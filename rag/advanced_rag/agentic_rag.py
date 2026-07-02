@@ -32,6 +32,7 @@ from rag.prompts.generator import citation_prompt, gen_meta_filter, kb_prompt
 from api.db.db_models import Document, Knowledgebase
 from rag.utils.tavily_conn import Tavily
 from common.token_utils import num_tokens_from_string
+from rag.utils.rag_trace import RagTraceCollector, _now_ms
 
 
 class RAGTools:
@@ -44,6 +45,7 @@ class RAGTools:
                  tav: Tavily | None = None,
                  meta_data_filter: dict | None = None,
                  user_defined_prompts: dict | None = None,
+                 trace: RagTraceCollector | None = None,
                  ):
         self.tenant_ids = tenant_ids
         self.chat_mdl = deepcopy(chat_mdl)
@@ -69,6 +71,7 @@ class RAGTools:
         self.tav = tav
         self.meta_data_filter = meta_data_filter
         self.user_defined_prompts = user_defined_prompts or {}
+        self.trace = trace
         # Accumulator for chunks/doc_aggs across tool calls within a turn —
         # populated by ``search_knowledge_bases`` and ``search_structured_data``
         # so the final answer can cite everything retrieved so far.
@@ -91,6 +94,15 @@ class RAGTools:
         if self.kb_ids:
             tools.append(self.summarize_document)
         chat_mdl.bind_tools(None, tools)
+
+    def _trace_tool_start(self, name: str, args: dict[str, Any] | None = None, *, retrieval_mode: str | None = None) -> str | None:
+        if not self.trace:
+            return None
+        return self.trace.start_tool(name, args, retrieval_mode=retrieval_mode)
+
+    def _trace_tool_end(self, tool_call_id: str | None, *, success: bool = True, result: Any = None, result_summary: dict[str, Any] | None = None, error: Exception | str | None = None) -> None:
+        if self.trace:
+            self.trace.end_tool(tool_call_id, success=success, result=result, result_summary=result_summary, error=error)
 
     def sys_prompt(self) -> str:
         """Return the system instruction the chat model should be initialised with.
@@ -264,30 +276,38 @@ class RAGTools:
               "What's the population of New York?"
             If the latest user message is already standalone, it's returned unchanged.
         """
+        tool_call_id = self._trace_tool_start("formalize_question", {"messages": messages})
         if not messages:
+            self._trace_tool_end(tool_call_id, result="")
             return ""
 
-        transcript = "\n".join(messages)
-        system = (
-            "You rewrite the LAST user message into a single, self-contained question "
-            "that can be understood without seeing the prior conversation. "
-            "Resolve pronouns, ellipses, and follow-up shortcuts using earlier turns. "
-            "Preserve the original language of the last user message. "
-            "Output ONLY the rewritten question — no preamble, no quotes, no explanation. "
-            "If the last user message is already a complete standalone question, return it unchanged."
-        )
-        user = (
-            f"Conversation:\n{transcript}\n\n"
-            "Rewritten standalone question:"
-        )
-
-        ans = await self.chat_mdl.async_chat(
-                system=system,
-                history=[{"role": "user", "content": user}],
-                gen_conf={"temperature": 0.1},
+        try:
+            transcript = "\n".join(messages)
+            system = (
+                "You rewrite the LAST user message into a single, self-contained question "
+                "that can be understood without seeing the prior conversation. "
+                "Resolve pronouns, ellipses, and follow-up shortcuts using earlier turns. "
+                "Preserve the original language of the last user message. "
+                "Output ONLY the rewritten question — no preamble, no quotes, no explanation. "
+                "If the last user message is already a complete standalone question, return it unchanged."
+            )
+            user = (
+                f"Conversation:\n{transcript}\n\n"
+                "Rewritten standalone question:"
             )
 
-        return ans.strip().strip('"').strip("'")
+            ans = await self.chat_mdl.async_chat(
+                    system=system,
+                    history=[{"role": "user", "content": user}],
+                    gen_conf={"temperature": 0.1},
+                )
+
+            result = ans.strip().strip('"').strip("'")
+            self._trace_tool_end(tool_call_id, result=result)
+            return result
+        except Exception as e:
+            self._trace_tool_end(tool_call_id, success=False, error=e)
+            raise
 
     async def _get_cached_metas(self) -> dict:
         """Lazy-load the flattened metadata map for the bound KBs and cache it
@@ -333,36 +353,47 @@ class RAGTools:
             those cases the caller should fall back to unfiltered retrieval
             (i.e. call ``search_knowledge_bases`` without ``attachments``).
         """
-        if not self.kb_ids:
-            return []
-
-        metas = await self._get_cached_metas()
-        if not metas:
-            return []
-
-        filters = await gen_meta_filter(self.chat_mdl, metas, question)
-        logging.debug(f"Metadata filter(auto) generated: {filters}")
-
-        conditions = filters.get("conditions") or []
-        if not conditions:
-            return []
-
-        logic = filters.get("logic", "and")
+        tool_call_id = self._trace_tool_start("filter_docs_by_metadata", {"question": question}, retrieval_mode="metadata")
         try:
-            doc_ids = await thread_pool_exec(
-                DocMetadataService.filter_doc_ids_by_meta_pushdown,
-                self.kb_ids,
-                conditions,
-                logic,
-            )
+            if not self.kb_ids:
+                self._trace_tool_end(tool_call_id, result=[])
+                return []
+
+            metas = await self._get_cached_metas()
+            if not metas:
+                self._trace_tool_end(tool_call_id, result=[])
+                return []
+
+            filters = await gen_meta_filter(self.chat_mdl, metas, question)
+            logging.debug(f"Metadata filter(auto) generated: {filters}")
+
+            conditions = filters.get("conditions") or []
+            if not conditions:
+                self._trace_tool_end(tool_call_id, result=[], result_summary={"docid_count": 0, "metadata_filters": filters})
+                return []
+
+            logic = filters.get("logic", "and")
+            try:
+                doc_ids = await thread_pool_exec(
+                    DocMetadataService.filter_doc_ids_by_meta_pushdown,
+                    self.kb_ids,
+                    conditions,
+                    logic,
+                )
+            except Exception as e:
+                logging.error(f"Metadata filter push down errored: {e}")
+                self._trace_tool_end(tool_call_id, success=False, result=[], result_summary={"docid_count": 0, "metadata_filters": filters}, error=e)
+                return []
+            logging.debug(f"Doc ids filtered by metadata: {doc_ids}")
+            # ``filter_doc_ids_by_meta_pushdown`` returns None when push-down isn't
+            # viable; treat that as "no filter applied" and surface as empty list
+            # so the caller falls back to unfiltered retrieval.
+            result = doc_ids or []
+            self._trace_tool_end(tool_call_id, result=result, result_summary={"docid_count": len(result), "metadata_filters": filters})
+            return result
         except Exception as e:
-            logging.error(f"Metadata filter push down errored: {e}")
-            return []
-        logging.debug(f"Doc ids filtered by metadata: {doc_ids}")
-        # ``filter_doc_ids_by_meta_pushdown`` returns None when push-down isn't
-        # viable; treat that as "no filter applied" and surface as empty list
-        # so the caller falls back to unfiltered retrieval.
-        return doc_ids or []
+            self._trace_tool_end(tool_call_id, success=False, error=e)
+            raise
 
     def _collect_doc_titles(self, max_docs:int = 512) -> list[tuple[str, str]]:
         """Return ``[(doc_id, name)]`` for every document in the bound KBs.
@@ -453,55 +484,69 @@ class RAGTools:
             relevant title. IDs returned by the LLM that are not in the catalogue
             are filtered out defensively.
         """
-        if not self.kb_ids:
-            return []
-
-        docs = await thread_pool_exec(self._collect_doc_titles)
-        if docs is None:
-            return "Too much documents for LLM to judge."
-        if not docs:
-            return []
-
-        catalogue = "\n".join(f"docID: {doc_id}, title: {title}" for doc_id, title in docs)
-        system = (
-            "You filter a document catalogue to find which documents are relevant "
-            "to a user's question. Use ONLY the titles in the catalogue — do not "
-            "invent docIDs. "
-            "Output ONLY a JSON array of the docIDs you consider relevant, e.g. "
-            '["abc123", "def456"]. If no document is clearly relevant, output []. '
-            "No explanations, no Markdown, no code fences, no prose around the array."
-        )
-        user = (
-            f"Question:\n{question}\n\n"
-            f"Documents:\n{catalogue}\n\n"
-            "Relevant docIDs (JSON array):"
-        )
-
-        ans = await self.chat_mdl.async_chat(
-            system=system,
-            history=[{"role": "user", "content": user}],
-            gen_conf={"temperature": 0.1},
-        )
-        if isinstance(ans, tuple):
-            ans = ans[0]
-
-        # Strip <think> reasoning prefixes and ```json fences before parsing.
-        cleaned = re.sub(r"^.*</think>", "", ans, flags=re.DOTALL)
-        cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", cleaned).strip()
+        tool_call_id = self._trace_tool_start("select_documents", {"question": question, "max_docs": max_docs}, retrieval_mode="doc_select")
         try:
-            ids = json_repair.loads(cleaned)
-        except Exception as e:
-            logging.warning(f"select_documents could not parse LLM output: {e!r} raw={ans[:200]!r}")
-            return []
-        if not isinstance(ids, list):
-            return []
+            if not self.kb_ids:
+                self._trace_tool_end(tool_call_id, result=[])
+                return []
 
-        # Defensive: drop anything the LLM hallucinated outside our catalogue.
-        known = {doc_id for doc_id, _ in docs}
-        res = [doc_id for doc_id in ids if isinstance(doc_id, str) and doc_id in known]
-        if not res:
-            return "Fail to pick the document IDs. Try other methods."
-        return res
+            docs = await thread_pool_exec(self._collect_doc_titles)
+            if docs is None:
+                result = "Too much documents for LLM to judge."
+                self._trace_tool_end(tool_call_id, result=result, result_summary={"docid_count": 0, "catalogue_truncated": True})
+                return result
+            if not docs:
+                self._trace_tool_end(tool_call_id, result=[])
+                return []
+
+            catalogue = "\n".join(f"docID: {doc_id}, title: {title}" for doc_id, title in docs)
+            system = (
+                "You filter a document catalogue to find which documents are relevant "
+                "to a user's question. Use ONLY the titles in the catalogue — do not "
+                "invent docIDs. "
+                "Output ONLY a JSON array of the docIDs you consider relevant, e.g. "
+                '["abc123", "def456"]. If no document is clearly relevant, output []. '
+                "No explanations, no Markdown, no code fences, no prose around the array."
+            )
+            user = (
+                f"Question:\n{question}\n\n"
+                f"Documents:\n{catalogue}\n\n"
+                "Relevant docIDs (JSON array):"
+            )
+
+            ans = await self.chat_mdl.async_chat(
+                system=system,
+                history=[{"role": "user", "content": user}],
+                gen_conf={"temperature": 0.1},
+            )
+            if isinstance(ans, tuple):
+                ans = ans[0]
+
+            # Strip <think> reasoning prefixes and ```json fences before parsing.
+            cleaned = re.sub(r"^.*</think>", "", ans, flags=re.DOTALL)
+            cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", cleaned).strip()
+            try:
+                ids = json_repair.loads(cleaned)
+            except Exception as e:
+                logging.warning(f"select_documents could not parse LLM output: {e!r} raw={ans[:200]!r}")
+                self._trace_tool_end(tool_call_id, success=False, result=[], result_summary={"docid_count": 0, "catalogue_count": len(docs)}, error=e)
+                return []
+            if not isinstance(ids, list):
+                self._trace_tool_end(tool_call_id, result=[], result_summary={"docid_count": 0, "catalogue_count": len(docs)})
+                return []
+
+            # Defensive: drop anything the LLM hallucinated outside our catalogue.
+            known = {doc_id for doc_id, _ in docs}
+            res = [doc_id for doc_id in ids if isinstance(doc_id, str) and doc_id in known]
+            if not res:
+                result = "Fail to pick the document IDs. Try other methods."
+                self._trace_tool_end(tool_call_id, result=result, result_summary={"docid_count": 0, "catalogue_count": len(docs), "dropped_doc_ids": len(ids)})
+                return result
+            self._trace_tool_end(tool_call_id, result=res, result_summary={"docid_count": len(res), "catalogue_count": len(docs), "dropped_doc_ids": len(ids) - len(res)})
+            return res
+        except Exception as e:
+            self._trace_tool_end(tool_call_id, success=False, error=e)
+            raise
 
     @tool
     async def search_knowledge_bases(
@@ -576,65 +621,119 @@ class RAGTools:
             ``doc_aggs``, and the keywords actually used for retrieval. An
             empty result is returned when no knowledge bases are bound.
         """
-        if not self.kb_ids:
-            return {"total": 0, "chunks": [], "doc_aggs": {}}
-
-        # Validate docid_scope against the actual catalogue — models often
-        # hallucinate 32-char hex strings, and the retriever silently returns
-        # zero chunks for unknown IDs (which then looks like "KB has nothing"
-        # to the calling LLM, when really the filter was bogus).
-        if docid_scope:
-            candidates = [d for d in docid_scope if isinstance(d, str)]
-            known = await thread_pool_exec(self._filter_known_doc_ids, candidates)
-            valid = [d for d in candidates if d in known]
-            if len(valid) != len(docid_scope):
-                dropped = [d for d in docid_scope if d not in known]
-                logging.warning(
-                    f"search_knowledge_bases: dropping {len(dropped)}/{len(docid_scope)} "
-                    f"unknown doc IDs from docid_scope (samples: {dropped[:3]})"
-                )
-            if valid:
-                docid_scope = valid
-            else:
-                # Every supplied ID was bogus. Falling back to unfiltered
-                # retrieval is safer than returning zero chunks and forcing
-                # the LLM into a retry loop.
-                logging.warning(
-                    "search_knowledge_bases: every supplied doc ID was unknown; "
-                    "falling back to unfiltered retrieval"
-                )
-                docid_scope = None
-
-        search_terms = keywords.strip() if keywords else ""
-        if not search_terms or using_embedding:
-            search_terms = question
-
-        embd_mdl = self.embed_mdl if using_embedding else None
-        # Vector contributes to ranking only when an embedding model is actually
-        # in play. With ``embd_mdl=None`` we MUST keep weight at 0 — otherwise
-        # the retriever silently falls back to whatever embedding it can find.
-        vector_weight = 0.7 if embd_mdl else 0
-        kbinfos = await settings.retriever.retrieval(
-            search_terms,
-            embd_mdl,
-            self.tenant_ids,
-            self.kb_ids,
-            1,
-            top_n,
-            similarity_threshold,
-            vector_similarity_weight=vector_weight,
-            aggs=True,
-            doc_ids=docid_scope,
-            rank_feature=label_question(question, self.kbs),
+        mode = "embedding" if using_embedding else "keyword"
+        tool_call_id = self._trace_tool_start(
+            "search_knowledge_bases",
+            {
+                "question": question,
+                "keywords": keywords,
+                "top_n": top_n,
+                "similarity_threshold": similarity_threshold,
+                "docid_scope": docid_scope,
+                "using_embedding": using_embedding,
+            },
+            retrieval_mode=mode,
         )
-        kbinfos["chunks"] = settings.retriever.retrieval_by_children(kbinfos["chunks"], self.tenant_ids)
-        start_idx = len(self.kbinfos.get("chunks", []))
-        if kbinfos:
-            self.kbinfos["chunks"].extend(kbinfos.get("chunks", []))
-            self.kbinfos["doc_aggs"].extend(kbinfos.get("doc_aggs", []))
-        return self._with_citation_guidelines(
-            kb_prompt(self.kbinfos, self.chat_mdl.max_length, start_idx)
-        )
+        try:
+            if not self.kb_ids:
+                result = {"total": 0, "chunks": [], "doc_aggs": {}}
+                self._trace_tool_end(tool_call_id, result=result)
+                return result
+
+            # Validate docid_scope against the actual catalogue — models often
+            # hallucinate 32-char hex strings, and the retriever silently returns
+            # zero chunks for unknown IDs (which then looks like "KB has nothing"
+            # to the calling LLM, when really the filter was bogus).
+            if docid_scope:
+                candidates = [d for d in docid_scope if isinstance(d, str)]
+                known = await thread_pool_exec(self._filter_known_doc_ids, candidates)
+                valid = [d for d in candidates if d in known]
+                if len(valid) != len(docid_scope):
+                    dropped = [d for d in docid_scope if d not in known]
+                    logging.warning(
+                        f"search_knowledge_bases: dropping {len(dropped)}/{len(docid_scope)} "
+                        f"unknown doc IDs from docid_scope (samples: {dropped[:3]})"
+                    )
+                if valid:
+                    docid_scope = valid
+                else:
+                    # Every supplied ID was bogus. Falling back to unfiltered
+                    # retrieval is safer than returning zero chunks and forcing
+                    # the LLM into a retry loop.
+                    logging.warning(
+                        "search_knowledge_bases: every supplied doc ID was unknown; "
+                        "falling back to unfiltered retrieval"
+                    )
+                    docid_scope = None
+
+            search_terms = keywords.strip() if keywords else ""
+            if not search_terms or using_embedding:
+                search_terms = question
+
+            embd_mdl = self.embed_mdl if using_embedding else None
+            # Vector contributes to ranking only when an embedding model is actually
+            # in play. With ``embd_mdl=None`` we MUST keep weight at 0 — otherwise
+            # the retriever silently falls back to whatever embedding it can find.
+            vector_weight = 0.7 if embd_mdl else 0
+            retrieval_started_ms = _now_ms()
+            kbinfos = await settings.retriever.retrieval(
+                search_terms,
+                embd_mdl,
+                self.tenant_ids,
+                self.kb_ids,
+                1,
+                top_n,
+                similarity_threshold,
+                vector_similarity_weight=vector_weight,
+                aggs=True,
+                doc_ids=docid_scope,
+                rank_feature=label_question(question, self.kbs),
+            )
+            kbinfos["chunks"] = settings.retriever.retrieval_by_children(kbinfos["chunks"], self.tenant_ids)
+            start_idx = len(self.kbinfos.get("chunks", []))
+            retrieval_call_id = None
+            if self.trace:
+                retrieval_call_id = self.trace.add_retrieval_call(
+                    mode=mode,
+                    query_text=search_terms,
+                    keywords=keywords,
+                    docid_scope=docid_scope,
+                    metadata_filters=self.meta_data_filter,
+                    chunks=kbinfos.get("chunks", []),
+                    doc_aggs=kbinfos.get("doc_aggs", []),
+                    tool_call_id=tool_call_id,
+                    used_embedding=bool(embd_mdl),
+                    used_web=False,
+                    started_ms=retrieval_started_ms,
+                )
+                self.trace.add_evidence_from_chunks(
+                    kbinfos.get("chunks", []),
+                    source_type="kb",
+                    retrieval_call_id=retrieval_call_id,
+                    tool_call_id=tool_call_id,
+                    start_citation_index=start_idx,
+                )
+            if kbinfos:
+                self.kbinfos["chunks"].extend(kbinfos.get("chunks", []))
+                self.kbinfos["doc_aggs"].extend(kbinfos.get("doc_aggs", []))
+            result = self._with_citation_guidelines(
+                kb_prompt(self.kbinfos, self.chat_mdl.max_length, start_idx)
+            )
+            self._trace_tool_end(
+                tool_call_id,
+                result=result,
+                result_summary={
+                    "retrieval_call_id": retrieval_call_id,
+                    "chunk_count": len(kbinfos.get("chunks", [])),
+                    "doc_agg_count": len(kbinfos.get("doc_aggs", [])),
+                    "retrieval_mode": mode,
+                    "embedding_retry_used": bool(embd_mdl),
+                },
+            )
+            return result
+        except Exception as e:
+            self._trace_tool_end(tool_call_id, success=False, error=e)
+            raise
 
     def _resolve_doc_tenant(self, doc_id: str) -> tuple[str, str] | None:
         """Return ``(kb_id, tenant_id)`` for ``doc_id`` if and only if the
@@ -691,62 +790,91 @@ class RAGTools:
             empty list is returned when the doc ID is unknown to the bound
             KBs or the document has no chunks indexed.
         """
-        if not self.kb_ids:
-            return []
+        tool_call_id = self._trace_tool_start("summarize_document", {"doc_id": doc_id}, retrieval_mode="summarize")
+        try:
+            if not self.kb_ids:
+                self._trace_tool_end(tool_call_id, result=[])
+                return []
 
-        resolved = await thread_pool_exec(self._resolve_doc_tenant, doc_id)
-        if resolved is None:
-            logging.warning(
-                f"summarize_document: doc_id {doc_id!r} is not in any bound "
-                "knowledge base — refusing to fetch (likely an LLM hallucination)"
+            resolved = await thread_pool_exec(self._resolve_doc_tenant, doc_id)
+            if resolved is None:
+                logging.warning(
+                    f"summarize_document: doc_id {doc_id!r} is not in any bound "
+                    "knowledge base — refusing to fetch (likely an LLM hallucination)"
+                )
+                self._trace_tool_end(tool_call_id, result=[], result_summary={"chunk_count": 0, "doc_id": doc_id})
+                return []
+            kb_id, tenant_id = resolved
+
+            cks = []
+            tokens = 0
+            retrieval_started_ms = _now_ms()
+            for offset in range(0, 10000, 128):
+                chunks = await thread_pool_exec(
+                    settings.retriever.chunk_list,
+                    doc_id,
+                    tenant_id,
+                    [kb_id],
+                    max_count=offset+128,
+                    offset=offset,
+                    fields=["content_with_weight", "docnm_kwd", "doc_id"],
+                    sort_by_position=True,
+                    retrieve_all=False,
+                )
+                for ck in chunks:
+                    num = num_tokens_from_string(str(ck["content_with_weight"]))
+                    if tokens + num > self.chat_mdl.max_length:
+                        break
+                    tokens += num
+                    cks.append(ck)
+
+            if not cks:
+                self._trace_tool_end(tool_call_id, result=[], result_summary={"chunk_count": 0, "doc_id": doc_id})
+                return []
+            doc_name = next(
+                (c.get("docnm_kwd") or "" for c in cks if c.get("docnm_kwd")),
+                "",
             )
-            return []
-        kb_id, tenant_id = resolved
-
-        cks = []
-        tokens = 0
-        for offset in range(0, 10000, 128):
-            chunks = await thread_pool_exec(
-                settings.retriever.chunk_list,
-                doc_id,
-                tenant_id,
-                [kb_id],
-                max_count=offset+128,
-                offset=offset,
-                fields=["content_with_weight", "docnm_kwd", "doc_id"],
-                sort_by_position=True,
-                retrieve_all=False,
+            kbinfos = {
+                "chunks": cks,
+                "doc_aggs": [
+                    {
+                        "doc_name": doc_name,
+                        "doc_id": doc_id,
+                        "count": len(cks),
+                    }
+                ],
+            }
+            start_idx = len(self.kbinfos.get("chunks", []))
+            retrieval_call_id = None
+            if self.trace:
+                retrieval_call_id = self.trace.add_retrieval_call(
+                    mode="summarize",
+                    query_text=doc_id,
+                    docid_scope=[doc_id],
+                    chunks=kbinfos.get("chunks", []),
+                    doc_aggs=kbinfos.get("doc_aggs", []),
+                    tool_call_id=tool_call_id,
+                    started_ms=retrieval_started_ms,
+                )
+                self.trace.add_evidence_from_chunks(
+                    kbinfos.get("chunks", []),
+                    source_type="summarize",
+                    retrieval_call_id=retrieval_call_id,
+                    tool_call_id=tool_call_id,
+                    start_citation_index=start_idx,
+                )
+            if kbinfos:
+                self.kbinfos["chunks"].extend(kbinfos.get("chunks", []))
+                self.kbinfos["doc_aggs"].extend(kbinfos.get("doc_aggs", []))
+            result = self._with_citation_guidelines(
+                kb_prompt(self.kbinfos, self.chat_mdl.max_length, start_idx)
             )
-            for ck in chunks:
-                num = num_tokens_from_string(str(ck["content_with_weight"]))
-                if tokens + num > self.chat_mdl.max_length:
-                    break
-                tokens += num
-                cks.append(ck)
-
-        if not cks:
-            return []
-        doc_name = next(
-            (c.get("docnm_kwd") or "" for c in cks if c.get("docnm_kwd")),
-            "",
-        )
-        kbinfos = {
-            "chunks": cks,
-            "doc_aggs": [
-                {
-                    "doc_name": doc_name,
-                    "doc_id": doc_id,
-                    "count": len(cks),
-                }
-            ],
-        }
-        start_idx = len(self.kbinfos.get("chunks", []))
-        if kbinfos:
-            self.kbinfos["chunks"].extend(kbinfos.get("chunks", []))
-            self.kbinfos["doc_aggs"].extend(kbinfos.get("doc_aggs", []))
-        return self._with_citation_guidelines(
-            kb_prompt(self.kbinfos, self.chat_mdl.max_length, start_idx)
-        )
+            self._trace_tool_end(tool_call_id, result=result, result_summary={"retrieval_call_id": retrieval_call_id, "chunk_count": len(cks), "doc_id": doc_id})
+            return result
+        except Exception as e:
+            self._trace_tool_end(tool_call_id, success=False, error=e)
+            raise
 
     @tool(timeout=60)
     async def search_structured_data(self, question: str) -> str:
@@ -777,40 +905,72 @@ class RAGTools:
             rules in the system prompt. An empty string is returned when no
             structured KB is bound or SQL generation/execution fails.
         """
-        if not self.sql_kbs or not self.field_map:
-            return ""
-
-        # Imported lazily to avoid a circular import:
-        # dialog_service constructs ``RAGTools``.
-        from api.db.services.dialog_service import use_sql
-
-        sql_kb_ids = [kb.id for kb in self.sql_kbs]
-        tenant_id = self.sql_kbs[0].tenant_id
+        tool_call_id = self._trace_tool_start("search_structured_data", {"question": question}, retrieval_mode="sql")
         try:
-            ans = await use_sql(
-                question,
-                self.field_map,
-                tenant_id,
-                self.chat_mdl,
-                quota=True,
-                kb_ids=sql_kb_ids,
-            )
+            if not self.sql_kbs or not self.field_map:
+                self._trace_tool_end(tool_call_id, result="")
+                return ""
+
+            # Imported lazily to avoid a circular import:
+            # dialog_service constructs ``RAGTools``.
+            from api.db.services.dialog_service import use_sql
+
+            sql_kb_ids = [kb.id for kb in self.sql_kbs]
+            tenant_id = self.sql_kbs[0].tenant_id
+            started_ms = _now_ms()
+            try:
+                ans = await use_sql(
+                    question,
+                    self.field_map,
+                    tenant_id,
+                    self.chat_mdl,
+                    quota=True,
+                    kb_ids=sql_kb_ids,
+                )
+            except Exception as e:
+                logging.exception(f"search_structured_data: use_sql failed: {e}")
+                if self.trace:
+                    self.trace.add_retrieval_call(mode="sql", query_text=question, docid_scope=sql_kb_ids, tool_call_id=tool_call_id, started_ms=started_ms, error=e)
+                self._trace_tool_end(tool_call_id, success=False, result="", error=e)
+                return ""
+
+            if not ans:
+                self._trace_tool_end(tool_call_id, result="", result_summary={"chunk_count": 0, "doc_agg_count": 0})
+                return ""
+
+            reference = ans.get("reference") or {}
+            new_chunks = reference.get("chunks") or []
+            new_doc_aggs = reference.get("doc_aggs") or []
+            start_idx = len(self.kbinfos.get("chunks", []))
+            retrieval_call_id = None
+            if self.trace:
+                retrieval_call_id = self.trace.add_retrieval_call(
+                    mode="sql",
+                    query_text=question,
+                    docid_scope=sql_kb_ids,
+                    chunks=new_chunks,
+                    doc_aggs=new_doc_aggs,
+                    tool_call_id=tool_call_id,
+                    started_ms=started_ms,
+                )
+                self.trace.add_evidence_from_chunks(
+                    new_chunks,
+                    source_type="sql",
+                    retrieval_call_id=retrieval_call_id,
+                    tool_call_id=tool_call_id,
+                    start_citation_index=start_idx,
+                )
+            if new_chunks:
+                self.kbinfos["chunks"].extend(new_chunks)
+            if new_doc_aggs:
+                self.kbinfos["doc_aggs"].extend(new_doc_aggs)
+
+            result = self._with_citation_guidelines(ans.get("answer", "") or "")
+            self._trace_tool_end(tool_call_id, result=result, result_summary={"retrieval_call_id": retrieval_call_id, "chunk_count": len(new_chunks), "doc_agg_count": len(new_doc_aggs)})
+            return result
         except Exception as e:
-            logging.exception(f"search_structured_data: use_sql failed: {e}")
-            return ""
-
-        if not ans:
-            return ""
-
-        reference = ans.get("reference") or {}
-        new_chunks = reference.get("chunks") or []
-        new_doc_aggs = reference.get("doc_aggs") or []
-        if new_chunks:
-            self.kbinfos["chunks"].extend(new_chunks)
-        if new_doc_aggs:
-            self.kbinfos["doc_aggs"].extend(new_doc_aggs)
-
-        return self._with_citation_guidelines(ans.get("answer", "") or "")
+            self._trace_tool_end(tool_call_id, success=False, error=e)
+            raise
 
     @tool
     async def web_search(self, query: str) -> List[dict[str, Any]]:
@@ -827,15 +987,42 @@ class RAGTools:
             ``{"url": str, "title": str, "content": str, "score": float}``,
             or an empty list when web search is not configured or fails.
         """
-        if self.tav is None:
-            return []
-        tav_res = await thread_pool_exec(self.tav.retrieve_chunks, query)
-        start_idx = len(self.kbinfos.get("chunks", []))
-        self.kbinfos["chunks"].extend(tav_res["chunks"])
-        self.kbinfos["doc_aggs"].extend(tav_res["doc_aggs"])
-        return self._with_citation_guidelines(
-            kb_prompt(self.kbinfos, self.chat_mdl.max_length, start_idx)
-        )
+        tool_call_id = self._trace_tool_start("web_search", {"query": query}, retrieval_mode="web")
+        try:
+            if self.tav is None:
+                self._trace_tool_end(tool_call_id, result=[])
+                return []
+            started_ms = _now_ms()
+            tav_res = await thread_pool_exec(self.tav.retrieve_chunks, query)
+            start_idx = len(self.kbinfos.get("chunks", []))
+            retrieval_call_id = None
+            if self.trace:
+                retrieval_call_id = self.trace.add_retrieval_call(
+                    mode="web",
+                    query_text=query,
+                    chunks=tav_res.get("chunks", []),
+                    doc_aggs=tav_res.get("doc_aggs", []),
+                    tool_call_id=tool_call_id,
+                    used_web=True,
+                    started_ms=started_ms,
+                )
+                self.trace.add_evidence_from_chunks(
+                    tav_res.get("chunks", []),
+                    source_type="web",
+                    retrieval_call_id=retrieval_call_id,
+                    tool_call_id=tool_call_id,
+                    start_citation_index=start_idx,
+                )
+            self.kbinfos["chunks"].extend(tav_res["chunks"])
+            self.kbinfos["doc_aggs"].extend(tav_res["doc_aggs"])
+            result = self._with_citation_guidelines(
+                kb_prompt(self.kbinfos, self.chat_mdl.max_length, start_idx)
+            )
+            self._trace_tool_end(tool_call_id, result=result, result_summary={"retrieval_call_id": retrieval_call_id, "chunk_count": len(tav_res.get("chunks", [])), "doc_agg_count": len(tav_res.get("doc_aggs", [])), "used_web": True})
+            return result
+        except Exception as e:
+            self._trace_tool_end(tool_call_id, success=False, error=e)
+            raise
 
     def get_citation_guidelines(self) -> str:
         """Return the citation guidelines this agent uses.

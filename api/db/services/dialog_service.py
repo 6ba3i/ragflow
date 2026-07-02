@@ -53,6 +53,7 @@ from rag.prompts.generator import chunks_format, citation_prompt, cross_language
 from common.token_utils import num_tokens_from_string
 from rag.utils.tavily_conn import Tavily
 from rag.utils.tts_cache import synthesize_with_cache
+from rag.utils.rag_trace import RagTraceCollector, _now_ms
 from common.string_utils import remove_redundant_spaces
 from common import settings
 
@@ -553,6 +554,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
     logging.debug("Begin async_chat")
     assert messages[-1]["role"] == "user", "The last content of this conversation is not from user."
     session_id = kwargs.get("session_id")
+    rag_trace = RagTraceCollector.from_kwargs(path="async_chat", dialog=dialog, messages=messages, kwargs=kwargs)
     use_web_search = _should_use_web_search(dialog.prompt_config, kwargs.get("internet"))
     logging.debug("web_search kb=%s tavily=%s internet=%r enabled=%s", bool(dialog.kb_ids), bool(dialog.prompt_config.get("tavily_api_key")), kwargs.get("internet"), use_web_search)
     if not dialog.kb_ids and not use_web_search:
@@ -572,6 +574,12 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
 
     factory = llm_model_config.get("llm_factory", "") if llm_model_config else ""
     max_tokens = llm_model_config.get("max_tokens") or 8192
+    if rag_trace:
+        rag_trace.set_llm_info(
+            model_provider=factory,
+            model_name=llm_model_config.get("llm_name") if llm_model_config else dialog.llm_id,
+            tool_support_claimed=getattr(dialog, "is_tools", None),
+        )
 
     check_llm_ts = timer()
 
@@ -592,6 +600,12 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
 
     check_langfuse_tracer_ts = timer()
     kbs, embd_mdl, rerank_mdl, chat_mdl, tts_mdl = get_models(dialog, trace_context=trace_context, langfuse_session_id=session_id)
+    if rag_trace:
+        rag_trace.set_llm_info(
+            model_provider=factory,
+            model_name=llm_model_config.get("llm_name") if llm_model_config else dialog.llm_id,
+            tool_support_claimed=getattr(chat_mdl, "is_tools", None),
+        )
     toolcall_session, tools = kwargs.get("toolcall_session"), kwargs.get("tools")
     if toolcall_session and tools:
         chat_mdl.bind_tools(toolcall_session, tools)
@@ -621,9 +635,29 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
     # try to use sql if field mapping is good to go
     if field_map:
         logging.debug("Use SQL to retrieval:{}".format(questions[-1]))
+        sql_started_ms = _now_ms()
         ans = await use_sql(questions[-1], field_map, dialog.tenant_id, chat_mdl, prompt_config.get("quote", True), dialog.kb_ids)
         # For aggregate queries (COUNT, SUM, etc.), chunks may be empty but answer is still valid
         if ans and (ans.get("reference", {}).get("chunks") or ans.get("answer")):
+            if rag_trace:
+                reference = ans.get("reference", {}) or {}
+                retrieval_call_id = rag_trace.add_retrieval_call(
+                    mode="sql",
+                    query_text=questions[-1],
+                    docid_scope=dialog.kb_ids,
+                    metadata_filters=dialog.meta_data_filter,
+                    chunks=reference.get("chunks", []),
+                    doc_aggs=reference.get("doc_aggs", []),
+                    started_ms=sql_started_ms,
+                )
+                rag_trace.add_evidence_from_chunks(reference.get("chunks", []), source_type="sql", retrieval_call_id=retrieval_call_id)
+                trace_payload = rag_trace.finish(
+                    final_reference_count=len(reference.get("chunks", [])),
+                    latency_timings={"sql": (timer() - check_langfuse_tracer_ts) * 1000},
+                    token_usage={},
+                )
+                if trace_payload:
+                    ans["trace"] = trace_payload
             if include_reference_metadata and ans.get("reference", {}).get("chunks"):
                 if len(dialog.kb_ids) != 1 and any(not c.get("kb_id") for c in ans["reference"]["chunks"]):
                     logging.warning(
@@ -721,6 +755,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
 
         else:
             if embd_mdl:
+                retrieval_started_ms = _now_ms()
                 kbinfos = await retriever.retrieval(
                     " ".join(questions),
                     embd_mdl,
@@ -741,11 +776,35 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                     if cks:
                         kbinfos["chunks"] = cks
                 kbinfos["chunks"] = retriever.retrieval_by_children(kbinfos["chunks"], tenant_ids)
+                if rag_trace:
+                    retrieval_call_id = rag_trace.add_retrieval_call(
+                        mode="normal",
+                        query_text=" ".join(questions),
+                        docid_scope=attachments,
+                        metadata_filters=dialog.meta_data_filter,
+                        chunks=kbinfos.get("chunks", []),
+                        doc_aggs=kbinfos.get("doc_aggs", []),
+                        used_embedding=True,
+                        used_web=False,
+                        started_ms=retrieval_started_ms,
+                    )
+                    rag_trace.add_evidence_from_chunks(kbinfos.get("chunks", []), source_type="kb", retrieval_call_id=retrieval_call_id)
             if use_web_search:
+                web_started_ms = _now_ms()
                 tav = Tavily(prompt_config["tavily_api_key"])
                 tav_res = tav.retrieve_chunks(" ".join(questions))
                 kbinfos["chunks"].extend(tav_res["chunks"])
                 kbinfos["doc_aggs"].extend(tav_res["doc_aggs"])
+                if rag_trace:
+                    web_retrieval_call_id = rag_trace.add_retrieval_call(
+                        mode="web",
+                        query_text=" ".join(questions),
+                        chunks=tav_res.get("chunks", []),
+                        doc_aggs=tav_res.get("doc_aggs", []),
+                        used_web=True,
+                        started_ms=web_started_ms,
+                    )
+                    rag_trace.add_evidence_from_chunks(tav_res.get("chunks", []), source_type="web", retrieval_call_id=web_retrieval_call_id, start_citation_index=max(0, len(kbinfos.get("chunks", [])) - len(tav_res.get("chunks", []))))
             if prompt_config.get("use_kg"):
                 default_chat_model = get_tenant_default_model_by_type(dialog.tenant_id, LLMType.CHAT)
                 ck = await settings.kg_retriever.retrieval(
@@ -809,6 +868,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
             think = ans[0] + "</think>"
             answer = ans[1]
 
+        citation_indices = set()
         if knowledges and (prompt_config.get("quote", True) and kwargs.get("quote", True)):
             idx = set([])
             normalized_answer = normalize_arabic_digits(answer) or ""
@@ -831,6 +891,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                         idx.add(i)
 
             answer, idx = repair_bad_citation_formats(answer, kbinfos, idx)
+            citation_indices = set(idx)
 
             idx = set([kbinfos["chunks"][int(i)]["doc_id"] for i in idx])
             recall_docs = [d for d in kbinfos["doc_aggs"] if d["doc_id"] in idx]
@@ -878,7 +939,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
             langfuse_output = {"time_elapsed:": re.sub(r"\n", "  \n", langfuse_output), "created_at": time.time()}
             langfuse_generation.update(
                 output=langfuse_output,
-                usage_details={
+            usage_details={
                     "input": used_token_count,
                     "output": tk_num,
                     "total": used_token_count + tk_num,
@@ -886,7 +947,30 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
             )
             langfuse_generation.end()
 
-        return {"answer": think + answer, "reference": refs, "prompt": re.sub(r"\n", "  \n", prompt), "created_at": time.time()}
+        trace_payload = None
+        if rag_trace:
+            trace_payload = rag_trace.finish(
+                final_reference_count=len(refs.get("chunks", [])) if isinstance(refs, dict) else 0,
+                latency_timings={
+                    "total": total_time_cost,
+                    "check_llm": check_llm_time_cost,
+                    "check_langfuse_tracer": check_langfuse_tracer_cost,
+                    "bind_models": bind_embedding_time_cost,
+                    "query_refinement": refine_question_time_cost,
+                    "retrieval": retrieval_time_cost,
+                    "generate_answer": generate_result_time_cost,
+                },
+                token_usage={
+                    "input": used_token_count,
+                    "output": tk_num,
+                    "total": used_token_count + tk_num,
+                },
+                citation_ids=list(citation_indices),
+            )
+        result = {"answer": think + answer, "reference": refs, "prompt": re.sub(r"\n", "  \n", prompt), "created_at": time.time()}
+        if trace_payload:
+            result["trace"] = trace_payload
+        return result
 
     if langfuse_tracer:
         try:
@@ -1806,16 +1890,20 @@ async def gen_mindmap(question, kb_ids, tenant_id, search_config={}):
 async def rag_agent(dialog, messages, stream=True, **kwargs):
     logging.debug("Begin rag_agent")
     assert messages[-1]["role"] == "user", "The last content of this conversation is not from user."
+    agent_start_ts = timer()
+    rag_trace = RagTraceCollector.from_kwargs(path="rag_agent", dialog=dialog, messages=messages, kwargs=kwargs)
     prompt_config = dialog.prompt_config
     kbs, embd_mdl, rerank_mdl, chat_mdl, tts_mdl = get_models(dialog)
     use_web_search = _should_use_web_search(prompt_config, kwargs.get("internet"))
     logging.debug("web_search kb=%s tavily=%s internet=%r enabled=%s", bool(dialog.kb_ids), bool(dialog.prompt_config.get("tavily_api_key")), kwargs.get("internet"), use_web_search)
     tenant_ids = list(set([kb.tenant_id for kb in kbs]))
+    tool_support_claimed = getattr(chat_mdl, "is_tools", None)
     rag_tools = RAGTools(tenant_ids, 
                          chat_mdl,
                          embed_mdl=embd_mdl,
                          kb_ids=dialog.kb_ids, 
-                         tav=Tavily(prompt_config["tavily_api_key"]) if use_web_search else None
+                         tav=Tavily(prompt_config["tavily_api_key"]) if use_web_search else None,
+                         trace=rag_trace,
                          )
 
     llm_type = TenantLLMService.llm_id2llm_type(dialog.llm_id)
@@ -1823,6 +1911,13 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
         llm_model_config = TenantLLMService.get_model_config(dialog.tenant_id, LLMType.IMAGE2TEXT, dialog.llm_id)
     else:
         llm_model_config = TenantLLMService.get_model_config(dialog.tenant_id, LLMType.CHAT, dialog.llm_id)
+    if rag_trace:
+        rag_trace.set_llm_info(
+            model_provider=llm_model_config.get("llm_factory") if llm_model_config else None,
+            model_name=llm_model_config.get("llm_name") if llm_model_config else dialog.llm_id,
+            tool_support_claimed=tool_support_claimed,
+            tool_binding_success=bool(getattr(chat_mdl, "toolcall_session", None) and getattr(chat_mdl, "tools", None)),
+        )
 
     #attachments = None
     #if "doc_ids" in kwargs:
@@ -1863,7 +1958,17 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
         if answer.lower().find("invalid key") >= 0 or answer.lower().find("invalid api") >= 0:
             answer += " Please set LLM API-Key in 'User Setting -> Model providers -> API-Key'"
 
-        return {"answer": think + answer, "reference": refs, "prompt": "", "created_at": time.time()}
+        trace_payload = None
+        if rag_trace:
+            trace_payload = rag_trace.finish(
+                final_reference_count=len(refs.get("chunks", [])) if isinstance(refs, dict) else 0,
+                latency_timings={"total": (timer() - agent_start_ts) * 1000},
+                token_usage={},
+            )
+        result = {"answer": think + answer, "reference": refs, "prompt": "", "created_at": time.time()}
+        if trace_payload:
+            result["trace"] = trace_payload
+        return result
 
     gen_conf = dialog.llm_setting
     if stream:

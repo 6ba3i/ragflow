@@ -32,7 +32,7 @@ from api.db.joint_services.tenant_model_service import (
 )
 from api.db.services.chunk_feedback_service import ChunkFeedbackService
 from api.db.services.conversation_service import ConversationService, structure_answer
-from api.db.services.dialog_service import DialogService, async_chat, gen_mindmap
+from api.db.services.dialog_service import DialogService, async_chat, gen_mindmap, rag_agent
 from api.db.services.knowledgebase_service import KnowledgebaseService
 from api.db.services.llm_service import LLMBundle
 from api.db.services.search_service import SearchService
@@ -210,6 +210,21 @@ def _get_bool_request_flag(req, *names, default=False):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
     return default
+
+
+def _env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _rag_agent_server_enabled():
+    return _env_bool("RAGFLOW_ENABLE_RAG_AGENT") or _env_bool("RAGFLOW_RAG_AGENT_ENABLED")
+
+
+def _select_completion_chat_runner(use_rag_agent=False):
+    return rag_agent if use_rag_agent and _rag_agent_server_enabled() else async_chat
 
 
 def _normalize_completion_messages(req):
@@ -1235,6 +1250,21 @@ async def session_completion(chat_id_in_arg=""):
             "legacy",
             default=False,
         )
+        use_rag_agent = _get_bool_request_flag(
+            req,
+            "use_rag_agent",
+            "agentic_rag",
+            default=False,
+        )
+        if _get_bool_request_flag(req, "disable_web", "disable_web_search", default=False):
+            req["internet"] = False
+        rag_trace_enabled = _get_bool_request_flag(req, "rag_trace", "rag_trace_enabled", default=False)
+        if rag_trace_enabled:
+            req["rag_trace_enabled"] = True
+        include_rag_trace = _get_bool_request_flag(req, "include_rag_trace", "rag_trace_include_response", default=False)
+        if include_rag_trace:
+            req["include_rag_trace"] = True
+        chat_runner = _select_completion_chat_runner(use_rag_agent)
         stream_mode = req.pop("stream", True)
 
         def _format_answer(ans):
@@ -1254,7 +1284,7 @@ async def session_completion(chat_id_in_arg=""):
                     # start_to_think/end_to_think events.
                     legacy_answer = ""
                     final_answer = None
-                    async for ans in rag_agent(dia, msg, True, session_id=session_id, **req):#async_chat(dia, msg, True, **req):
+                    async for ans in chat_runner(dia, msg, True, session_id=session_id, **req):
                         ans = _format_answer(ans)
                         if ans.get("final"):
                             final_answer = ans
@@ -1291,7 +1321,7 @@ async def session_completion(chat_id_in_arg=""):
                         payload = _sanitize_json_floats({"code": 0, "message": "", "data": final_chunk})
                         yield "data:" + json.dumps(payload, ensure_ascii=False) + "\n\n"
                 else:
-                    async for ans in async_chat(dia, msg, True, session_id=session_id, **req):
+                    async for ans in chat_runner(dia, msg, True, session_id=session_id, **req):
                         ans = _format_answer(ans)
                         payload = _sanitize_json_floats({"code": 0, "message": "", "data": ans})
                         yield "data:" + json.dumps(payload, ensure_ascii=False) + "\n\n"
@@ -1311,7 +1341,7 @@ async def session_completion(chat_id_in_arg=""):
             return resp
 
         answer = None
-        async for ans in async_chat(dia, msg, False, session_id=session_id, **req):
+        async for ans in chat_runner(dia, msg, False, session_id=session_id, **req):
             answer = _format_answer(ans)
             if conv is not None:
                 await thread_pool_exec(ConversationService.update_by_id, conv.id, conv.to_dict())
