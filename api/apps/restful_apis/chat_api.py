@@ -1254,7 +1254,7 @@ async def session_completion(chat_id_in_arg=""):
                     # start_to_think/end_to_think events.
                     legacy_answer = ""
                     final_answer = None
-                    async for ans in async_chat(dia, msg, True, session_id=session_id, **req):
+                    async for ans in rag_agent(dia, msg, True, session_id=session_id, **req):#async_chat(dia, msg, True, **req):
                         ans = _format_answer(ans)
                         if ans.get("final"):
                             final_answer = ans
