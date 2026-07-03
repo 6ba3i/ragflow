@@ -787,6 +787,13 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                         used_embedding=True,
                         used_web=False,
                         started_ms=retrieval_started_ms,
+                        retrieval_variant="hybrid_default",
+                        similarity_threshold=dialog.similarity_threshold,
+                        vector_similarity_weight=dialog.vector_similarity_weight,
+                        top_k=dialog.top_k,
+                        page_size=dialog.top_n,
+                        doc_scope_enabled=bool(attachments),
+                        metadata_filter_enabled=bool(dialog.meta_data_filter),
                     )
                     rag_trace.add_evidence_from_chunks(kbinfos.get("chunks", []), source_type="kb", retrieval_call_id=retrieval_call_id)
             if use_web_search:
@@ -1906,11 +1913,17 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
                          trace=rag_trace,
                          )
 
-    llm_type = TenantLLMService.llm_id2llm_type(dialog.llm_id)
-    if llm_type == "image2text":
-        llm_model_config = TenantLLMService.get_model_config(dialog.tenant_id, LLMType.IMAGE2TEXT, dialog.llm_id)
+    if dialog.llm_id:
+        llm_types = get_model_type_by_name(dialog.tenant_id, dialog.llm_id)
+        if "chat" in llm_types:
+            llm_type = LLMType.CHAT.value
+            llm_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.CHAT, dialog.llm_id)
+        else:
+            llm_type = LLMType.IMAGE2TEXT.value
+            llm_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.IMAGE2TEXT, dialog.llm_id)
     else:
-        llm_model_config = TenantLLMService.get_model_config(dialog.tenant_id, LLMType.CHAT, dialog.llm_id)
+        llm_type = LLMType.CHAT.value
+        llm_model_config = get_tenant_default_model_by_type(dialog.tenant_id, LLMType.CHAT)
     if rag_trace:
         rag_trace.set_llm_info(
             model_provider=llm_model_config.get("llm_factory") if llm_model_config else None,

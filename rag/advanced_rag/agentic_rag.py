@@ -33,6 +33,7 @@ from api.db.db_models import Document, Knowledgebase
 from rag.utils.tavily_conn import Tavily
 from common.token_utils import num_tokens_from_string
 from rag.utils.rag_trace import RagTraceCollector, _now_ms
+from rag.utils.retrieval_diagnostics import make_retrieval_variant, resolve_variant_knobs
 
 
 class RAGTools:
@@ -79,6 +80,7 @@ class RAGTools:
         # Set to True after the first retrieval tool has stamped the citation
         # rules onto its output, so subsequent retrieval calls don't repeat.
         self._citations_injected: bool = False
+        self._keyword_first_chunk_ids: dict[tuple[str, str, tuple[str, ...]], set[str]] = {}
 
         tools = [
             self.formalize_question,
@@ -670,11 +672,16 @@ class RAGTools:
             if not search_terms or using_embedding:
                 search_terms = question
 
-            embd_mdl = self.embed_mdl if using_embedding else None
-            # Vector contributes to ranking only when an embedding model is actually
-            # in play. With ``embd_mdl=None`` we MUST keep weight at 0 — otherwise
-            # the retriever silently falls back to whatever embedding it can find.
-            vector_weight = 0.7 if embd_mdl else 0
+            variant_name = "embedding_retry" if using_embedding else "keyword_first"
+            variant = make_retrieval_variant(variant_name)
+            variant_knobs = resolve_variant_knobs(
+                variant,
+                default_vector_similarity_weight=0.7 if self.embed_mdl else 0.0,
+                default_similarity_threshold=similarity_threshold,
+                embedding_available=self.embed_mdl is not None,
+            )
+            embd_mdl = self.embed_mdl if variant_knobs["using_embedding"] else None
+            vector_weight = variant_knobs["vector_similarity_weight"]
             retrieval_started_ms = _now_ms()
             kbinfos = await settings.retriever.retrieval(
                 search_terms,
@@ -705,6 +712,14 @@ class RAGTools:
                     used_embedding=bool(embd_mdl),
                     used_web=False,
                     started_ms=retrieval_started_ms,
+                    retrieval_variant=variant_knobs["retrieval_variant"],
+                    similarity_threshold=variant_knobs["similarity_threshold"],
+                    vector_similarity_weight=vector_weight,
+                    top_k=top_n,
+                    page_size=top_n,
+                    doc_scope_enabled=bool(docid_scope),
+                    metadata_filter_enabled=bool(self.meta_data_filter),
+                    diagnostics=self._retry_diagnostics(question, keywords, docid_scope, using_embedding, kbinfos.get("chunks", [])),
                 )
                 self.trace.add_evidence_from_chunks(
                     kbinfos.get("chunks", []),
@@ -727,6 +742,11 @@ class RAGTools:
                     "chunk_count": len(kbinfos.get("chunks", [])),
                     "doc_agg_count": len(kbinfos.get("doc_aggs", [])),
                     "retrieval_mode": mode,
+                    "retrieval_variant": variant_knobs["retrieval_variant"],
+                    "similarity_threshold": variant_knobs["similarity_threshold"],
+                    "vector_similarity_weight": vector_weight,
+                    "doc_scope_enabled": bool(docid_scope),
+                    "metadata_filter_enabled": bool(self.meta_data_filter),
                     "embedding_retry_used": bool(embd_mdl),
                 },
             )
@@ -734,6 +754,29 @@ class RAGTools:
         except Exception as e:
             self._trace_tool_end(tool_call_id, success=False, error=e)
             raise
+
+
+    def _retry_diagnostics(self, question: str, keywords: str, docid_scope: list[str] | None, using_embedding: bool, chunks: list[dict[str, Any]]) -> dict[str, Any]:
+        """Track keyword-first vs embedding-retry evidence deltas for traces."""
+        scope_key = tuple(sorted(docid_scope or []))
+        key = (question or "", keywords or "", scope_key)
+        chunk_ids = {str(c.get("chunk_id") or c.get("id")) for c in chunks if c.get("chunk_id") or c.get("id")}
+        if not using_embedding:
+            self._keyword_first_chunk_ids[key] = chunk_ids
+            return {
+                "keyword_first_chunk_count": len(chunk_ids),
+                "embedding_retry_zero_chunks": None,
+                "new_evidence_count": None,
+                "new_chunk_ids_after_retry": [],
+            }
+        previous = self._keyword_first_chunk_ids.get(key, set())
+        new_ids = sorted(chunk_ids - previous)
+        return {
+            "keyword_first_chunk_count": len(previous),
+            "embedding_retry_zero_chunks": len(chunk_ids) == 0,
+            "new_evidence_count": len(new_ids),
+            "new_chunk_ids_after_retry": new_ids[:32],
+        }
 
     def _resolve_doc_tenant(self, doc_id: str) -> tuple[str, str] | None:
         """Return ``(kb_id, tenant_id)`` for ``doc_id`` if and only if the

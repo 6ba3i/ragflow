@@ -95,32 +95,43 @@ def sanitize_for_trace(value: Any, *, key: str | None = None, depth: int = 0) ->
         return repr(value)[:_MAX_TEXT_LEN]
 
 
+def _first_present(mapping: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in mapping:
+            return mapping.get(key)
+    return None
+
+
+def _score_fields(chunk: dict[str, Any]) -> dict[str, Any]:
+    similarity = chunk.get("similarity")
+    final_score = chunk.get("final_score", chunk.get("score", similarity))
+    return {
+        "score": final_score,
+        "similarity": similarity,
+        "term_similarity": chunk.get("term_similarity"),
+        "vector_similarity": chunk.get("vector_similarity"),
+        "rank_feature_score": _first_present(chunk, ("rank_feature_score", "pagerank_fea", "rank_feature")),
+        "final_score": final_score,
+    }
+
+
 def summarize_chunks(chunks: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     """Summarize chunks without full content or vectors."""
     summarized = []
     for chunk in chunks or []:
-        summarized.append(
-            {
-                "chunk_id": chunk.get("chunk_id") or chunk.get("id"),
-                "doc_id": chunk.get("doc_id"),
-                "doc_title": chunk.get("docnm_kwd") or chunk.get("document_name"),
-                "source_uri": chunk.get("url"),
-                "score": chunk.get("score") or chunk.get("similarity"),
-                "term_similarity": chunk.get("term_similarity"),
-                "vector_similarity": chunk.get("vector_similarity"),
-            }
-        )
+        item = {
+            "chunk_id": chunk.get("chunk_id") or chunk.get("id"),
+            "doc_id": chunk.get("doc_id"),
+            "doc_title": chunk.get("docnm_kwd") or chunk.get("document_name"),
+            "source_uri": chunk.get("url"),
+        }
+        item.update(_score_fields(chunk))
+        summarized.append(item)
     return sanitize_for_trace(summarized)
 
 
 def _chunk_scores(chunk: dict[str, Any]) -> dict[str, Any]:
-    return sanitize_for_trace(
-        {
-            "score": chunk.get("score") or chunk.get("similarity"),
-            "term_similarity": chunk.get("term_similarity"),
-            "vector_similarity": chunk.get("vector_similarity"),
-        }
-    )
+    return sanitize_for_trace(_score_fields(chunk))
 
 
 def _chunk_position(chunk: dict[str, Any]) -> dict[str, Any]:
@@ -277,6 +288,14 @@ class RagTraceCollector:
         used_web: bool | None = None,
         started_ms: float | None = None,
         error: Exception | str | None = None,
+        retrieval_variant: str | None = None,
+        similarity_threshold: float | None = None,
+        vector_similarity_weight: float | None = None,
+        top_k: int | None = None,
+        page_size: int | None = None,
+        doc_scope_enabled: bool | None = None,
+        metadata_filter_enabled: bool | None = None,
+        diagnostics: dict[str, Any] | None = None,
     ) -> str | None:
         if not self.enabled:
             return None
@@ -295,6 +314,14 @@ class RagTraceCollector:
             "chunks": summarize_chunks(chunks),
             "used_embedding": used_embedding,
             "used_web": used_web,
+            "retrieval_variant": retrieval_variant,
+            "similarity_threshold": similarity_threshold,
+            "vector_similarity_weight": vector_similarity_weight,
+            "top_k": top_k,
+            "page_size": page_size,
+            "doc_scope_enabled": doc_scope_enabled,
+            "metadata_filter_enabled": metadata_filter_enabled,
+            "diagnostics": sanitize_for_trace(diagnostics or {}),
             "latency_ms": _duration_ms(started_ms),
             "error": sanitize_for_trace(str(error), key="error") if error else None,
         }
