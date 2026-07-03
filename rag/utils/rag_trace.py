@@ -145,7 +145,7 @@ def _chunk_position(chunk: dict[str, Any]) -> dict[str, Any]:
 
 
 def trace_enabled_from_env() -> bool:
-    return str(os.getenv("RAGFLOW_RAG_TRACE_ENABLED", "")).strip().lower() in {"1", "true", "yes", "on"}
+    return str(os.getenv("RAG_TRACE_ENABLED", "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class RagTraceCollector:
@@ -181,6 +181,7 @@ class RagTraceCollector:
             "retrieval_calls": [],
             "evidence_ledger": [],
             "citation_mappings": [],
+            "context_builder": [],
             "llm": {},
             "latency_ms": {},
             "token_usage": {},
@@ -194,7 +195,7 @@ class RagTraceCollector:
         # JSONL trace files are a server-side diagnostic sink only. Do not accept
         # request-controlled file paths from kwargs; callers may use the env var
         # to configure a deployment-owned output path.
-        output_path = os.getenv("RAGFLOW_RAG_TRACE_PATH")
+        output_path = os.getenv("RAG_TRACE_PATH")
         include_in_response = bool(kwargs.get("include_rag_trace") or kwargs.get("rag_trace_include_response"))
         if not (explicit_enabled or output_path or include_in_response or kwargs.get("rag_trace_collector")):
             return None
@@ -374,6 +375,14 @@ class RagTraceCollector:
                     }
                 )
             )
+
+    def add_context_builder_summary(self, summary: dict[str, Any] | None, *, stage: str | None = None) -> None:
+        if not self.enabled:
+            return
+        record = dict(summary or {})
+        if stage is not None:
+            record["stage"] = stage
+        self.data["context_builder"].append(sanitize_for_trace(record))
 
     def record_error(self, message: str, *, source: str | None = None) -> None:
         if not self.enabled:

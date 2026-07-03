@@ -54,6 +54,7 @@ from common.token_utils import num_tokens_from_string
 from rag.utils.tavily_conn import Tavily
 from rag.utils.tts_cache import synthesize_with_cache
 from rag.utils.rag_trace import RagTraceCollector, _now_ms
+from rag.utils.context_builder import EvidenceBundleConfig, apply_context_builder_to_kbinfos, mark_chunks_source_type
 from common.string_utils import remove_redundant_spaces
 from common import settings
 
@@ -629,6 +630,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         attachments_ = "\n\n".join(text_attachments)
 
     prompt_config = dialog.prompt_config
+    context_builder_config = EvidenceBundleConfig.from_env(kwargs)
     include_reference_metadata, metadata_fields = _resolve_reference_metadata(prompt_config, request_payload=kwargs)
     field_map = KnowledgebaseService.get_field_map(dialog.kb_ids)
     logging.debug(f"field_map retrieved: {field_map}")
@@ -639,18 +641,26 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         ans = await use_sql(questions[-1], field_map, dialog.tenant_id, chat_mdl, prompt_config.get("quote", True), dialog.kb_ids)
         # For aggregate queries (COUNT, SUM, etc.), chunks may be empty but answer is still valid
         if ans and (ans.get("reference", {}).get("chunks") or ans.get("answer")):
+            reference = ans.get("reference", {}) or {}
+            sql_context_result = apply_context_builder_to_kbinfos(reference, context_builder_config, source_type="sql")
+            if sql_context_result.bundle:
+                ans["reference"] = sql_context_result.kbinfos
+                reference = sql_context_result.kbinfos
             if rag_trace:
-                reference = ans.get("reference", {}) or {}
                 retrieval_call_id = rag_trace.add_retrieval_call(
                     mode="sql",
                     query_text=questions[-1],
                     docid_scope=dialog.kb_ids,
                     metadata_filters=dialog.meta_data_filter,
-                    chunks=reference.get("chunks", []),
-                    doc_aggs=reference.get("doc_aggs", []),
+                    chunks=(ans.get("reference", {}) or {}).get("chunks", []),
+                    doc_aggs=(ans.get("reference", {}) or {}).get("doc_aggs", []),
                     started_ms=sql_started_ms,
                 )
-                rag_trace.add_evidence_from_chunks(reference.get("chunks", []), source_type="sql", retrieval_call_id=retrieval_call_id)
+                rag_trace.add_evidence_from_chunks((ans.get("reference", {}) or {}).get("chunks", []), source_type="sql", retrieval_call_id=retrieval_call_id)
+                if sql_context_result.bundle:
+                    rag_trace.add_context_builder_summary(sql_context_result.bundle.summary(), stage="async_chat.sql")
+                else:
+                    rag_trace.add_context_builder_summary({"enabled": False, "candidate_evidence_count": len(reference.get("chunks", []))}, stage="async_chat.sql")
                 trace_payload = rag_trace.finish(
                     final_reference_count=len(reference.get("chunks", [])),
                     latency_timings={"sql": (timer() - check_langfuse_tracer_ts) * 1000},
@@ -800,6 +810,8 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                 web_started_ms = _now_ms()
                 tav = Tavily(prompt_config["tavily_api_key"])
                 tav_res = tav.retrieve_chunks(" ".join(questions))
+                if context_builder_config.enabled:
+                    mark_chunks_source_type(tav_res.get("chunks", []), "web")
                 kbinfos["chunks"].extend(tav_res["chunks"])
                 kbinfos["doc_aggs"].extend(tav_res["doc_aggs"])
                 if rag_trace:
@@ -827,6 +839,14 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
             metadata_fields,
         )
         _enrich_chunks_with_document_metadata(kbinfos.get("chunks", []), metadata_fields)
+
+    context_result = apply_context_builder_to_kbinfos(kbinfos, context_builder_config)
+    if rag_trace:
+        if context_result.bundle:
+            rag_trace.add_context_builder_summary(context_result.bundle.summary(), stage="async_chat.prompt")
+        else:
+            rag_trace.add_context_builder_summary({"enabled": False, "candidate_evidence_count": len(kbinfos.get("chunks", []))}, stage="async_chat.prompt")
+    kbinfos = context_result.kbinfos
 
     knowledges = kb_prompt(kbinfos, max_tokens)
     logging.debug("{}->{}".format(" ".join(questions), "\n->".join(knowledges)))
@@ -1911,6 +1931,7 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
                          kb_ids=dialog.kb_ids, 
                          tav=Tavily(prompt_config["tavily_api_key"]) if use_web_search else None,
                          trace=rag_trace,
+                         context_builder_config=EvidenceBundleConfig.from_env(kwargs),
                          )
 
     if dialog.llm_id:
@@ -1961,9 +1982,10 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
             think = ans[0] + "</think>"
             answer = ans[1]
 
-        answer, _ = repair_bad_citation_formats(answer, rag_tools.kbinfos, set([]))
+        final_kbinfos = rag_tools.context_kbinfos(stage="rag_agent.final_reference")
+        answer, _ = repair_bad_citation_formats(answer, final_kbinfos, set([]))
 
-        refs = deepcopy(rag_tools.kbinfos)
+        refs = deepcopy(final_kbinfos)
         for c in refs["chunks"]:
             if c.get("vector"):
                 del c["vector"]

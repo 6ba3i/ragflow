@@ -21,6 +21,8 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Literal
 
+from rag.utils.context_builder import EvidenceBundleConfig, apply_context_builder_to_kbinfos
+
 RetrievalVariantName = Literal[
     "hybrid_default",
     "bm25_only",
@@ -250,7 +252,43 @@ def make_ablation_row(
         "chunks": slim_chunks,
         "doc_ids": doc_ids,
         "duplicate_doc_ratio": duplicate_doc_ratio(slim_chunks),
+        "context_builder_metrics": make_context_builder_metrics(chunks),
         "errors": errors or [],
+    }
+
+
+def make_context_builder_metrics(chunks: list[dict[str, Any]] | dict[str, Any] | None) -> dict[str, Any]:
+    """Unlabeled same-candidate context-builder metrics for offline ablations."""
+
+    if isinstance(chunks, dict):
+        chunks = chunks.get("chunks", [])
+    chunks = chunks or []
+    current = apply_context_builder_to_kbinfos({"chunks": chunks, "doc_aggs": []}, EvidenceBundleConfig(enabled=False))
+    deduped = apply_context_builder_to_kbinfos({"chunks": chunks, "doc_aggs": []}, EvidenceBundleConfig(enabled=True))
+    max_per_doc = apply_context_builder_to_kbinfos({"chunks": chunks, "doc_aggs": []}, EvidenceBundleConfig(enabled=True, max_chunks_per_doc=1))
+    source_types = {str(c.get("_ragflow_source_type") or c.get("source_type") or ("web" if c.get("url") and c.get("doc_id") == c.get("chunk_id") else "kb")) for c in chunks if isinstance(c, dict)}
+    doc_ids = {c.get("doc_id") for c in chunks if isinstance(c, dict) and c.get("doc_id")}
+    token_estimate = deduped.bundle.summary()["estimated_context_tokens"] if deduped.bundle else 0
+    return {
+        "variants": [
+            "current_top_n",
+            "accumulated_kbinfos_as_is",
+            "doc_dedup",
+            "max_chunks_per_doc",
+            "evidence_bundle_builder",
+            "larger_top_n_only",
+        ],
+        "candidate_count": len(chunks),
+        "current_selected_count": len(current.kbinfos.get("chunks", [])),
+        "dedup_selected_count": len(deduped.kbinfos.get("chunks", [])),
+        "max_chunks_per_doc_selected_count": len(max_per_doc.kbinfos.get("chunks", [])),
+        "rejected_count": deduped.bundle.summary()["rejected_evidence_count"] if deduped.bundle else 0,
+        "duplicate_ratio": duplicate_doc_ratio(chunks),
+        "source_diversity": len(source_types),
+        "document_diversity": len(doc_ids),
+        "estimated_context_tokens": token_estimate,
+        "citation_mapping_completeness": 1.0 if not deduped.bundle or all(r.citation_index is not None for r in deduped.bundle.selected) else 0.0,
+        "labeled_metrics": {"status": "not_computed", "reason": "No labels supplied; context-builder ablation reports unlabeled metrics only."},
     }
 
 
@@ -311,6 +349,9 @@ def build_ablation_summary(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
             "avg_returned_chunks": _avg(chunk_counts),
             "avg_unique_docs": _avg(unique_doc_counts),
             "avg_duplicate_doc_ratio": _avg(dup_ratios),
+            "avg_context_builder_dedup_selected": _avg([float((r.get("context_builder_metrics") or {}).get("dedup_selected_count", 0)) for r in items]),
+            "avg_context_builder_rejected": _avg([float((r.get("context_builder_metrics") or {}).get("rejected_count", 0)) for r in items]),
+            "avg_context_builder_tokens": _avg([float((r.get("context_builder_metrics") or {}).get("estimated_context_tokens", 0)) for r in items]),
             "score_components": score_summary(all_chunks),
         }
 

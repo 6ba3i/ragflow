@@ -33,6 +33,7 @@ from api.db.db_models import Document, Knowledgebase
 from rag.utils.tavily_conn import Tavily
 from common.token_utils import num_tokens_from_string
 from rag.utils.rag_trace import RagTraceCollector, _now_ms
+from rag.utils.context_builder import EvidenceBundleConfig, apply_context_builder_to_kbinfos, mark_chunks_source_type
 from rag.utils.retrieval_diagnostics import make_retrieval_variant, resolve_variant_knobs
 
 
@@ -47,6 +48,7 @@ class RAGTools:
                  meta_data_filter: dict | None = None,
                  user_defined_prompts: dict | None = None,
                  trace: RagTraceCollector | None = None,
+                 context_builder_config: EvidenceBundleConfig | None = None,
                  ):
         self.tenant_ids = tenant_ids
         self.chat_mdl = deepcopy(chat_mdl)
@@ -73,6 +75,7 @@ class RAGTools:
         self.meta_data_filter = meta_data_filter
         self.user_defined_prompts = user_defined_prompts or {}
         self.trace = trace
+        self.context_builder_config = context_builder_config or EvidenceBundleConfig.from_env()
         # Accumulator for chunks/doc_aggs across tool calls within a turn —
         # populated by ``search_knowledge_bases`` and ``search_structured_data``
         # so the final answer can cite everything retrieved so far.
@@ -96,6 +99,25 @@ class RAGTools:
         if self.kb_ids:
             tools.append(self.summarize_document)
         chat_mdl.bind_tools(None, tools)
+
+    def context_kbinfos(self, *, stage: str | None = None, start_citation_index: int = 0) -> dict[str, Any]:
+        result = apply_context_builder_to_kbinfos(
+            self.kbinfos,
+            self.context_builder_config,
+            start_citation_index=start_citation_index,
+        )
+        if self.trace:
+            if result.bundle:
+                self.trace.add_context_builder_summary(result.bundle.summary(), stage=stage)
+            else:
+                self.trace.add_context_builder_summary(
+                    {"enabled": False, "candidate_evidence_count": len(self.kbinfos.get("chunks", []))},
+                    stage=stage,
+                )
+        return result.kbinfos
+
+    def _prompt_start_idx(self, start_idx: int) -> int:
+        return 0 if self.context_builder_config.enabled else start_idx
 
     def _trace_tool_start(self, name: str, args: dict[str, Any] | None = None, *, retrieval_mode: str | None = None) -> str | None:
         if not self.trace:
@@ -729,10 +751,13 @@ class RAGTools:
                     start_citation_index=start_idx,
                 )
             if kbinfos:
+                if self.context_builder_config.enabled:
+                    mark_chunks_source_type(kbinfos.get("chunks", []), "kb")
                 self.kbinfos["chunks"].extend(kbinfos.get("chunks", []))
                 self.kbinfos["doc_aggs"].extend(kbinfos.get("doc_aggs", []))
+            prompt_kbinfos = self.context_kbinfos(stage="rag_agent.search_knowledge_bases", start_citation_index=self._prompt_start_idx(start_idx))
             result = self._with_citation_guidelines(
-                kb_prompt(self.kbinfos, self.chat_mdl.max_length, start_idx)
+                kb_prompt(prompt_kbinfos, self.chat_mdl.max_length, self._prompt_start_idx(start_idx))
             )
             self._trace_tool_end(
                 tool_call_id,
@@ -908,10 +933,13 @@ class RAGTools:
                     start_citation_index=start_idx,
                 )
             if kbinfos:
+                if self.context_builder_config.enabled:
+                    mark_chunks_source_type(kbinfos.get("chunks", []), "summary")
                 self.kbinfos["chunks"].extend(kbinfos.get("chunks", []))
                 self.kbinfos["doc_aggs"].extend(kbinfos.get("doc_aggs", []))
+            prompt_kbinfos = self.context_kbinfos(stage="rag_agent.summarize_document", start_citation_index=self._prompt_start_idx(start_idx))
             result = self._with_citation_guidelines(
-                kb_prompt(self.kbinfos, self.chat_mdl.max_length, start_idx)
+                kb_prompt(prompt_kbinfos, self.chat_mdl.max_length, self._prompt_start_idx(start_idx))
             )
             self._trace_tool_end(tool_call_id, result=result, result_summary={"retrieval_call_id": retrieval_call_id, "chunk_count": len(cks), "doc_id": doc_id})
             return result
@@ -1004,6 +1032,8 @@ class RAGTools:
                     start_citation_index=start_idx,
                 )
             if new_chunks:
+                if self.context_builder_config.enabled:
+                    mark_chunks_source_type(new_chunks, "sql")
                 self.kbinfos["chunks"].extend(new_chunks)
             if new_doc_aggs:
                 self.kbinfos["doc_aggs"].extend(new_doc_aggs)
@@ -1056,10 +1086,13 @@ class RAGTools:
                     tool_call_id=tool_call_id,
                     start_citation_index=start_idx,
                 )
+            if self.context_builder_config.enabled:
+                mark_chunks_source_type(tav_res.get("chunks", []), "web")
             self.kbinfos["chunks"].extend(tav_res["chunks"])
             self.kbinfos["doc_aggs"].extend(tav_res["doc_aggs"])
+            prompt_kbinfos = self.context_kbinfos(stage="rag_agent.web_search", start_citation_index=self._prompt_start_idx(start_idx))
             result = self._with_citation_guidelines(
-                kb_prompt(self.kbinfos, self.chat_mdl.max_length, start_idx)
+                kb_prompt(prompt_kbinfos, self.chat_mdl.max_length, self._prompt_start_idx(start_idx))
             )
             self._trace_tool_end(tool_call_id, result=result, result_summary={"retrieval_call_id": retrieval_call_id, "chunk_count": len(tav_res.get("chunks", [])), "doc_agg_count": len(tav_res.get("doc_aggs", [])), "used_web": True})
             return result
