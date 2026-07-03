@@ -328,6 +328,8 @@ async def agent_bot_logs(shared_id, message_id):
 @add_tenant_id_to_kwargs
 @validate_request("question", "kb_ids")
 async def ask_about_embedded(tenant_id=None):
+    if not tenant_id:
+        return get_error_data_result(message="permission denined.")
     req = await get_request_json()
     uid = tenant_id
 
@@ -366,6 +368,8 @@ async def ask_about_embedded(tenant_id=None):
 @add_tenant_id_to_kwargs
 @validate_request("kb_id", "question")
 async def retrieval_test_embedded(tenant_id=None):
+    if not tenant_id:
+        return get_error_data_result(message="permission denined.")
     req = await get_request_json()
     page = int(req.get("page", 1))
     size = int(req.get("size", 30))
@@ -385,8 +389,6 @@ async def retrieval_test_embedded(tenant_id=None):
         return get_error_data_result("`top_k` must be greater than 0")
     langs = req.get("cross_languages", [])
     rerank_id = req.get("rerank_id", "")
-    if not tenant_id:
-        return get_error_data_result(message="permission denined.")
     search_config = {}
 
     async def _retrieval():
@@ -568,6 +570,8 @@ async def detail_share_embedded(tenant_id=None):
 @add_tenant_id_to_kwargs
 @validate_request("question", "kb_ids")
 async def mindmap(tenant_id=None):
+    if not tenant_id:
+        return get_error_data_result(message="permission denined.")
     req = await get_request_json()
 
     search_id = req.get("search_id", "")
