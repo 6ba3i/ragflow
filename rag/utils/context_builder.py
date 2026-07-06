@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover - optional in small unit-test environmen
     num_tokens_from_string = None  # type: ignore[assignment]
 
 EvidenceSourceType = Literal["kb", "sql", "web", "summary"]
+ContextDiversityStrategy = Literal["rank", "source_round_robin"]
 _SOURCE_PRIORITY = {"kb": 0, "sql": 1, "web": 2, "summary": 3}
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
@@ -40,16 +41,27 @@ class EvidenceBundleConfig:
     max_chunks: int | None = None
     max_chunks_per_doc: int | None = None
     max_context_tokens: int | None = None
+    diversity_enabled: bool = False
+    diversity_strategy: ContextDiversityStrategy = "rank"
+    max_chunks_per_source: int | None = None
+    max_source_fraction: float | None = None
 
     @classmethod
     def from_env(cls, overrides: dict[str, Any] | None = None) -> "EvidenceBundleConfig":
         overrides = overrides or {}
         enabled = _bool_setting(overrides.get("context_builder_enabled"), "CONTEXT_BUILDER_ENABLED", False)
+        strategy = str(overrides.get("context_diversity_strategy") or os.getenv("CONTEXT_DIVERSITY_STRATEGY") or "rank").strip().lower()
+        if strategy not in {"rank", "source_round_robin"}:
+            strategy = "rank"
         return cls(
             enabled=enabled,
             max_chunks=_int_setting(overrides.get("context_max_chunks"), "CONTEXT_MAX_CHUNKS"),
             max_chunks_per_doc=_int_setting(overrides.get("context_max_chunks_per_doc"), "CONTEXT_MAX_CHUNKS_PER_DOC"),
             max_context_tokens=_int_setting(overrides.get("context_max_tokens"), "CONTEXT_MAX_TOKENS"),
+            diversity_enabled=_bool_setting(overrides.get("context_diversity_enabled"), "CONTEXT_DIVERSITY_ENABLED", False),
+            diversity_strategy=strategy,  # type: ignore[arg-type]
+            max_chunks_per_source=_int_setting(overrides.get("context_max_chunks_per_source"), "CONTEXT_MAX_CHUNKS_PER_SOURCE"),
+            max_source_fraction=_float_setting(overrides.get("context_max_source_fraction"), "CONTEXT_MAX_SOURCE_FRACTION"),
         )
 
 
@@ -98,6 +110,7 @@ class EvidenceBundle:
         source_counts = Counter(r.source_type for r in self.records)
         selected_source_counts = Counter(r.source_type for r in self.selected)
         per_doc_selected = Counter(r.doc_id for r in self.selected if r.doc_id)
+        per_source_selected = Counter(_source_group_key(r) for r in self.selected if r.source_type == "kb")
         citation_mapping = [
             {
                 "citation_index": r.citation_index,
@@ -119,11 +132,16 @@ class EvidenceBundle:
             "max_chunks": self.config.max_chunks,
             "max_chunks_per_doc": self.config.max_chunks_per_doc,
             "max_context_tokens": self.config.max_context_tokens,
+            "diversity_enabled": self.config.diversity_enabled,
+            "diversity_strategy": self.config.diversity_strategy,
+            "max_chunks_per_source": self.config.max_chunks_per_source,
+            "max_source_fraction": self.config.max_source_fraction,
             "selected_evidence_ids": [r.evidence_id for r in self.selected[:_MAX_TRACE_IDS]],
             "citation_index_mapping": citation_mapping,
             "source_type_counts": dict(sorted(source_counts.items())),
             "selected_source_type_counts": dict(sorted(selected_source_counts.items())),
             "per_document_selected_counts": dict(sorted((str(k), v) for k, v in per_doc_selected.items())),
+            "per_source_selected_counts": dict(sorted((str(k), v) for k, v in per_source_selected.items())),
             "estimated_context_tokens": estimated_tokens,
         }
 
@@ -160,6 +178,18 @@ def _int_setting(value: Any, env_name: str, default: int | None = None) -> int |
         return default
     try:
         parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _float_setting(value: Any, env_name: str, default: float | None = None) -> float | None:
+    if value is None:
+        value = os.getenv(env_name)
+    if value in (None, ""):
+        return default
+    try:
+        parsed = float(value)
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
@@ -265,10 +295,20 @@ def build_context_bundle(
     used_tokens = 0
 
     ordered = sorted(records, key=lambda record: _record_sort_key(record, config))
+    if config.diversity_enabled and config.diversity_strategy == "source_round_robin":
+        ordered = _round_robin_by_source(ordered)
+
+    source_limit = _source_limit(config)
+    per_source: defaultdict[str, int] = defaultdict(int)
+
     for record in ordered:
         dup_key = _dedupe_key(record)
+        source_key = _source_group_key(record)
         if dup_key in seen:
             _reject(record, "duplicate", rejected)
+            continue
+        if config.diversity_enabled and source_limit and record.source_type == "kb" and per_source[source_key] >= source_limit:
+            _reject(record, "max_chunks_per_source", rejected)
             continue
         if config.max_chunks is not None and len(selected) >= config.max_chunks:
             _reject(record, "max_chunks", rejected)
@@ -292,6 +332,8 @@ def build_context_bundle(
         used_tokens += estimated
         if record.source_type == "kb" and record.doc_id:
             per_doc[record.doc_id] += 1
+        if config.diversity_enabled and record.source_type == "kb":
+            per_source[source_key] += 1
     return EvidenceBundle(records=ordered, selected=selected, rejected=rejected, config=config)
 
 
@@ -338,6 +380,34 @@ def _record_sort_key(record: EvidenceRecord, _config: EvidenceBundleConfig) -> t
     return (record.rank, record.evidence_id)
 
 
+def _round_robin_by_source(records: list[EvidenceRecord]) -> list[EvidenceRecord]:
+    buckets: dict[str, list[EvidenceRecord]] = defaultdict(list)
+    source_order: list[str] = []
+    for record in records:
+        source_key = _source_group_key(record)
+        if source_key not in buckets:
+            source_order.append(source_key)
+        buckets[source_key].append(record)
+    for bucket in buckets.values():
+        bucket.sort(key=lambda record: _record_sort_key(record, EvidenceBundleConfig(enabled=True)))
+
+    ordered: list[EvidenceRecord] = []
+    while any(buckets.values()):
+        for source_key in source_order:
+            if buckets[source_key]:
+                ordered.append(buckets[source_key].pop(0))
+    return ordered
+
+
+def _source_limit(config: EvidenceBundleConfig) -> int | None:
+    limits: list[int] = []
+    if config.max_chunks_per_source:
+        limits.append(config.max_chunks_per_source)
+    if config.max_chunks and config.max_source_fraction:
+        limits.append(max(1, int(config.max_chunks * config.max_source_fraction + 0.999999)))
+    return min(limits) if limits else None
+
+
 def _dedupe_key(record: EvidenceRecord) -> tuple[str, str]:
     if record.source_type == "web":
         if record.source_uri:
@@ -362,6 +432,27 @@ def _section_key(section_page_order: dict[str, Any]) -> str:
 
 def _normalized_uri(uri: str) -> str:
     return (uri or "").strip().lower().rstrip("/")
+
+
+def _normalized_doc_title(title: str | None) -> str:
+    value = (title or "").strip().lower()
+    if not value:
+        return ""
+    value = re.sub(r"\(\d+\)(?=\.[^.]+$|$)", "", value)
+    value = re.sub(r"\.[a-z0-9]{1,8}$", "", value)
+    value = re.sub(r"[_\s]+", " ", value)
+    return value.strip()
+
+
+def _source_group_key(record: EvidenceRecord) -> str:
+    title = _normalized_doc_title(record.doc_title)
+    if title:
+        return f"title:{title}"
+    if record.source_uri:
+        return f"uri:{_normalized_uri(record.source_uri)}"
+    if record.doc_id:
+        return f"doc:{record.doc_id}"
+    return f"evidence:{record.evidence_id}"
 
 
 def _content_hash(content: str) -> str:

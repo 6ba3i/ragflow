@@ -35,6 +35,7 @@ from common.token_utils import num_tokens_from_string
 from rag.utils.rag_trace import RagTraceCollector, _now_ms
 from rag.utils.context_builder import EvidenceBundleConfig, apply_context_builder_to_kbinfos, mark_chunks_source_type
 from rag.utils.retrieval_diagnostics import make_retrieval_variant, resolve_variant_knobs
+from rag.utils.retrieval_fusion import FusionConfig
 
 
 class RAGTools:
@@ -702,7 +703,8 @@ class RAGTools:
                 default_similarity_threshold=similarity_threshold,
                 embedding_available=self.embed_mdl is not None,
             )
-            embd_mdl = self.embed_mdl if variant_knobs["using_embedding"] else None
+            fusion_config = FusionConfig.from_env()
+            embd_mdl = self.embed_mdl if (variant_knobs["using_embedding"] or fusion_config.enabled) else None
             vector_weight = variant_knobs["vector_similarity_weight"]
             retrieval_started_ms = _now_ms()
             kbinfos = await settings.retriever.retrieval(
@@ -741,7 +743,16 @@ class RAGTools:
                     page_size=top_n,
                     doc_scope_enabled=bool(docid_scope),
                     metadata_filter_enabled=bool(self.meta_data_filter),
-                    diagnostics=self._retry_diagnostics(question, keywords, docid_scope, using_embedding, kbinfos.get("chunks", [])),
+                    diagnostics=self._retrieval_diagnostics(
+                        question,
+                        keywords,
+                        docid_scope,
+                        using_embedding,
+                        kbinfos.get("chunks", []),
+                        kbinfos,
+                        fusion_config,
+                        bool(embd_mdl),
+                    ),
                 )
                 self.trace.add_evidence_from_chunks(
                     kbinfos.get("chunks", []),
@@ -773,6 +784,7 @@ class RAGTools:
                     "doc_scope_enabled": bool(docid_scope),
                     "metadata_filter_enabled": bool(self.meta_data_filter),
                     "embedding_retry_used": bool(embd_mdl),
+                    "effective_mode": "fusion" if (kbinfos.get("diagnostics", {}).get("fusion") or {}).get("enabled") else mode,
                 },
             )
             return result
@@ -780,6 +792,32 @@ class RAGTools:
             self._trace_tool_end(tool_call_id, success=False, error=e)
             raise
 
+
+    def _retrieval_diagnostics(
+        self,
+        question: str,
+        keywords: str,
+        docid_scope: list[str] | None,
+        using_embedding: bool,
+        chunks: list[dict[str, Any]],
+        kbinfos: dict[str, Any],
+        fusion_config: FusionConfig,
+        used_embedding_for_fusion: bool,
+    ) -> dict[str, Any]:
+        diagnostics = self._retry_diagnostics(question, keywords, docid_scope, using_embedding, chunks)
+        fusion = (kbinfos.get("diagnostics") or {}).get("fusion") or kbinfos.get("fusion")
+        requested_mode = "embedding" if using_embedding else "keyword"
+        diagnostics["retrieval"] = {
+            "requested_mode": requested_mode,
+            "effective_mode": "fusion" if fusion and fusion.get("enabled") else requested_mode,
+            "used_embedding_for_fusion": bool(fusion_config.enabled and used_embedding_for_fusion),
+        }
+        if fusion:
+            diagnostics["fusion"] = fusion
+            notes = fusion.get("fallback_notes") or []
+            if notes:
+                diagnostics["retrieval"]["fallback_note"] = notes[0]
+        return diagnostics
 
     def _retry_diagnostics(self, question: str, keywords: str, docid_scope: list[str] | None, using_embedding: bool, chunks: list[dict[str, Any]]) -> dict[str, Any]:
         """Track keyword-first vs embedding-retry evidence deltas for traces."""

@@ -17,6 +17,7 @@ import json
 import logging
 import re
 import math
+import time
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 
@@ -28,6 +29,7 @@ from common.float_utils import get_float
 from common.constants import PAGERANK_FLD, TAG_FLD
 from common.tag_feature_utils import parse_tag_features
 from common import settings
+from rag.utils.retrieval_fusion import FusionConfig, fuse_retrieval_lanes, merge_child_fusion_metadata
 
 from common.misc_utils import thread_pool_exec
 
@@ -587,10 +589,31 @@ class Dealer:
             highlight=False,
             rank_feature: dict | None = {PAGERANK_FLD: 10},
             trace_id=None,
+            _fusion_internal: bool = False,
     ):
         ranks = {"total": 0, "chunks": [], "doc_aggs": {}}
         if not question:
             return ranks
+
+        fusion_config = FusionConfig.from_env()
+        if fusion_config.enabled and not _fusion_internal and rerank_mdl is None:
+            return await self._retrieval_with_fusion(
+                question,
+                embd_mdl,
+                tenant_ids,
+                kb_ids,
+                page,
+                page_size,
+                similarity_threshold=similarity_threshold,
+                vector_similarity_weight=vector_similarity_weight,
+                top=top,
+                doc_ids=doc_ids,
+                aggs=aggs,
+                highlight=highlight,
+                rank_feature=rank_feature,
+                trace_id=trace_id,
+                config=fusion_config,
+            )
 
         # Candidate window for block-based pagination. It MUST stay a multiple
         # of page_size so the block fetched (global_offset // RERANK_LIMIT) and
@@ -769,6 +792,113 @@ class Dealer:
             ranks["doc_aggs"] = []
 
         return ranks
+
+    async def _retrieval_with_fusion(
+            self,
+            question,
+            embd_mdl,
+            tenant_ids,
+            kb_ids,
+            page,
+            page_size,
+            similarity_threshold=0.2,
+            vector_similarity_weight=0.3,
+            top=1024,
+            doc_ids=None,
+            aggs=True,
+            highlight=False,
+            rank_feature: dict | None = None,
+            trace_id=None,
+            config: FusionConfig | None = None,
+    ):
+        """Opt-in Phase 2 sparse+dense fusion before Phase 3 context building."""
+        config = config or FusionConfig.from_env()
+        started_total = time.perf_counter()
+        page = max(page, 1)
+        global_offset = (page - 1) * page_size
+        lane_window = min(int(top), max(int(config.window), global_offset + page_size)) if top else max(int(config.window), global_offset + page_size)
+        lane_window = max(page_size, lane_window)
+        fallback_notes: list[str] = []
+        latencies: dict[str, float] = {}
+
+        sparse_start = time.perf_counter()
+        sparse = await self.retrieval(
+            question,
+            None,
+            tenant_ids,
+            kb_ids,
+            1,
+            lane_window,
+            similarity_threshold,
+            vector_similarity_weight=0.0,
+            top=top,
+            doc_ids=doc_ids,
+            aggs=aggs,
+            rerank_mdl=None,
+            highlight=highlight,
+            rank_feature=rank_feature,
+            trace_id=trace_id,
+            _fusion_internal=True,
+        )
+        latencies["sparse"] = round((time.perf_counter() - sparse_start) * 1000, 3)
+
+        dense = {"total": 0, "chunks": [], "doc_aggs": []}
+        if embd_mdl is None:
+            fallback_notes.append("dense_fallback:embedding_unavailable")
+        else:
+            dense_start = time.perf_counter()
+            dense = await self.retrieval(
+                question,
+                embd_mdl,
+                tenant_ids,
+                kb_ids,
+                1,
+                lane_window,
+                similarity_threshold,
+                vector_similarity_weight=1.0,
+                top=top,
+                doc_ids=doc_ids,
+                aggs=aggs,
+                rerank_mdl=None,
+                highlight=highlight,
+                rank_feature=rank_feature,
+                trace_id=trace_id,
+                _fusion_internal=True,
+            )
+            latencies["dense"] = round((time.perf_counter() - dense_start) * 1000, 3)
+            fallback_notes.append("dense_lane:dense_best_effort_existing_embedding_path")
+
+        fusion_start = time.perf_counter()
+        sparse_chunks = sparse.get("chunks", []) if isinstance(sparse, dict) else []
+        dense_chunks = dense.get("chunks", []) if isinstance(dense, dict) else []
+        from rag.utils.retrieval_fusion import lane_candidates_from_chunks
+        sparse_candidates = lane_candidates_from_chunks(
+            sparse_chunks,
+            lane="sparse",
+            requested_lane="sparse",
+            effective_lane="sparse",
+        )
+        dense_candidates = lane_candidates_from_chunks(
+            dense_chunks,
+            lane="dense",
+            requested_lane="dense",
+            effective_lane="dense_best_effort" if embd_mdl is not None else "unavailable",
+            fallback_note="dense_best_effort_existing_embedding_path" if embd_mdl is not None else "embedding_unavailable",
+        )
+        fusion = fuse_retrieval_lanes(
+            {"sparse": sparse_candidates, "dense": dense_candidates},
+            config,
+            fallback_notes=fallback_notes,
+        )
+        latencies["fusion"] = round((time.perf_counter() - fusion_start) * 1000, 3)
+        latencies["total"] = round((time.perf_counter() - started_total) * 1000, 3)
+        fused = fusion.to_kbinfos({"doc_aggs": sparse.get("doc_aggs", []), "total": sparse.get("total", 0)}, offset=global_offset, limit=page_size)
+        fused.setdefault("diagnostics", {}).setdefault("fusion", fusion.diagnostics)
+        fused["diagnostics"]["fusion"]["latency_ms"] = latencies
+        fused["fusion"] = fused["diagnostics"]["fusion"]
+        if not aggs:
+            fused["doc_aggs"] = []
+        return fused
 
     def sql_retrieval(self, sql, fetch_size=128, format="json"):
         tbl = self.dataStore.sql(sql, fetch_size, format)
@@ -976,6 +1106,9 @@ class Dealer:
                     d["vector"] = cks[0][k]
                     vector_size = len(cks[0][k])
                     break
+            fusion_meta = merge_child_fusion_metadata(cks)
+            if fusion_meta:
+                d["_ragflow_fusion"] = fusion_meta
             chunks.append(d)
 
         return sorted(chunks, key=lambda x: x["similarity"] * -1)

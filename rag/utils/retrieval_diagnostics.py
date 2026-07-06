@@ -30,9 +30,34 @@ RetrievalVariantName = Literal[
     "hybrid_weighted",
     "keyword_first",
     "embedding_retry",
+    "current_weighted",
+    "linear_sparse_dense",
+    "rrf_sparse_dense",
+    "title_first_bm25_dense_rrf",
+    "rrf_max_chunks_per_doc",
+    "rrf_doc_section_diversity",
 ]
 
 DEFAULT_RETRIEVAL_VARIANT: RetrievalVariantName = "hybrid_default"
+PHASE2_FUSION_ABLATION_VARIANTS: tuple[str, ...] = (
+    "current_weighted",
+    "bm25_only",
+    "dense_only",
+    "linear_sparse_dense",
+    "rrf_sparse_dense",
+    "title_first_bm25_dense_rrf",
+    "rrf_max_chunks_per_doc",
+    "rrf_doc_section_diversity",
+)
+
+PHASE2_FUSION_INTERNAL_ALIASES: tuple[str, ...] = (
+    "fusion_current_weighted",
+    "fusion_linear",
+    "fusion_rrf",
+    "fusion_rrf_diversity",
+    "fusion_doc_level",
+)
+
 SUPPORTED_RETRIEVAL_VARIANTS: tuple[RetrievalVariantName, ...] = (
     "hybrid_default",
     "bm25_only",
@@ -40,6 +65,12 @@ SUPPORTED_RETRIEVAL_VARIANTS: tuple[RetrievalVariantName, ...] = (
     "hybrid_weighted",
     "keyword_first",
     "embedding_retry",
+    "current_weighted",
+    "linear_sparse_dense",
+    "rrf_sparse_dense",
+    "title_first_bm25_dense_rrf",
+    "rrf_max_chunks_per_doc",
+    "rrf_doc_section_diversity",
 )
 
 
@@ -88,6 +119,22 @@ def make_retrieval_variant(
             using_embedding=False,
             vector_similarity_weight=0.0,
             similarity_threshold=similarity_threshold,
+        )
+    if variant_name == "current_weighted":
+        return RetrievalVariant(
+            name="current_weighted",
+            using_embedding=True,
+            vector_similarity_weight=None if vector_similarity_weight is None else _clamp_weight(vector_similarity_weight),
+            similarity_threshold=similarity_threshold,
+            note="Phase 2 ablation baseline: preserves the current weighted retrieval behavior for comparison.",
+        )
+    if variant_name in {"linear_sparse_dense", "rrf_sparse_dense", "title_first_bm25_dense_rrf", "rrf_max_chunks_per_doc", "rrf_doc_section_diversity"}:
+        return RetrievalVariant(
+            name=variant_name,  # type: ignore[arg-type]
+            using_embedding=True,
+            vector_similarity_weight=_clamp_weight(0.5 if vector_similarity_weight is None else vector_similarity_weight),
+            similarity_threshold=similarity_threshold,
+            note=f"Phase 2 fusion ablation variant '{variant_name}' represented for offline diagnostics; labeled metrics are not computed without labels.",
         )
     if variant_name == "dense_only":
         return RetrievalVariant(
@@ -257,17 +304,21 @@ def make_ablation_row(
     }
 
 
+def phase2_ablation_variants() -> tuple[str, ...]:
+    return PHASE2_FUSION_ABLATION_VARIANTS
+
+
 def make_context_builder_metrics(chunks: list[dict[str, Any]] | dict[str, Any] | None) -> dict[str, Any]:
     """Unlabeled same-candidate context-builder metrics for offline ablations."""
 
     if isinstance(chunks, dict):
         chunks = chunks.get("chunks", [])
-    chunks = chunks or []
-    current = apply_context_builder_to_kbinfos({"chunks": chunks, "doc_aggs": []}, EvidenceBundleConfig(enabled=False))
-    deduped = apply_context_builder_to_kbinfos({"chunks": chunks, "doc_aggs": []}, EvidenceBundleConfig(enabled=True))
-    max_per_doc = apply_context_builder_to_kbinfos({"chunks": chunks, "doc_aggs": []}, EvidenceBundleConfig(enabled=True, max_chunks_per_doc=1))
-    source_types = {str(c.get("_ragflow_source_type") or c.get("source_type") or ("web" if c.get("url") and c.get("doc_id") == c.get("chunk_id") else "kb")) for c in chunks if isinstance(c, dict)}
-    doc_ids = {c.get("doc_id") for c in chunks if isinstance(c, dict) and c.get("doc_id")}
+    chunk_list = [chunk for chunk in (chunks or []) if isinstance(chunk, dict)]
+    current = apply_context_builder_to_kbinfos({"chunks": chunk_list, "doc_aggs": []}, EvidenceBundleConfig(enabled=False))
+    deduped = apply_context_builder_to_kbinfos({"chunks": chunk_list, "doc_aggs": []}, EvidenceBundleConfig(enabled=True))
+    max_per_doc = apply_context_builder_to_kbinfos({"chunks": chunk_list, "doc_aggs": []}, EvidenceBundleConfig(enabled=True, max_chunks_per_doc=1))
+    source_types = {str(c.get("_ragflow_source_type") or c.get("source_type") or ("web" if c.get("url") and c.get("doc_id") == c.get("chunk_id") else "kb")) for c in chunk_list}
+    doc_ids = {c.get("doc_id") for c in chunk_list if c.get("doc_id")}
     token_estimate = deduped.bundle.summary()["estimated_context_tokens"] if deduped.bundle else 0
     return {
         "variants": [
@@ -277,13 +328,14 @@ def make_context_builder_metrics(chunks: list[dict[str, Any]] | dict[str, Any] |
             "max_chunks_per_doc",
             "evidence_bundle_builder",
             "larger_top_n_only",
+            *PHASE2_FUSION_ABLATION_VARIANTS,
         ],
-        "candidate_count": len(chunks),
+        "candidate_count": len(chunk_list),
         "current_selected_count": len(current.kbinfos.get("chunks", [])),
         "dedup_selected_count": len(deduped.kbinfos.get("chunks", [])),
         "max_chunks_per_doc_selected_count": len(max_per_doc.kbinfos.get("chunks", [])),
         "rejected_count": deduped.bundle.summary()["rejected_evidence_count"] if deduped.bundle else 0,
-        "duplicate_ratio": duplicate_doc_ratio(chunks),
+        "duplicate_ratio": duplicate_doc_ratio(chunk_list),
         "source_diversity": len(source_types),
         "document_diversity": len(doc_ids),
         "estimated_context_tokens": token_estimate,
@@ -382,7 +434,7 @@ def build_ablation_summary(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "variants": variants,
         "overlap_matrix": overlap,
         "top_disagreements": sorted(disagreements, key=lambda r: r["disagreement"], reverse=True)[:10],
-        "labeled_metrics": {"status": "not_computed", "reason": "No labels supplied; Phase 1 does not fake labeled metrics."},
+        "labeled_metrics": {"status": "not_computed", "reason": "No labels supplied; retrieval ablation reports do not fake labeled metrics."},
     }
 
 

@@ -804,6 +804,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                         page_size=dialog.top_n,
                         doc_scope_enabled=bool(attachments),
                         metadata_filter_enabled=bool(dialog.meta_data_filter),
+                        diagnostics=kbinfos.get("diagnostics", {}),
                     )
                     rag_trace.add_evidence_from_chunks(kbinfos.get("chunks", []), source_type="kb", retrieval_call_id=retrieval_call_id)
             if use_web_search:
