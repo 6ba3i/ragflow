@@ -38,6 +38,156 @@ from rag.utils.retrieval_diagnostics import make_retrieval_variant, resolve_vari
 from rag.utils.retrieval_fusion import FusionConfig
 
 
+_MISSING_ATTRIBUTE_PATTERNS: tuple[tuple[str, str], ...] = (
+    (r"\b(?:born|birthplace|where was)\b", "birthplace"),
+    (r"\b(?:died|death date|when did .* die)\b", "death date"),
+    (r"\b(?:population|census)\b", "population census"),
+    (r"\b(?:rank|ranked|most populous|largest|smallest)\b", "rank table row"),
+    (r"\b(?:title|won|winner|champion)\b", "title year"),
+    (r"\b(?:independence|founded|founding|incorporated)\b", "independence founding year"),
+)
+
+_FOLLOWUP_ENTITY_SPAN = re.compile(
+    r"\b[A-Z][\w'-]*(?:(?:\s+(?:of|the|and|de|da|del|van|von|la|le|du))*\s+[A-Z][\w'-]*){0,5}"
+)
+_FOLLOWUP_QUESTION_WORDS = frozenset({"what", "who", "whom", "whose", "when", "which", "where", "how", "why", "list"})
+_FOLLOWUP_LEADING_NOISE = _FOLLOWUP_QUESTION_WORDS | frozenset({"tell", "show", "give", "find", "name", "please"})
+_FOLLOWUP_WEAK_SINGLETONS = _FOLLOWUP_LEADING_NOISE | frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "do",
+        "does",
+        "did",
+        "can",
+        "could",
+        "would",
+        "should",
+        "will",
+        "may",
+        "might",
+        "in",
+        "on",
+        "at",
+        "by",
+        "from",
+        "to",
+        "for",
+        "of",
+        "and",
+        "or",
+    }
+)
+_FOLLOWUP_PRONOUN_REFERENCE = re.compile(r"\b(?:it|its|they|them|their|this|that|these|those|he|she|his|her)\b", re.I)
+_FOLLOWUP_YEAR_RE = re.compile(r"\b(?:1[5-9]\d{2}|20\d{2}|2100)\b")
+
+
+def _clean_followup_entity_candidate(candidate: str | None) -> str:
+    text = re.sub(r"\s+", " ", candidate or "").strip(" \t\r\n\"'`*_()[]{}:;,.!?")
+    text = re.sub(r"\.(?:pdf|docx?|pptx?|xlsx?|txt|md|html?)$", "", text, flags=re.I).strip()
+    parts = text.split()
+    while len(parts) > 1 and parts[0].lower().strip(".,:;!?") in _FOLLOWUP_LEADING_NOISE:
+        parts = parts[1:]
+    return " ".join(parts).strip(" \t\r\n\"'`*_()[]{}:;,.!?")
+
+
+def _is_weak_followup_entity(candidate: str | None) -> bool:
+    text = _clean_followup_entity_candidate(candidate)
+    if not text or len(text) > 120:
+        return True
+    words = [word.lower() for word in re.findall(r"[A-Za-z][\w'-]*", text)]
+    if not words:
+        return True
+    if len(words) == 1 and words[0] in _FOLLOWUP_WEAK_SINGLETONS:
+        return True
+    return all(word in _FOLLOWUP_WEAK_SINGLETONS for word in words)
+
+
+def _followup_entity_from_text(text: str | None, source: str, detail: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    for match in _FOLLOWUP_ENTITY_SPAN.finditer(text or ""):
+        entity = _clean_followup_entity_candidate(match.group(0))
+        if not _is_weak_followup_entity(entity):
+            return {"entity": entity, "source": source, "detail": detail or {}}
+    return None
+
+
+def _followup_entity_from_evidence(chunks: list[dict[str, Any]] | None, question: str) -> dict[str, Any] | None:
+    if not _FOLLOWUP_PRONOUN_REFERENCE.search(question):
+        return None
+    for chunk in chunks or []:
+        for field in ("docnm_kwd", "document_name", "title", "source", "url"):
+            candidate = _followup_entity_from_text(
+                chunk.get(field),
+                "title/source",
+                {"field": field, "chunk_id": chunk.get("chunk_id") or chunk.get("id"), "doc_id": chunk.get("doc_id")},
+            )
+            if candidate:
+                return candidate
+    for chunk in chunks or []:
+        for field in ("content_with_weight", "content_ltks", "content"):
+            candidate = _followup_entity_from_text(
+                chunk.get(field),
+                "retrieved_evidence",
+                {"field": field, "chunk_id": chunk.get("chunk_id") or chunk.get("id"), "doc_id": chunk.get("doc_id")},
+            )
+            if candidate:
+                return candidate
+    return None
+
+
+def _missing_attribute_query(
+    entity: str | None,
+    attribute: str | None,
+    original_question: str | None,
+    retrieved_evidence: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Build a traceable focused follow-up query hint for entity->attribute questions.
+
+    The LLM still decides whether another tool call is necessary; this helper is
+    deliberately deterministic and side-effect free so traces can show that a
+    bounded follow-up opportunity was recognized.
+    """
+    question = (original_question or "").strip()
+    haystack = " ".join(part for part in (attribute, question) if part).lower()
+    matched_attribute = None
+    for pattern, label in _MISSING_ATTRIBUTE_PATTERNS:
+        if re.search(pattern, haystack):
+            matched_attribute = label
+            break
+    if not matched_attribute:
+        return None
+    selected_entity = (
+        _followup_entity_from_text(question, "original_question", {"field": "question"})
+        or _followup_entity_from_evidence(retrieved_evidence, question)
+    )
+    entity_text = _clean_followup_entity_candidate(entity)
+    if not selected_entity and entity_text and not _is_weak_followup_entity(entity_text) and entity_text.lower() != question.lower():
+        selected_entity = {"entity": entity_text, "source": "fallback_heuristic", "detail": {"field": "entity"}}
+    if not selected_entity:
+        return None
+    entity_text = selected_entity["entity"]
+    years = _FOLLOWUP_YEAR_RE.findall(question)
+    year_text = f" {' '.join(years[:2])}" if years else ""
+    followup_query = f"{entity_text} {matched_attribute}{year_text}".strip()
+    return {
+        "followup_reason": "entity_attribute_missing_fact_candidate",
+        "followup_query": followup_query,
+        "followup_entity": entity_text,
+        "followup_entity_source": selected_entity["source"],
+        "followup_entity_source_detail": selected_entity["detail"],
+        "followup_attribute": matched_attribute,
+        "followup_max_attempts": 2,
+    }
+
+
 class RAGTools:
     def __init__(self, 
                  tenant_ids: list[str],
@@ -85,6 +235,7 @@ class RAGTools:
         # rules onto its output, so subsequent retrieval calls don't repeat.
         self._citations_injected: bool = False
         self._keyword_first_chunk_ids: dict[tuple[str, str, tuple[str, ...]], set[str]] = {}
+        self._last_context_query: str | None = None
 
         tools = [
             self.formalize_question,
@@ -101,11 +252,12 @@ class RAGTools:
             tools.append(self.summarize_document)
         chat_mdl.bind_tools(None, tools)
 
-    def context_kbinfos(self, *, stage: str | None = None, start_citation_index: int = 0) -> dict[str, Any]:
+    def context_kbinfos(self, *, stage: str | None = None, start_citation_index: int = 0, query: str | None = None) -> dict[str, Any]:
         result = apply_context_builder_to_kbinfos(
             self.kbinfos,
             self.context_builder_config,
             start_citation_index=start_citation_index,
+            query=query or self._last_context_query,
         )
         if self.trace:
             if result.bundle:
@@ -262,7 +414,16 @@ class RAGTools:
             "- DO NOT make anything up. If the retrieved evidence does not "
             "answer the question, reply with an explicit \"I don't have "
             "enough information based on the available sources\" (in the "
-            "user's language).\n"
+            "user's language). If you identify an intermediate entity but "
+            "the retrieved chunks lack the requested attribute, issue one "
+            "focused `search_knowledge_bases` query for that entity plus the "
+            "missing attribute/year/token before refusing.\n"
+            "- For numeric, date, rank, birthplace, title-year, population, "
+            "or city/state claims, cite a retrieved chunk containing the "
+            "exact fact or state that the exact fact was not found. Do not "
+            "use uncited world knowledge to complete a missing arithmetic or "
+            "multi-hop chain. Before refusing a multi-hop question, say which "
+            "hop is missing and whether targeted retrieval was attempted.\n"
             "- DO NOT cite sources that were not returned by your tool calls "
             "in this turn.\n"
             "- DO NOT invent identifiers. Every doc ID you pass to a tool "
@@ -766,7 +927,11 @@ class RAGTools:
                     mark_chunks_source_type(kbinfos.get("chunks", []), "kb")
                 self.kbinfos["chunks"].extend(kbinfos.get("chunks", []))
                 self.kbinfos["doc_aggs"].extend(kbinfos.get("doc_aggs", []))
-            prompt_kbinfos = self.context_kbinfos(stage="rag_agent.search_knowledge_bases", start_citation_index=self._prompt_start_idx(start_idx))
+            self._last_context_query = question
+            followup_hint = _missing_attribute_query(question, keywords, question, retrieved_evidence=kbinfos.get("chunks", []))
+            if followup_hint and self.trace:
+                self.trace.add_context_builder_summary(followup_hint, stage="rag_agent.followup_hint")
+            prompt_kbinfos = self.context_kbinfos(stage="rag_agent.search_knowledge_bases", start_citation_index=self._prompt_start_idx(start_idx), query=question)
             result = self._with_citation_guidelines(
                 kb_prompt(prompt_kbinfos, self.chat_mdl.max_length, self._prompt_start_idx(start_idx))
             )

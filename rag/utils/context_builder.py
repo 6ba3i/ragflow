@@ -33,6 +33,7 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
 _MAX_TRACE_IDS = 128
 _TRACE_CONTENT_PREVIEW = 120
+_STRONG_RELEVANCE_THRESHOLD = 0.5
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,14 @@ class EvidenceBundleConfig:
     diversity_strategy: ContextDiversityStrategy = "rank"
     max_chunks_per_source: int | None = None
     max_source_fraction: float | None = None
+    relevance_filter_enabled: bool = False
+    min_vector_similarity: float | None = None
+    min_term_similarity: float | None = None
+    preserve_top_ranked: int = 3
+    preserve_query_token_overlap: bool = True
+    primary_doc_extra_chunks: int = 0
+    primary_doc_min_rank_hits: int = 2
+    primary_doc_max_chunks: int | None = None
 
     @classmethod
     def from_env(cls, overrides: dict[str, Any] | None = None) -> "EvidenceBundleConfig":
@@ -62,6 +71,14 @@ class EvidenceBundleConfig:
             diversity_strategy=strategy,  # type: ignore[arg-type]
             max_chunks_per_source=_int_setting(overrides.get("context_max_chunks_per_source"), "CONTEXT_MAX_CHUNKS_PER_SOURCE"),
             max_source_fraction=_float_setting(overrides.get("context_max_source_fraction"), "CONTEXT_MAX_SOURCE_FRACTION"),
+            relevance_filter_enabled=_bool_setting(overrides.get("context_relevance_filter_enabled"), "CONTEXT_RELEVANCE_FILTER_ENABLED", False),
+            min_vector_similarity=_float_setting(overrides.get("context_min_vector_similarity"), "CONTEXT_MIN_VECTOR_SIMILARITY"),
+            min_term_similarity=_float_setting(overrides.get("context_min_term_similarity"), "CONTEXT_MIN_TERM_SIMILARITY"),
+            preserve_top_ranked=_int_setting(overrides.get("context_preserve_top_ranked"), "CONTEXT_PRESERVE_TOP_RANKED", 3) or 3,
+            preserve_query_token_overlap=_bool_setting(overrides.get("context_preserve_query_token_overlap"), "CONTEXT_PRESERVE_QUERY_TOKEN_OVERLAP", True),
+            primary_doc_extra_chunks=_int_setting(overrides.get("context_primary_doc_extra_chunks"), "CONTEXT_PRIMARY_DOC_EXTRA_CHUNKS", 0) or 0,
+            primary_doc_min_rank_hits=_int_setting(overrides.get("context_primary_doc_min_rank_hits"), "CONTEXT_PRIMARY_DOC_MIN_RANK_HITS", 2) or 2,
+            primary_doc_max_chunks=_int_setting(overrides.get("context_primary_doc_max_chunks"), "CONTEXT_PRIMARY_DOC_MAX_CHUNKS"),
         )
 
 
@@ -104,6 +121,14 @@ class EvidenceBundle:
     selected: list[EvidenceRecord]
     rejected: list[EvidenceRecord]
     config: EvidenceBundleConfig
+    query_feature_flags: dict[str, bool] = field(default_factory=dict)
+    priority_boosted_evidence_ids: list[str] = field(default_factory=list)
+    primary_document_ids: list[str] = field(default_factory=list)
+    per_document_effective_limits: dict[str, int] = field(default_factory=dict)
+    primary_doc_extra_selected_count: int = 0
+    priority_boost_strength_counts: dict[str, int] = field(default_factory=dict)
+    low_relevance_preserved_count: int = 0
+    low_relevance_bypass_reason_counts: dict[str, int] = field(default_factory=dict)
 
     def summary(self) -> dict[str, Any]:
         rejection_counts = Counter(r.rejection_reason or "unknown" for r in self.rejected)
@@ -136,6 +161,21 @@ class EvidenceBundle:
             "diversity_strategy": self.config.diversity_strategy,
             "max_chunks_per_source": self.config.max_chunks_per_source,
             "max_source_fraction": self.config.max_source_fraction,
+            "relevance_filter_enabled": self.config.relevance_filter_enabled,
+            **({
+                "min_vector_similarity": self.config.min_vector_similarity,
+                "min_term_similarity": self.config.min_term_similarity,
+                "low_relevance_rejected_count": rejection_counts.get("low_relevance", 0),
+            } if self.config.relevance_filter_enabled else {"low_relevance_rejected_count": rejection_counts.get("low_relevance", 0)}),
+            "low_relevance_preserved_count": self.low_relevance_preserved_count,
+            "low_relevance_bypass_reason_counts": dict(sorted(self.low_relevance_bypass_reason_counts.items())),
+            "query_feature_flags": dict(sorted(self.query_feature_flags.items())),
+            "priority_boosted_count": len(self.priority_boosted_evidence_ids),
+            "priority_boosted_evidence_ids": self.priority_boosted_evidence_ids[:_MAX_TRACE_IDS],
+            "priority_boost_strength_counts": dict(sorted(self.priority_boost_strength_counts.items())),
+            "primary_document_ids": self.primary_document_ids[:_MAX_TRACE_IDS],
+            "per_document_effective_limits": dict(sorted((str(k), v) for k, v in self.per_document_effective_limits.items())),
+            "primary_doc_extra_selected_count": self.primary_doc_extra_selected_count,
             "selected_evidence_ids": [r.evidence_id for r in self.selected[:_MAX_TRACE_IDS]],
             "citation_index_mapping": citation_mapping,
             "source_type_counts": dict(sorted(source_counts.items())),
@@ -287,6 +327,7 @@ def build_context_bundle(
     config: EvidenceBundleConfig,
     *,
     start_citation_index: int = 0,
+    query: str | None = None,
 ) -> EvidenceBundle:
     selected: list[EvidenceRecord] = []
     rejected: list[EvidenceRecord] = []
@@ -294,12 +335,41 @@ def build_context_bundle(
     per_doc: defaultdict[str, int] = defaultdict(int)
     used_tokens = 0
 
+    query_features = _query_features(query)
     ordered = sorted(records, key=lambda record: _record_sort_key(record, config))
+    all_ordered = list(ordered)
+
+    low_relevance_preserved_count = 0
+    low_relevance_bypass_reason_counts: Counter[str] = Counter()
+    relevance_kept: list[EvidenceRecord] = []
+    for record in ordered:
+        is_low_relevance = _is_low_relevance(record, config)
+        bypass_reasons = _low_relevance_bypass_reasons(record, record.rank, config, query_features) if is_low_relevance else []
+        if is_low_relevance and not bypass_reasons:
+            _reject(record, "low_relevance", rejected)
+        else:
+            if is_low_relevance:
+                low_relevance_preserved_count += 1
+                low_relevance_bypass_reason_counts.update(bypass_reasons)
+            relevance_kept.append(record)
+    ordered = relevance_kept
+
+    priority_boosts_by_object_id = {id(record): _priority_boost_details(record, query_features) for record in all_ordered}
+    priority_boosted_ids = [r.evidence_id for r in ordered if _priority_boost_score(priority_boosts_by_object_id.get(id(r))) > 0]
+    if priority_boosted_ids:
+        ordered = sorted(ordered, key=lambda record: (-_priority_boost_score(priority_boosts_by_object_id.get(id(record))), record.rank, record.evidence_id))
+
+    primary_doc_reasons = _primary_doc_candidate_reasons(ordered, config, query_features)
+    primary_doc_ids = _primary_doc_ids(primary_doc_reasons)
+    primary_source_reasons = _primary_source_candidate_reasons(ordered, config, query_features, primary_doc_reasons)
+    effective_doc_limits = _effective_doc_limits(ordered, config, primary_doc_ids)
+
     if config.diversity_enabled and config.diversity_strategy == "source_round_robin":
         ordered = _round_robin_by_source(ordered)
 
     source_limit = _source_limit(config)
     per_source: defaultdict[str, int] = defaultdict(int)
+    primary_doc_extra_selected_count = 0
 
     for record in ordered:
         dup_key = _dedupe_key(record)
@@ -307,14 +377,23 @@ def build_context_bundle(
         if dup_key in seen:
             _reject(record, "duplicate", rejected)
             continue
-        if config.diversity_enabled and source_limit and record.source_type == "kb" and per_source[source_key] >= source_limit:
+        if config.diversity_enabled and source_limit and record.source_type == "kb" and per_source[source_key] >= _source_limit_for_record(
+            record,
+            config,
+            primary_doc_ids,
+            primary_doc_reasons,
+            primary_source_reasons,
+            source_limit,
+            query_features,
+        ):
             _reject(record, "max_chunks_per_source", rejected)
             continue
         if config.max_chunks is not None and len(selected) >= config.max_chunks:
             _reject(record, "max_chunks", rejected)
             continue
         if record.source_type == "kb" and config.max_chunks_per_doc and record.doc_id:
-            if per_doc[record.doc_id] >= config.max_chunks_per_doc:
+            doc_limit = _doc_limit_for_record(record, config, primary_doc_ids)
+            if per_doc[record.doc_id] >= doc_limit:
                 _reject(record, "max_chunks_per_doc", rejected)
                 continue
         estimated = _estimate_tokens(record.content)
@@ -332,9 +411,24 @@ def build_context_bundle(
         used_tokens += estimated
         if record.source_type == "kb" and record.doc_id:
             per_doc[record.doc_id] += 1
+            if record.doc_id in primary_doc_ids and config.max_chunks_per_doc and per_doc[record.doc_id] > config.max_chunks_per_doc:
+                primary_doc_extra_selected_count += 1
         if config.diversity_enabled and record.source_type == "kb":
             per_source[source_key] += 1
-    return EvidenceBundle(records=ordered, selected=selected, rejected=rejected, config=config)
+    return EvidenceBundle(
+        records=all_ordered,
+        selected=selected,
+        rejected=rejected,
+        config=config,
+        query_feature_flags={k: v for k, v in query_features.items() if isinstance(v, bool)},
+        priority_boosted_evidence_ids=priority_boosted_ids,
+        primary_document_ids=sorted(primary_doc_ids),
+        per_document_effective_limits=effective_doc_limits,
+        primary_doc_extra_selected_count=primary_doc_extra_selected_count,
+        priority_boost_strength_counts=_priority_boost_strength_counts(priority_boosts_by_object_id.values()),
+        low_relevance_preserved_count=low_relevance_preserved_count,
+        low_relevance_bypass_reason_counts=dict(low_relevance_bypass_reason_counts),
+    )
 
 
 def apply_context_builder_to_kbinfos(
@@ -345,11 +439,12 @@ def apply_context_builder_to_kbinfos(
     source_type: str | None = None,
     retrieval_call_id: str | None = None,
     tool_call_id: str | None = None,
+    query: str | None = None,
 ) -> ContextBuilderResult:
     if not config.enabled:
         return ContextBuilderResult(kbinfos=kbinfos, bundle=None, original_unchanged=True)
     records = evidence_records_from_kbinfos(kbinfos, source_type=source_type, retrieval_call_id=retrieval_call_id, tool_call_id=tool_call_id)
-    bundle = build_context_bundle(records, config, start_citation_index=start_citation_index)
+    bundle = build_context_bundle(records, config, start_citation_index=start_citation_index, query=query)
     return ContextBuilderResult(kbinfos=bundle_to_kbinfos(bundle, kbinfos), bundle=bundle, original_unchanged=False)
 
 
@@ -367,6 +462,458 @@ def bundle_to_kbinfos(bundle: EvidenceBundle, original_kbinfos: dict[str, Any]) 
     if "total" in original_kbinfos:
         new_kbinfos["total"] = original_kbinfos["total"]
     return new_kbinfos
+
+
+
+_YEAR_RE = re.compile(r"\b(?:1[5-9]\d{2}|20\d{2}|2100)\b")
+_NUMERIC_VALUE_RE = re.compile(r"\b\d[\d,]*(?:\.\d+)?\b")
+_TOKEN_RE = re.compile(r"[\w]+", re.UNICODE)
+_TEMPORAL_TERMS = {"as", "of", "time", "first", "official", "current", "recent", "year", "when", "date", "founded", "independence", "incorporated"}
+_NUMERIC_TERMS = {"population", "census", "rank", "ranked", "most", "populous", "many", "total", "number", "count", "largest", "smallest"}
+_BIO_TERMS = {"born", "birthplace", "died", "death", "title", "won", "winner", "award"}
+_ATTRIBUTE_TERMS = {
+    "area",
+    "award",
+    "birthplace",
+    "born",
+    "capital",
+    "census",
+    "currency",
+    "death",
+    "died",
+    "established",
+    "founded",
+    "incorporated",
+    "independence",
+    "language",
+    "official",
+    "opened",
+    "population",
+    "title",
+    "won",
+    "winner",
+}
+_TABLE_RANK_TERMS = {"rank", "ranked", "ranking", "row", "rows", "table"}
+
+
+def _query_features(query: str | None) -> dict[str, Any]:
+    text = (query or "").lower()
+    tokens = set(_TOKEN_RE.findall(text))
+    years = set(_YEAR_RE.findall(text))
+    numbers = {_normalize_number_token(match) for match in _NUMERIC_VALUE_RE.findall(text)}
+    return {
+        "text": text,
+        "temporal": bool(years or tokens.intersection(_TEMPORAL_TERMS) or "as of" in text or "at the time" in text),
+        "numeric_table": bool(tokens.intersection(_NUMERIC_TERMS) or "how many" in text),
+        "biography": bool(tokens.intersection(_BIO_TERMS)),
+        "years": years,
+        "numbers": numbers,
+        "numeric_claims": numbers.difference(years),
+        "tokens": {t for t in tokens if len(t) > 2},
+    }
+
+
+def _record_relevance_signals(record: EvidenceRecord) -> dict[str, float | None]:
+    return {
+        "vector_similarity": _float_or_none(record.scores.get("vector_similarity")),
+        "term_similarity": _float_or_none(record.scores.get("term_similarity")),
+        "similarity": _float_or_none(record.scores.get("similarity")),
+        "final_score": _float_or_none(record.scores.get("final_score")),
+    }
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_low_relevance(record: EvidenceRecord, config: EvidenceBundleConfig) -> bool:
+    if not config.relevance_filter_enabled:
+        return False
+    signals = _record_relevance_signals(record)
+    checks: list[bool] = []
+    if config.min_vector_similarity is not None and signals["vector_similarity"] is not None:
+        checks.append(signals["vector_similarity"] < config.min_vector_similarity)
+    if config.min_term_similarity is not None and signals["term_similarity"] is not None:
+        checks.append(signals["term_similarity"] < config.min_term_similarity)
+    return any(checks)
+
+
+def _missing_configured_relevance_signal(record: EvidenceRecord, config: EvidenceBundleConfig) -> bool:
+    signals = _record_relevance_signals(record)
+    return bool(
+        (config.min_vector_similarity is not None and signals["vector_similarity"] is None)
+        or (config.min_term_similarity is not None and signals["term_similarity"] is None)
+    )
+
+
+def _strong_low_relevance_evidence_reasons(record: EvidenceRecord, query_features: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    score_reasons = _record_score_support_reasons(record)
+    if "strong_term_score" in score_reasons:
+        reasons.append("strong_term_score")
+    if _exact_title_match(record, query_features):
+        reasons.append("exact_title_match")
+    if _numeric_claim_matches(record, query_features):
+        reasons.append("numeric_claim_match")
+
+    attribute_terms = _attribute_specific_terms(record, query_features)
+    has_stronger_anchor = bool(reasons or attribute_terms)
+    if attribute_terms and (_exact_year_match(record, query_features) or _exact_title_match(record, query_features) or _numeric_claim_matches(record, query_features)):
+        reasons.append("attribute_specific_match")
+    if _exact_year_match(record, query_features) and has_stronger_anchor:
+        reasons.append("exact_year_with_stronger_anchor")
+    return _unique_reasons(reasons)
+
+
+def _low_relevance_bypass_reasons(record: EvidenceRecord, rank: int, config: EvidenceBundleConfig, query_features: dict[str, Any]) -> list[str]:
+    strong_reasons = _strong_low_relevance_evidence_reasons(record, query_features)
+    reasons: list[str] = []
+    if rank < max(0, config.preserve_top_ranked):
+        if _missing_configured_relevance_signal(record, config):
+            reasons.append("top_ranked_with_missing_relevance_signal")
+        if strong_reasons:
+            reasons.append("top_ranked_with_strong_evidence")
+    reasons.extend(strong_reasons)
+    return _unique_reasons(reasons)
+
+
+def _query_token_overlap(record: EvidenceRecord, query_features: dict[str, Any]) -> bool:
+    tokens = query_features.get("tokens") or set()
+    if not tokens:
+        return False
+    content_tokens = set(_TOKEN_RE.findall((record.content or "").lower()))
+    return bool(tokens.intersection(content_tokens))
+
+
+def _priority_boost_score(priority_boost: dict[str, Any] | None) -> int:
+    if not priority_boost:
+        return 0
+    try:
+        return int(priority_boost.get("score") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _priority_boost_strength_counts(priority_boosts: Any) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for priority_boost in priority_boosts:
+        if not isinstance(priority_boost, dict):
+            continue
+        strength = str(priority_boost.get("strength") or "none")
+        if strength != "none":
+            counts[strength] += 1
+    return dict(sorted(counts.items()))
+
+
+def _record_text(record: EvidenceRecord) -> str:
+    return f"{record.doc_title or ''}\n{record.content or ''}".lower()
+
+
+def _record_tokens(record: EvidenceRecord) -> set[str]:
+    return set(_TOKEN_RE.findall(_record_text(record)))
+
+
+def _record_numbers(record: EvidenceRecord) -> set[str]:
+    return {_normalize_number_token(match) for match in _NUMERIC_VALUE_RE.findall(_record_text(record))}
+
+
+def _normalize_number_token(value: Any) -> str:
+    return str(value).replace(",", "").strip().lower()
+
+
+def _attribute_specific_terms(record: EvidenceRecord, query_features: dict[str, Any]) -> set[str]:
+    query_terms = (query_features.get("tokens") or set()).intersection(_ATTRIBUTE_TERMS)
+    if not query_terms:
+        return set()
+    return query_terms.intersection(_record_tokens(record))
+
+
+def _table_or_rank_indicator_terms(record: EvidenceRecord, query_features: dict[str, Any]) -> set[str]:
+    if not query_features.get("numeric_table"):
+        return set()
+    return (query_features.get("tokens") or set()).union(_TABLE_RANK_TERMS).intersection(_TABLE_RANK_TERMS).intersection(_record_tokens(record))
+
+
+def _numeric_claim_matches(record: EvidenceRecord, query_features: dict[str, Any]) -> set[str]:
+    query_numbers = query_features.get("numeric_claims") or set()
+    if not query_numbers:
+        return set()
+    return query_numbers.intersection(_record_numbers(record))
+
+
+def _record_score_support_reasons(record: EvidenceRecord) -> list[str]:
+    signals = _record_relevance_signals(record)
+    reasons: list[str] = []
+    if any(
+        signals.get(key) is not None and (signals.get(key) or 0.0) >= _STRONG_RELEVANCE_THRESHOLD
+        for key in ("vector_similarity", "similarity", "final_score")
+    ):
+        reasons.append("strong_dense_score")
+    term_similarity = signals.get("term_similarity")
+    if term_similarity is not None and term_similarity >= _STRONG_RELEVANCE_THRESHOLD:
+        reasons.append("strong_term_score")
+    return reasons
+
+
+def _record_anchor_support_reasons(record: EvidenceRecord, query_features: dict[str, Any]) -> list[str]:
+    reasons = _record_score_support_reasons(record)
+    if _exact_title_match(record, query_features):
+        reasons.append("exact_title_match")
+    return _unique_reasons(reasons)
+
+
+def _exact_year_match(record: EvidenceRecord, query_features: dict[str, Any]) -> bool:
+    years = query_features.get("years") or set()
+    if not years:
+        return False
+    text = f"{record.doc_title or ''}\n{record.content or ''}".lower()
+    return any(re.search(rf"\b{re.escape(str(year))}\b", text) for year in years)
+
+
+def _exact_title_match(record: EvidenceRecord, query_features: dict[str, Any]) -> bool:
+    title = _normalized_doc_title(record.doc_title)
+    if not title:
+        return False
+    title_tokens = {token for token in _TOKEN_RE.findall(title) if len(token) > 2}
+    if not title_tokens:
+        return False
+    query_text = str(query_features.get("text") or "")
+    if len(title) >= 4 and re.search(rf"(?<!\w){re.escape(title)}(?!\w)", query_text):
+        return True
+    query_tokens = query_features.get("tokens") or set()
+    return title_tokens.issubset(query_tokens)
+
+
+def _unique_reasons(reasons: list[str]) -> list[str]:
+    unique: list[str] = []
+    for reason in reasons:
+        if reason and reason not in unique:
+            unique.append(reason)
+    return unique
+
+
+def _primary_doc_ids(primary_doc_reasons: dict[str, list[dict[str, Any]]]) -> set[str]:
+    return {str(doc_id) for doc_id, reasons in primary_doc_reasons.items() if reasons}
+
+
+def _primary_doc_candidate_reasons(records: list[EvidenceRecord], config: EvidenceBundleConfig, query_features: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    if not (config.max_chunks_per_doc and config.primary_doc_extra_chunks > 0):
+        return {}
+    reasons: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    required_rank_hit_count = max(2, config.primary_doc_min_rank_hits)
+    top_window_size = max(required_rank_hit_count * 3, config.preserve_top_ranked, 6)
+    top_window = records[:top_window_size]
+    supported_top_hits = [
+        record
+        for record in top_window
+        if record.source_type == "kb" and record.doc_id and _record_anchor_support_reasons(record, query_features)
+    ]
+    counts = Counter(record.doc_id for record in supported_top_hits)
+    for doc_id, count in counts.items():
+        if count >= required_rank_hit_count:
+            reasons[str(doc_id)].append(
+                {
+                    "reason": "repeated_top_rank_hits",
+                    "rank_hit_count": count,
+                    "required_rank_hit_count": required_rank_hit_count,
+                    "top_window_size": top_window_size,
+                    "support_reasons": ",".join(
+                        _unique_reasons(
+                            reason
+                            for record in supported_top_hits
+                            if record.doc_id == doc_id
+                            for reason in _record_anchor_support_reasons(record, query_features)
+                        )
+                    ),
+                }
+            )
+    for record in records:
+        if record.source_type != "kb" or not record.doc_id:
+            continue
+        if _exact_title_match(record, query_features):
+            reasons[str(record.doc_id)].append({"reason": "exact_title_match", "evidence_id": record.evidence_id})
+    return {doc_id: _dedupe_reason_details(reason_details) for doc_id, reason_details in reasons.items()}
+
+
+def _primary_source_candidate_reasons(
+    records: list[EvidenceRecord],
+    config: EvidenceBundleConfig,
+    query_features: dict[str, Any],
+    primary_doc_reasons: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    if config.primary_doc_extra_chunks <= 0:
+        return {}
+    reasons: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    required_rank_hit_count = max(2, config.primary_doc_min_rank_hits)
+    top_window_size = max(required_rank_hit_count * 3, config.preserve_top_ranked, 6)
+    top_window = records[:top_window_size]
+    supported_top_hits = [
+        record
+        for record in top_window
+        if record.source_type == "kb" and _record_anchor_support_reasons(record, query_features)
+    ]
+    source_counts = Counter(_source_group_key(record) for record in supported_top_hits)
+    for source_key, count in source_counts.items():
+        if count >= required_rank_hit_count:
+            reasons[str(source_key)].append(
+                {
+                    "reason": "repeated_top_rank_hits",
+                    "rank_hit_count": count,
+                    "required_rank_hit_count": required_rank_hit_count,
+                    "top_window_size": top_window_size,
+                    "support_reasons": ",".join(
+                        _unique_reasons(
+                            reason
+                            for record in supported_top_hits
+                            if _source_group_key(record) == source_key
+                            for reason in _record_anchor_support_reasons(record, query_features)
+                        )
+                    ),
+                }
+            )
+    for record in records:
+        if record.source_type != "kb":
+            continue
+        source_key = _source_group_key(record)
+        if record.doc_id:
+            for detail in primary_doc_reasons.get(str(record.doc_id), []):
+                reason = detail.get("reason") if isinstance(detail, dict) else None
+                if reason in {"repeated_top_rank_hits", "exact_title_match"}:
+                    reasons[str(source_key)].append({"reason": str(reason), "evidence_id": record.evidence_id})
+        if _exact_title_match(record, query_features):
+            reasons[str(source_key)].append({"reason": "exact_title_match", "evidence_id": record.evidence_id})
+    return {source_key: _dedupe_reason_details(reason_details) for source_key, reason_details in reasons.items()}
+
+
+def _doc_limit_for_record(record: EvidenceRecord, config: EvidenceBundleConfig, primary_doc_ids: set[str]) -> int:
+    base = config.max_chunks_per_doc or 0
+    if not base:
+        return 0
+    if record.doc_id in primary_doc_ids:
+        return _expanded_primary_cap(base, config)
+    return base
+
+
+def _effective_doc_limits(records: list[EvidenceRecord], config: EvidenceBundleConfig, primary_doc_ids: set[str]) -> dict[str, int]:
+    if not config.max_chunks_per_doc:
+        return {}
+    doc_ids = {r.doc_id for r in records if r.source_type == "kb" and r.doc_id}
+    limits = {}
+    for doc_id in doc_ids:
+        limit = config.max_chunks_per_doc
+        if doc_id in primary_doc_ids:
+            limit = _expanded_primary_cap(config.max_chunks_per_doc, config)
+        limits[str(doc_id)] = limit
+    return limits
+
+
+def _expanded_primary_cap(base: int, config: EvidenceBundleConfig) -> int:
+    expanded = base + max(0, config.primary_doc_extra_chunks)
+    if config.primary_doc_max_chunks is not None:
+        expanded = min(expanded, config.primary_doc_max_chunks)
+    return max(base, expanded)
+
+
+def _source_limit_for_record(
+    record: EvidenceRecord,
+    config: EvidenceBundleConfig,
+    primary_doc_ids: set[str],
+    primary_doc_reasons: dict[str, list[dict[str, Any]]],
+    primary_source_reasons: dict[str, list[dict[str, Any]]],
+    base_source_limit: int | None,
+    query_features: dict[str, Any],
+) -> int | None:
+    if base_source_limit is None:
+        return None
+    reasons = _source_cap_expansion_reasons(record, primary_doc_ids, primary_doc_reasons, primary_source_reasons, query_features)
+    if not reasons or config.primary_doc_extra_chunks <= 0:
+        return base_source_limit
+    return _expanded_primary_cap(base_source_limit, config)
+
+
+def _source_cap_expansion_reasons(
+    record: EvidenceRecord,
+    primary_doc_ids: set[str],
+    primary_doc_reasons: dict[str, list[dict[str, Any]]],
+    primary_source_reasons: dict[str, list[dict[str, Any]]],
+    query_features: dict[str, Any],
+) -> list[str]:
+    reasons: list[str] = []
+    doc_id = str(record.doc_id) if record.doc_id else ""
+    if doc_id and doc_id in primary_doc_ids:
+        reasons.extend(
+            str(reason_detail.get("reason"))
+            for reason_detail in primary_doc_reasons.get(doc_id, [])
+            if isinstance(reason_detail, dict) and reason_detail.get("reason") in {"repeated_top_rank_hits", "exact_title_match"}
+        )
+    source_key = _source_group_key(record)
+    reasons.extend(
+        str(reason_detail.get("reason"))
+        for reason_detail in primary_source_reasons.get(source_key, [])
+        if isinstance(reason_detail, dict) and reason_detail.get("reason") in {"repeated_top_rank_hits", "exact_title_match"}
+    )
+    if _exact_title_match(record, query_features):
+        reasons.append("exact_title_match")
+    return _unique_reasons(reasons)
+
+
+def _dedupe_reason_details(reason_details: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str | None]] = set()
+    deduped: list[dict[str, Any]] = []
+    for detail in reason_details:
+        reason = str(detail.get("reason") or "")
+        evidence_id = str(detail.get("evidence_id")) if detail.get("evidence_id") is not None else None
+        key = (reason, evidence_id)
+        if not reason or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(detail)
+    return deduped
+
+
+def _priority_boost_details(record: EvidenceRecord, query_features: dict[str, Any]) -> dict[str, Any]:
+    if not query_features:
+        return {"score": 0, "strength": "none"}
+    score = 0
+    strong_reason_count = 0
+    weak_reason_count = 0
+    has_strong_typed_anchor = False
+
+    if _exact_title_match(record, query_features):
+        score += 6
+        has_strong_typed_anchor = True
+        strong_reason_count += 1
+    if _exact_year_match(record, query_features):
+        score += 4
+        has_strong_typed_anchor = True
+        strong_reason_count += 1
+
+    numeric_matches = _numeric_claim_matches(record, query_features)
+    if numeric_matches:
+        score += 4
+        has_strong_typed_anchor = True
+        strong_reason_count += 1
+
+    attribute_terms = _attribute_specific_terms(record, query_features)
+    if attribute_terms and has_strong_typed_anchor:
+        score += 2
+        strong_reason_count += 1
+    elif attribute_terms:
+        weak_reason_count += 1
+
+    table_rank_terms = _table_or_rank_indicator_terms(record, query_features)
+    if table_rank_terms:
+        score += 1
+        weak_reason_count += 1
+
+    if _query_token_overlap(record, query_features):
+        weak_reason_count += 1
+
+    strength = "strong" if strong_reason_count else "weak" if weak_reason_count else "none"
+    return {"score": score, "strength": strength}
 
 
 def _reject(record: EvidenceRecord, reason: str, rejected: list[EvidenceRecord]) -> None:
@@ -388,9 +935,6 @@ def _round_robin_by_source(records: list[EvidenceRecord]) -> list[EvidenceRecord
         if source_key not in buckets:
             source_order.append(source_key)
         buckets[source_key].append(record)
-    for bucket in buckets.values():
-        bucket.sort(key=lambda record: _record_sort_key(record, EvidenceBundleConfig(enabled=True)))
-
     ordered: list[EvidenceRecord] = []
     while any(buckets.values()):
         for source_key in source_order:

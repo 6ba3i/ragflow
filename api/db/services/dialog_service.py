@@ -36,7 +36,6 @@ from api.db.services.doc_metadata_service import DocMetadataService
 from api.db.services.knowledgebase_service import KnowledgebaseService
 from api.db.services.langfuse_service import TenantLangfuseService
 from api.db.services.llm_service import LLMBundle
-from api.db.services.tenant_llm_service import TenantLLMService
 from common.metadata_utils import apply_meta_data_filter
 from api.utils.reference_metadata_utils import (
     enrich_chunks_with_document_metadata,
@@ -642,7 +641,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         # For aggregate queries (COUNT, SUM, etc.), chunks may be empty but answer is still valid
         if ans and (ans.get("reference", {}).get("chunks") or ans.get("answer")):
             reference = ans.get("reference", {}) or {}
-            sql_context_result = apply_context_builder_to_kbinfos(reference, context_builder_config, source_type="sql")
+            sql_context_result = apply_context_builder_to_kbinfos(reference, context_builder_config, source_type="sql", query=questions[-1])
             if sql_context_result.bundle:
                 ans["reference"] = sql_context_result.kbinfos
                 reference = sql_context_result.kbinfos
@@ -841,7 +840,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         )
         _enrich_chunks_with_document_metadata(kbinfos.get("chunks", []), metadata_fields)
 
-    context_result = apply_context_builder_to_kbinfos(kbinfos, context_builder_config)
+    context_result = apply_context_builder_to_kbinfos(kbinfos, context_builder_config, query=" ".join(questions))
     if rag_trace:
         if context_result.bundle:
             rag_trace.add_context_builder_summary(context_result.bundle.summary(), stage="async_chat.prompt")
