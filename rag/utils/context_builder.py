@@ -147,7 +147,8 @@ class EvidenceBundle:
             for r in self.selected[:_MAX_TRACE_IDS]
         ]
         estimated_tokens = sum(_estimate_tokens(r.content) for r in self.selected)
-        return {
+        agentic_lineage = _agentic_lineage_summary(self.records, self.selected, self.rejected)
+        summary = {
             "enabled": self.config.enabled,
             "candidate_evidence_count": len(self.records),
             "selected_evidence_count": len(self.selected),
@@ -184,6 +185,9 @@ class EvidenceBundle:
             "per_source_selected_counts": dict(sorted((str(k), v) for k, v in per_source_selected.items())),
             "estimated_context_tokens": estimated_tokens,
         }
+        if agentic_lineage:
+            summary["agentic_lineage"] = agentic_lineage
+        return summary
 
 
 @dataclass(frozen=True)
@@ -301,6 +305,22 @@ def evidence_records_from_kbinfos(
         metadata = dict(chunk.get("document_metadata") or {})
         if chunk.get("_ragflow_source_type"):
             metadata["source_type"] = chunk.get("_ragflow_source_type")
+        agentic_metadata = chunk.get("_ragflow_agentic_retrieval")
+        if isinstance(agentic_metadata, dict):
+            metadata["agentic_retrieval"] = dict(agentic_metadata)
+        for lineage_key in (
+            "plan_id",
+            "facet_id",
+            "subquery_id",
+            "retrieval_call_id",
+            "lineage_rank",
+            "merge_rank",
+            "retrieval_variant",
+            "selected_for_context",
+            "rejection_reason",
+        ):
+            if lineage_key in chunk and chunk.get(lineage_key) is not None:
+                metadata[lineage_key] = chunk.get(lineage_key)
         records.append(
             EvidenceRecord(
                 evidence_id=evidence_id,
@@ -377,7 +397,7 @@ def build_context_bundle(
         if dup_key in seen:
             _reject(record, "duplicate", rejected)
             continue
-        if config.diversity_enabled and source_limit and record.source_type == "kb" and per_source[source_key] >= _source_limit_for_record(
+        record_source_limit = _source_limit_for_record(
             record,
             config,
             primary_doc_ids,
@@ -385,7 +405,8 @@ def build_context_bundle(
             primary_source_reasons,
             source_limit,
             query_features,
-        ):
+        )
+        if config.diversity_enabled and record_source_limit is not None and record.source_type == "kb" and per_source[source_key] >= record_source_limit:
             _reject(record, "max_chunks_per_source", rejected)
             continue
         if config.max_chunks is not None and len(selected) >= config.max_chunks:
@@ -406,6 +427,7 @@ def build_context_bundle(
         record.selected_for_context = True
         record.rejection_reason = None
         record.citation_index = start_citation_index + len(selected)
+        _sync_record_chunk_context_metadata(record)
         selected.append(record)
         seen[dup_key] = record
         used_tokens += estimated
@@ -721,12 +743,12 @@ def _primary_doc_candidate_reasons(records: list[EvidenceRecord], config: Eviden
                     "required_rank_hit_count": required_rank_hit_count,
                     "top_window_size": top_window_size,
                     "support_reasons": ",".join(
-                        _unique_reasons(
+                        _unique_reasons([
                             reason
                             for record in supported_top_hits
                             if record.doc_id == doc_id
                             for reason in _record_anchor_support_reasons(record, query_features)
-                        )
+                        ])
                     ),
                 }
             )
@@ -765,12 +787,12 @@ def _primary_source_candidate_reasons(
                     "required_rank_hit_count": required_rank_hit_count,
                     "top_window_size": top_window_size,
                     "support_reasons": ",".join(
-                        _unique_reasons(
+                        _unique_reasons([
                             reason
                             for record in supported_top_hits
                             if _source_group_key(record) == source_key
                             for reason in _record_anchor_support_reasons(record, query_features)
-                        )
+                        ])
                     ),
                 }
             )
@@ -920,7 +942,59 @@ def _reject(record: EvidenceRecord, reason: str, rejected: list[EvidenceRecord])
     record.selected_for_context = False
     record.rejection_reason = reason
     record.citation_index = None
+    _sync_record_chunk_context_metadata(record)
     rejected.append(record)
+
+
+def _sync_record_chunk_context_metadata(record: EvidenceRecord) -> None:
+    if not isinstance(record.chunk, dict):
+        return
+    record.chunk["selected_for_context"] = record.selected_for_context
+    record.chunk["rejection_reason"] = record.rejection_reason
+    if record.citation_index is not None:
+        record.chunk["citation_index"] = record.citation_index
+    raw_agentic = record.metadata.get("agentic_retrieval")
+    agentic: dict[str, Any] = dict(raw_agentic) if isinstance(raw_agentic, dict) else {}
+    for key in ("plan_id", "facet_id", "subquery_id", "retrieval_call_id", "lineage_rank", "merge_rank", "retrieval_variant"):
+        if key in record.metadata and record.metadata.get(key) is not None:
+            record.chunk[key] = record.metadata.get(key)
+            agentic[key] = record.metadata.get(key)
+    if agentic:
+        agentic["selected_for_context"] = record.selected_for_context
+        agentic["rejection_reason"] = record.rejection_reason
+        if record.citation_index is not None:
+            agentic["citation_index"] = record.citation_index
+        record.chunk["_ragflow_agentic_retrieval"] = agentic
+
+
+def _agentic_lineage_summary(records: list[EvidenceRecord], selected: list[EvidenceRecord], rejected: list[EvidenceRecord]) -> list[dict[str, Any]]:
+    def lineage_value(record: EvidenceRecord, key: str) -> Any:
+        agentic = record.metadata.get("agentic_retrieval")
+        if isinstance(agentic, dict) and agentic.get(key) is not None:
+            return agentic.get(key)
+        return record.metadata.get(key)
+
+    lineage: list[dict[str, Any]] = []
+    selected_ids = {id(record) for record in selected}
+    for record in records[:_MAX_TRACE_IDS]:
+        if not lineage_value(record, "plan_id"):
+            continue
+        selected_for_context = id(record) in selected_ids
+        lineage.append(
+            {
+                "evidence_id": record.evidence_id,
+                "chunk_id": record.chunk_id,
+                "plan_id": lineage_value(record, "plan_id"),
+                "subquery_id": lineage_value(record, "subquery_id"),
+                "facet_id": lineage_value(record, "facet_id"),
+                "retrieval_call_id": record.retrieval_call_id or lineage_value(record, "retrieval_call_id"),
+                "lineage_rank": lineage_value(record, "lineage_rank"),
+                "merge_rank": lineage_value(record, "merge_rank"),
+                "selected_for_context": selected_for_context,
+                "rejection_reason": None if selected_for_context else record.rejection_reason,
+            }
+        )
+    return lineage
 
 
 def _record_sort_key(record: EvidenceRecord, _config: EvidenceBundleConfig) -> tuple[Any, ...]:

@@ -1914,6 +1914,30 @@ async def gen_mindmap(question, kb_ids, tenant_id, search_config={}):
     return mind_map.output
 
 
+def _resolve_rag_agent_llm_type_and_config(dialog):
+    """Resolve the model config used by rag_agent's final-answer model.
+
+    ``rag_agent`` is a chat route. If a configured dialog model is not explicitly
+    image2text-only, prefer the CHAT provider-instance lookup. The previous
+    fallback treated any non-``chat`` type-list result as IMAGE2TEXT, which makes
+    valid chat models fail with "is not a image2text model" when the provider
+    type lookup is incomplete or stale.
+    """
+    if not dialog.llm_id:
+        return LLMType.CHAT.value, get_tenant_default_model_by_type(dialog.tenant_id, LLMType.CHAT)
+
+    llm_types = set(get_model_type_by_name(dialog.tenant_id, dialog.llm_id) or [])
+    if LLMType.IMAGE2TEXT.value in llm_types and LLMType.CHAT.value not in llm_types:
+        return (
+            LLMType.IMAGE2TEXT.value,
+            get_model_config_from_provider_instance(dialog.tenant_id, LLMType.IMAGE2TEXT, dialog.llm_id),
+        )
+    return (
+        LLMType.CHAT.value,
+        get_model_config_from_provider_instance(dialog.tenant_id, LLMType.CHAT, dialog.llm_id),
+    )
+
+
 async def rag_agent(dialog, messages, stream=True, **kwargs):
     logging.debug("Begin rag_agent")
     assert messages[-1]["role"] == "user", "The last content of this conversation is not from user."
@@ -1934,17 +1958,7 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
                          context_builder_config=EvidenceBundleConfig.from_env(kwargs),
                          )
 
-    if dialog.llm_id:
-        llm_types = get_model_type_by_name(dialog.tenant_id, dialog.llm_id)
-        if "chat" in llm_types:
-            llm_type = LLMType.CHAT.value
-            llm_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.CHAT, dialog.llm_id)
-        else:
-            llm_type = LLMType.IMAGE2TEXT.value
-            llm_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.IMAGE2TEXT, dialog.llm_id)
-    else:
-        llm_type = LLMType.CHAT.value
-        llm_model_config = get_tenant_default_model_by_type(dialog.tenant_id, LLMType.CHAT)
+    llm_type, llm_model_config = _resolve_rag_agent_llm_type_and_config(dialog)
     if rag_trace:
         rag_trace.set_llm_info(
             model_provider=llm_model_config.get("llm_factory") if llm_model_config else None,

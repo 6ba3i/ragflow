@@ -119,11 +119,21 @@ def summarize_chunks(chunks: list[dict[str, Any]] | None) -> list[dict[str, Any]
     """Summarize chunks without full content or vectors."""
     summarized = []
     for chunk in chunks or []:
+        raw_agentic = chunk.get("_ragflow_agentic_retrieval")
+        agentic: dict[str, Any] = raw_agentic if isinstance(raw_agentic, dict) else {}
         item = {
             "chunk_id": chunk.get("chunk_id") or chunk.get("id"),
             "doc_id": chunk.get("doc_id"),
             "doc_title": chunk.get("docnm_kwd") or chunk.get("document_name"),
             "source_uri": chunk.get("url"),
+            "plan_id": chunk.get("plan_id") or agentic.get("plan_id"),
+            "facet_id": chunk.get("facet_id") or agentic.get("facet_id"),
+            "subquery_id": chunk.get("subquery_id") or agentic.get("subquery_id"),
+            "retrieval_call_id": chunk.get("retrieval_call_id") or agentic.get("retrieval_call_id"),
+            "lineage_rank": chunk.get("lineage_rank") or agentic.get("lineage_rank"),
+            "merge_rank": chunk.get("merge_rank") or agentic.get("merge_rank"),
+            "selected_for_context": chunk.get("selected_for_context") if chunk.get("selected_for_context") is not None else agentic.get("selected_for_context"),
+            "rejection_reason": chunk.get("rejection_reason") or agentic.get("rejection_reason"),
         }
         item.update(_score_fields(chunk))
         summarized.append(item)
@@ -182,6 +192,8 @@ class RagTraceCollector:
             "evidence_ledger": [],
             "citation_mappings": [],
             "context_builder": [],
+            "agentic_retrieval": [],
+            "agentic_planning": [],
             "llm": {},
             "latency_ms": {},
             "token_usage": {},
@@ -297,6 +309,10 @@ class RagTraceCollector:
         doc_scope_enabled: bool | None = None,
         metadata_filter_enabled: bool | None = None,
         diagnostics: dict[str, Any] | None = None,
+        plan_id: str | None = None,
+        facet_id: str | None = None,
+        subquery_id: str | None = None,
+        iteration_id: str | None = None,
     ) -> str | None:
         if not self.enabled:
             return None
@@ -323,6 +339,10 @@ class RagTraceCollector:
             "doc_scope_enabled": doc_scope_enabled,
             "metadata_filter_enabled": metadata_filter_enabled,
             "diagnostics": sanitize_for_trace(diagnostics or {}),
+            "plan_id": plan_id,
+            "facet_id": facet_id,
+            "subquery_id": subquery_id,
+            "iteration_id": iteration_id,
             "latency_ms": _duration_ms(started_ms),
             "error": sanitize_for_trace(str(error), key="error") if error else None,
         }
@@ -345,6 +365,8 @@ class RagTraceCollector:
         if not self.enabled:
             return
         for offset, chunk in enumerate(chunks or []):
+            raw_agentic = chunk.get("_ragflow_agentic_retrieval")
+            agentic: dict[str, Any] = raw_agentic if isinstance(raw_agentic, dict) else {}
             self._evidence_seq += 1
             evidence_id = f"evidence-{self._evidence_seq:05d}"
             citation_index = start_citation_index + offset
@@ -352,6 +374,12 @@ class RagTraceCollector:
                 "evidence_id": evidence_id,
                 "tool_call_id": tool_call_id,
                 "retrieval_call_id": retrieval_call_id,
+                "plan_id": chunk.get("plan_id") or agentic.get("plan_id"),
+                "facet_id": chunk.get("facet_id") or agentic.get("facet_id"),
+                "subquery_id": chunk.get("subquery_id") or agentic.get("subquery_id"),
+                "iteration_id": chunk.get("iteration_id") or agentic.get("iteration_id"),
+                "lineage_rank": chunk.get("lineage_rank") or agentic.get("lineage_rank"),
+                "merge_rank": chunk.get("merge_rank") or agentic.get("merge_rank"),
                 "source_type": source_type,
                 "chunk_id": chunk.get("chunk_id") or chunk.get("id"),
                 "doc_id": chunk.get("doc_id"),
@@ -360,8 +388,9 @@ class RagTraceCollector:
                 "section_page_order": _chunk_position(chunk),
                 "scores": _chunk_scores(chunk),
                 "citation_index": citation_index,
-                "selected_for_context": selected_for_context,
-                "support_status": support_status,
+                "selected_for_context": chunk.get("selected_for_context") if chunk.get("selected_for_context") is not None else agentic.get("selected_for_context", selected_for_context),
+                "rejection_reason": chunk.get("rejection_reason") or agentic.get("rejection_reason"),
+                "support_status": chunk.get("support_status") or agentic.get("support_status", support_status),
             }
             self.data["evidence_ledger"].append(sanitize_for_trace(entry))
             self.data["citation_mappings"].append(
@@ -383,6 +412,41 @@ class RagTraceCollector:
         if stage is not None:
             record["stage"] = stage
         self.data["context_builder"].append(sanitize_for_trace(record))
+
+    def add_agentic_retrieval_event(self, stage: str, payload: dict[str, Any] | None = None) -> None:
+        if not self.enabled:
+            return
+        record = dict(payload or {})
+        record["stage"] = stage
+        self.data["agentic_retrieval"].append(sanitize_for_trace(record))
+
+    def add_agentic_planner_event(self, **fields: Any) -> None:
+        if not self.enabled:
+            return
+        record = {"event": "planner"}
+        record.update(fields)
+        plan_id = str(record.get("plan_id") or "")
+        if _is_sensitive_key(plan_id):
+            record["plan_id"] = "<redacted-plan-id>"
+        self.data["agentic_planning"].append(sanitize_for_trace(record))
+
+    def add_agentic_subquery_event(self, **fields: Any) -> None:
+        if not self.enabled:
+            return
+        record = {"event": "subquery"}
+        record.update(fields)
+        self.data["agentic_planning"].append(sanitize_for_trace(record))
+
+    def add_agentic_fallback(self, **fields: Any) -> None:
+        if not self.enabled:
+            return
+        record = {"event": "fallback"}
+        if "reason" in record and "fallback_reason" not in fields:
+            record["fallback_reason"] = record.pop("reason")
+        record.update(fields)
+        if "reason" in record and "fallback_reason" not in record:
+            record["fallback_reason"] = record.pop("reason")
+        self.data["agentic_planning"].append(sanitize_for_trace(record))
 
     def record_error(self, message: str, *, source: str | None = None) -> None:
         if not self.enabled:

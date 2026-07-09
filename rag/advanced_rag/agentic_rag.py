@@ -14,12 +14,21 @@
 #  limitations under the License.
 #
 
+import asyncio
 import logging
 import re
 from typing import Any, List
 
 import json_repair
 from copy import deepcopy
+from rag.advanced_rag.agentic_retrieval import (
+    AgenticPlannerError,
+    AgenticRetrievalConfig,
+    build_planner_input,
+    execute_bounded_plan,
+    generate_llm_plan,
+    should_plan,
+)
 from api.db.services.doc_metadata_service import DocMetadataService
 from api.db.services.document_service import DocumentService
 from api.db.services.knowledgebase_service import KnowledgebaseService
@@ -200,6 +209,7 @@ class RAGTools:
                  user_defined_prompts: dict | None = None,
                  trace: RagTraceCollector | None = None,
                  context_builder_config: EvidenceBundleConfig | None = None,
+                 agentic_retrieval_config: AgenticRetrievalConfig | None = None,
                  ):
         self.tenant_ids = tenant_ids
         self.chat_mdl = deepcopy(chat_mdl)
@@ -227,6 +237,7 @@ class RAGTools:
         self.user_defined_prompts = user_defined_prompts or {}
         self.trace = trace
         self.context_builder_config = context_builder_config or EvidenceBundleConfig.from_env()
+        self.agentic_retrieval_config = agentic_retrieval_config or AgenticRetrievalConfig.from_env()
         # Accumulator for chunks/doc_aggs across tool calls within a turn —
         # populated by ``search_knowledge_bases`` and ``search_structured_data``
         # so the final answer can cite everything retrieved so far.
@@ -645,6 +656,128 @@ class RAGTools:
         )
         return {row.id for row in rows}
 
+    async def _try_agentic_bounded_retrieval(
+        self,
+        *,
+        question: str,
+        docid_scope: list[str] | None,
+        top_n: int,
+        similarity_threshold: float,
+    ) -> Any | None:
+        """Run Phase 5's LLM helper planner inside the rag_agent retrieval tool.
+
+        This is intentionally a bounded helper around ``search_knowledge_bases``:
+        diagnostic mode records only the trigger, shadow mode runs the plan but
+        leaves the tool output on the baseline retrieval path, and active mode
+        returns bounded retrieval only after LLM planning, validation, and lane
+        execution all succeed.
+        """
+        cfg = self.agentic_retrieval_config
+        if not cfg.enabled or cfg.mode == "off" or not self.embed_mdl or not self.kb_ids:
+            return None
+
+        scope = type("RAGAgentPlannerScope", (), {"kb_ids": self.kb_ids})()
+        trigger = should_plan(
+            question,
+            history=[],
+            dialog=scope,
+            attachments=docid_scope or [],
+            cfg=cfg,
+            cheap_features={"kb_scope_available": bool(self.kb_ids)},
+            diagnostics=None,
+        )
+        trigger_payload = {
+            **trigger.to_trace_dict(),
+            "source": "rag_agent.search_knowledge_bases",
+            "tool_top_n": top_n,
+        }
+        if self.trace:
+            self.trace.add_agentic_retrieval_event("trigger", trigger_payload)
+        if not trigger.should_plan:
+            if self.trace:
+                self.trace.add_agentic_retrieval_event("bypass", trigger_payload)
+            return None
+        if cfg.mode == "diagnostic":
+            if self.trace:
+                self.trace.add_agentic_retrieval_event("diagnostic_trigger_only", trigger_payload)
+            return None
+
+        planner_input = build_planner_input(
+            question,
+            history=[],
+            dialog=scope,
+            attachments=docid_scope or [],
+            cfg=cfg,
+            trigger=trigger,
+            tenant_ids=self.tenant_ids,
+            metadata_filters=self.meta_data_filter,
+        )
+        try:
+            plan = await generate_llm_plan(
+                planner_input,
+                cfg,
+                chat_mdl=self.chat_mdl,
+                rag_trace=self.trace,
+            )
+            result = await execute_bounded_plan(
+                plan,
+                retriever=settings.retriever,
+                embd_mdl=self.embed_mdl,
+                tenant_ids=self.tenant_ids,
+                kb_ids=self.kb_ids,
+                doc_ids=docid_scope,
+                similarity_threshold=similarity_threshold,
+                vector_similarity_weight=0.7 if self.embed_mdl else 0.0,
+                top_k=max(1, top_n),
+                rank_feature=label_question(question, self.kbs),
+                rerank_mdl=None,
+                cfg=cfg,
+                rag_trace=self.trace,
+                metadata_filters=self.meta_data_filter,
+                apply_children=True,
+                apply_toc=False,
+                chat_mdl=self.chat_mdl,
+            )
+        except asyncio.CancelledError:
+            raise
+        except AgenticPlannerError as exc:
+            if self.trace:
+                self.trace.add_agentic_retrieval_event(
+                    "planner_llm_fallback_to_baseline",
+                    {"reason": exc.reason, "detail": exc.detail, "mode": cfg.mode, "source": "rag_agent.search_knowledge_bases"},
+                )
+            return None
+        except Exception as exc:
+            if self.trace:
+                self.trace.add_agentic_retrieval_event(
+                    "planner_llm_fallback_to_baseline",
+                    {"reason": "planner_error", "detail": str(exc), "mode": cfg.mode, "source": "rag_agent.search_knowledge_bases"},
+                )
+            return None
+
+        if self.trace:
+            self.trace.add_agentic_retrieval_event(
+                "result",
+                {
+                    "plan_id": plan.plan_id,
+                    "mode": cfg.mode,
+                    "source": "rag_agent.search_knowledge_bases",
+                    "fallback_to_baseline": result.fallback_to_baseline,
+                    "fallback_reason": result.fallback_reason,
+                    "diagnostics": result.diagnostics,
+                },
+            )
+        if result.fallback_to_baseline and self.trace:
+            self.trace.add_agentic_retrieval_event(
+                "planner_llm_fallback_to_baseline",
+                {
+                    "reason": result.fallback_reason or "bounded_retrieval_failed",
+                    "mode": cfg.mode,
+                    "source": "rag_agent.search_knowledge_bases",
+                },
+            )
+        return result
+
     @tool(timeout=60)
     async def select_documents(self, question: str, max_docs:int=512) -> List[str]:
         """Ask an LLM to pick the document IDs whose titles look relevant to the question.
@@ -852,6 +985,18 @@ class RAGTools:
                     )
                     docid_scope = None
 
+            agentic_result = await self._try_agentic_bounded_retrieval(
+                question=question,
+                docid_scope=docid_scope,
+                top_n=top_n,
+                similarity_threshold=similarity_threshold,
+            )
+            use_agentic_result = (
+                agentic_result is not None
+                and self.agentic_retrieval_config.mode == "active"
+                and not agentic_result.fallback_to_baseline
+            )
+
             search_terms = keywords.strip() if keywords else ""
             if not search_terms or using_embedding:
                 search_terms = question
@@ -865,63 +1010,69 @@ class RAGTools:
                 embedding_available=self.embed_mdl is not None,
             )
             fusion_config = FusionConfig.from_env()
-            embd_mdl = self.embed_mdl if (variant_knobs["using_embedding"] or fusion_config.enabled) else None
             vector_weight = variant_knobs["vector_similarity_weight"]
-            retrieval_started_ms = _now_ms()
-            kbinfos = await settings.retriever.retrieval(
-                search_terms,
-                embd_mdl,
-                self.tenant_ids,
-                self.kb_ids,
-                1,
-                top_n,
-                similarity_threshold,
-                vector_similarity_weight=vector_weight,
-                aggs=True,
-                doc_ids=docid_scope,
-                rank_feature=label_question(question, self.kbs),
-            )
-            kbinfos["chunks"] = settings.retriever.retrieval_by_children(kbinfos["chunks"], self.tenant_ids)
             start_idx = len(self.kbinfos.get("chunks", []))
             retrieval_call_id = None
-            if self.trace:
-                retrieval_call_id = self.trace.add_retrieval_call(
-                    mode=mode,
-                    query_text=search_terms,
-                    keywords=keywords,
-                    docid_scope=docid_scope,
-                    metadata_filters=self.meta_data_filter,
-                    chunks=kbinfos.get("chunks", []),
-                    doc_aggs=kbinfos.get("doc_aggs", []),
-                    tool_call_id=tool_call_id,
-                    used_embedding=bool(embd_mdl),
-                    used_web=False,
-                    started_ms=retrieval_started_ms,
-                    retrieval_variant=variant_knobs["retrieval_variant"],
-                    similarity_threshold=variant_knobs["similarity_threshold"],
+            embd_mdl = None
+            if use_agentic_result:
+                assert agentic_result is not None
+                kbinfos = agentic_result.kbinfos
+            else:
+                embd_mdl = self.embed_mdl if (variant_knobs["using_embedding"] or fusion_config.enabled) else None
+                retrieval_started_ms = _now_ms()
+                kbinfos = await settings.retriever.retrieval(
+                    search_terms,
+                    embd_mdl,
+                    self.tenant_ids,
+                    self.kb_ids,
+                    1,
+                    top_n,
+                    similarity_threshold,
                     vector_similarity_weight=vector_weight,
-                    top_k=top_n,
-                    page_size=top_n,
-                    doc_scope_enabled=bool(docid_scope),
-                    metadata_filter_enabled=bool(self.meta_data_filter),
-                    diagnostics=self._retrieval_diagnostics(
-                        question,
-                        keywords,
-                        docid_scope,
-                        using_embedding,
+                    aggs=True,
+                    doc_ids=docid_scope,
+                    rank_feature=label_question(question, self.kbs),
+                )
+                kbinfos["chunks"] = settings.retriever.retrieval_by_children(kbinfos["chunks"], self.tenant_ids)
+                if self.trace:
+                    retrieval_call_id = self.trace.add_retrieval_call(
+                        mode=mode,
+                        query_text=search_terms,
+                        keywords=keywords,
+                        docid_scope=docid_scope,
+                        metadata_filters=self.meta_data_filter,
+                        chunks=kbinfos.get("chunks", []),
+                        doc_aggs=kbinfos.get("doc_aggs", []),
+                        tool_call_id=tool_call_id,
+                        used_embedding=bool(embd_mdl),
+                        used_web=False,
+                        started_ms=retrieval_started_ms,
+                        retrieval_variant=variant_knobs["retrieval_variant"],
+                        similarity_threshold=variant_knobs["similarity_threshold"],
+                        vector_similarity_weight=vector_weight,
+                        top_k=top_n,
+                        page_size=top_n,
+                        doc_scope_enabled=bool(docid_scope),
+                        metadata_filter_enabled=bool(self.meta_data_filter),
+                        diagnostics=self._retrieval_diagnostics(
+                            question,
+                            keywords,
+                            docid_scope,
+                            using_embedding,
+                            kbinfos.get("chunks", []),
+                            kbinfos,
+                            fusion_config,
+                            bool(embd_mdl),
+                        ),
+                    )
+                    self.trace.add_evidence_from_chunks(
                         kbinfos.get("chunks", []),
-                        kbinfos,
-                        fusion_config,
-                        bool(embd_mdl),
-                    ),
-                )
-                self.trace.add_evidence_from_chunks(
-                    kbinfos.get("chunks", []),
-                    source_type="kb",
-                    retrieval_call_id=retrieval_call_id,
-                    tool_call_id=tool_call_id,
-                    start_citation_index=start_idx,
-                )
+                        source_type="kb",
+                        retrieval_call_id=retrieval_call_id,
+                        tool_call_id=tool_call_id,
+                        start_citation_index=start_idx,
+                    )
+
             if kbinfos:
                 if self.context_builder_config.enabled:
                     mark_chunks_source_type(kbinfos.get("chunks", []), "kb")
@@ -942,14 +1093,14 @@ class RAGTools:
                     "retrieval_call_id": retrieval_call_id,
                     "chunk_count": len(kbinfos.get("chunks", [])),
                     "doc_agg_count": len(kbinfos.get("doc_aggs", [])),
-                    "retrieval_mode": mode,
-                    "retrieval_variant": variant_knobs["retrieval_variant"],
+                    "retrieval_mode": "agentic" if use_agentic_result else mode,
+                    "retrieval_variant": "llm_bounded_plan" if use_agentic_result else variant_knobs["retrieval_variant"],
                     "similarity_threshold": variant_knobs["similarity_threshold"],
                     "vector_similarity_weight": vector_weight,
                     "doc_scope_enabled": bool(docid_scope),
                     "metadata_filter_enabled": bool(self.meta_data_filter),
                     "embedding_retry_used": bool(embd_mdl),
-                    "effective_mode": "fusion" if (kbinfos.get("diagnostics", {}).get("fusion") or {}).get("enabled") else mode,
+                    "effective_mode": "agentic_bounded" if use_agentic_result else ("fusion" if (kbinfos.get("diagnostics", {}).get("fusion") or {}).get("enabled") else mode),
                 },
             )
             return result
