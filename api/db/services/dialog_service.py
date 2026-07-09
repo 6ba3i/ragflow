@@ -296,14 +296,7 @@ async def async_chat_solo(dialog, messages, stream=True, session_id=None):
     image_attachments = []
     image_files = []
 
-    if dialog.llm_id:
-        llm_types = get_model_type_by_name(dialog.tenant_id, dialog.llm_id)
-        if "chat" in llm_types:
-            model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.CHAT, dialog.llm_id)
-        else:
-            model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.IMAGE2TEXT, dialog.llm_id)
-    else:
-        model_config = get_tenant_default_model_by_type(dialog.tenant_id, LLMType.CHAT)
+    _, model_config = _resolve_dialog_llm_type_and_config(dialog)
 
     chat_mdl = LLMBundle(dialog.tenant_id, model_config, langfuse_session_id=session_id)
     factory = model_config.get("llm_factory", "") if model_config else ""
@@ -563,14 +556,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         return
 
     chat_start_ts = timer()
-    if dialog.llm_id:
-        llm_types = get_model_type_by_name(dialog.tenant_id, dialog.llm_id)
-        if "chat" in llm_types:
-            llm_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.CHAT, dialog.llm_id)
-        else:
-            llm_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.IMAGE2TEXT, dialog.llm_id)
-    else:
-        llm_model_config = get_tenant_default_model_by_type(dialog.tenant_id, LLMType.CHAT)
+    _, llm_model_config = _resolve_dialog_llm_type_and_config(dialog)
 
     factory = llm_model_config.get("llm_factory", "") if llm_model_config else ""
     max_tokens = llm_model_config.get("max_tokens") or 8192
@@ -1914,10 +1900,10 @@ async def gen_mindmap(question, kb_ids, tenant_id, search_config={}):
     return mind_map.output
 
 
-def _resolve_rag_agent_llm_type_and_config(dialog):
-    """Resolve the model config used by rag_agent's final-answer model.
+def _resolve_dialog_llm_type_and_config(dialog):
+    """Resolve the dialog chat model config.
 
-    ``rag_agent`` is a chat route. If a configured dialog model is not explicitly
+    Dialog completion routes are chat routes. If a configured dialog model is not explicitly
     image2text-only, prefer the CHAT provider-instance lookup. The previous
     fallback treated any non-``chat`` type-list result as IMAGE2TEXT, which makes
     valid chat models fail with "is not a image2text model" when the provider
@@ -1936,6 +1922,10 @@ def _resolve_rag_agent_llm_type_and_config(dialog):
         LLMType.CHAT.value,
         get_model_config_from_provider_instance(dialog.tenant_id, LLMType.CHAT, dialog.llm_id),
     )
+
+
+def _resolve_rag_agent_llm_type_and_config(dialog):
+    return _resolve_dialog_llm_type_and_config(dialog)
 
 
 async def rag_agent(dialog, messages, stream=True, **kwargs):

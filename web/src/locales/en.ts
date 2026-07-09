@@ -1127,6 +1127,9 @@ This auto-tagging feature enhances retrieval by adding another layer of domain-s
       useKnowledgeGraph: 'Use knowledge graph',
       useKnowledgeGraphTip:
         'Whether to use knowledge graph(s) in the specified dataset(s) during retrieval for multi-hop question answering. When enabled, this would involve iterative searches across entity, relationship, and community report chunks, greatly increasing retrieval time.',
+      useRagAgent: 'Agentic RAG',
+      useRagAgentTip:
+        'Use agentic retrieval for this chat when enabled by the server; turn off to use normal retrieval.',
       keyword: 'Keyword analysis',
       keywordTip: `Use LLM to analyze user's questions, extract keywords which will be emphasize during the relevance computation. Works well with lengthy queries but will increase response time.`,
       languageTip:

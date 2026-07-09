@@ -18,6 +18,7 @@ export interface PromptConfig {
   keyword: boolean;
   refine_multiturn: boolean;
   use_kg: boolean;
+  use_rag_agent?: boolean;
   reasoning?: boolean;
   cross_languages?: Array<string>;
   tavily_api_key?: string;

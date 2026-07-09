@@ -224,6 +224,11 @@ export function ChatPromptEngine({ prefix = '' }: ChatPromptEngineProps) {
         <UseKnowledgeGraphFormField
           name={prefixName(prefix, 'prompt_config.use_kg')}
         ></UseKnowledgeGraphFormField>
+        <SwitchFormField
+          name={prefixName(prefix, 'prompt_config.use_rag_agent')}
+          label={t('chat.useRagAgent')}
+          tooltip={t('chat.useRagAgentTip')}
+        ></SwitchFormField>
         <RerankFormFields prefix={prefix}></RerankFormFields>
         <CrossLanguageFormField
           name={prefixName(prefix, 'prompt_config.cross_languages')}

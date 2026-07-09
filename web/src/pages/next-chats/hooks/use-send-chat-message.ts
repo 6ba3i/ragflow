@@ -6,7 +6,7 @@ import {
   useSelectDerivedMessages,
   useSendMessageWithSse,
 } from '@/hooks/logic-hooks';
-import { useGetChatSearchParams } from '@/hooks/use-chat-request';
+import { useFetchChat, useGetChatSearchParams } from '@/hooks/use-chat-request';
 import { IMessage } from '@/interfaces/database/chat';
 import api from '@/utils/api';
 import { trim } from 'lodash';
@@ -65,6 +65,7 @@ export const useSelectNextMessages = () => {
 
 export const useSendMessage = (controller: AbortController) => {
   const { conversationId, isNew } = useGetChatSearchParams();
+  const { data: currentDialog } = useFetchChat();
   const { handleInputChange, value, setValue } = useHandleMessageInputChange();
 
   const { handleUploadFile, isUploading, removeFile, files, clearFiles } =
@@ -111,6 +112,7 @@ export const useSendMessage = (controller: AbortController) => {
           pass_all_history_messages: true,
           reasoning: enableThinking,
           internet: enableInternet,
+          use_rag_agent: currentDialog?.prompt_config?.use_rag_agent === true,
         },
         controller,
       );
@@ -130,6 +132,7 @@ export const useSendMessage = (controller: AbortController) => {
       setValue,
       send,
       controller,
+      currentDialog?.prompt_config?.use_rag_agent,
     ],
   );
 

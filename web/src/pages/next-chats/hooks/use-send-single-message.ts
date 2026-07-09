@@ -66,6 +66,9 @@ export function useSendSingleMessage({
       messages?: IMessage[];
     } & NextMessageInputOnPressEnterParameter) => {
       const sessionId = currentConversationId ?? conversationId;
+      const useRagAgent =
+        (params as any)?.use_rag_agent ??
+        ((params as any)?.prompt_config?.use_rag_agent === true);
       const res = await send(
         api.completionUrl,
         {
@@ -80,6 +83,7 @@ export function useSendSingleMessage({
           reasoning: enableThinking,
           internet: enableInternet,
           ...params,
+          use_rag_agent: useRagAgent,
           pass_all_history_messages: true,
         },
         controller,

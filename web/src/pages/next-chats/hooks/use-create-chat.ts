@@ -31,6 +31,7 @@ export const useCreateChatDialog = () => {
         system: t('chat.systemInitialValue'),
         refine_multiturn: false,
         use_kg: false,
+        use_rag_agent: false,
         reasoning: false,
         parameters: [{ key: 'knowledge', optional: false }],
         toc_enhance: false,
