@@ -135,6 +135,10 @@ def summarize_chunks(chunks: list[dict[str, Any]] | None) -> list[dict[str, Any]
             "selected_for_context": chunk.get("selected_for_context") if chunk.get("selected_for_context") is not None else agentic.get("selected_for_context"),
             "rejection_reason": chunk.get("rejection_reason") or agentic.get("rejection_reason"),
         }
+        for key in ("iteration_id", "followup_id"):
+            value = chunk.get(key) or agentic.get(key)
+            if value is not None:
+                item[key] = value
         item.update(_score_fields(chunk))
         summarized.append(item)
     return sanitize_for_trace(summarized)
@@ -194,6 +198,7 @@ class RagTraceCollector:
             "context_builder": [],
             "agentic_retrieval": [],
             "agentic_planning": [],
+            "agentic_refinement": [],
             "llm": {},
             "latency_ms": {},
             "token_usage": {},
@@ -313,6 +318,7 @@ class RagTraceCollector:
         facet_id: str | None = None,
         subquery_id: str | None = None,
         iteration_id: str | None = None,
+        followup_id: str | None = None,
     ) -> str | None:
         if not self.enabled:
             return None
@@ -346,6 +352,8 @@ class RagTraceCollector:
             "latency_ms": _duration_ms(started_ms),
             "error": sanitize_for_trace(str(error), key="error") if error else None,
         }
+        if followup_id is not None:
+            record["followup_id"] = followup_id
         self.data["retrieval_calls"].append(record)
         if error:
             self.record_error(str(error), source=mode)
@@ -392,6 +400,9 @@ class RagTraceCollector:
                 "rejection_reason": chunk.get("rejection_reason") or agentic.get("rejection_reason"),
                 "support_status": chunk.get("support_status") or agentic.get("support_status", support_status),
             }
+            followup_id = chunk.get("followup_id") or agentic.get("followup_id")
+            if followup_id is not None:
+                entry["followup_id"] = followup_id
             self.data["evidence_ledger"].append(sanitize_for_trace(entry))
             self.data["citation_mappings"].append(
                 sanitize_for_trace(
@@ -408,10 +419,10 @@ class RagTraceCollector:
     def add_context_builder_summary(self, summary: dict[str, Any] | None, *, stage: str | None = None) -> None:
         if not self.enabled:
             return
-        record = dict(summary or {})
+        record = sanitize_for_trace(dict(summary or {}))
         if stage is not None:
-            record["stage"] = stage
-        self.data["context_builder"].append(sanitize_for_trace(record))
+            record["stage"] = sanitize_for_trace(stage, key="stage")
+        self.data["context_builder"].append(record)
 
     def add_agentic_retrieval_event(self, stage: str, payload: dict[str, Any] | None = None) -> None:
         if not self.enabled:
@@ -436,6 +447,13 @@ class RagTraceCollector:
         record = {"event": "subquery"}
         record.update(fields)
         self.data["agentic_planning"].append(sanitize_for_trace(record))
+
+    def add_agentic_refinement_event(self, event: str, **fields: Any) -> None:
+        if not self.enabled:
+            return
+        record = {"event": event}
+        record.update(fields)
+        self.data["agentic_refinement"].append(sanitize_for_trace(record))
 
     def add_agentic_fallback(self, **fields: Any) -> None:
         if not self.enabled:
@@ -474,7 +492,11 @@ class RagTraceCollector:
         return out if self.include_in_response else None
 
     def to_dict(self) -> dict[str, Any]:
-        return sanitize_for_trace(deepcopy(self.data))
+        payload = sanitize_for_trace(deepcopy(self.data))
+        for sanitized, recorded in zip(payload.get("context_builder", []), self.data.get("context_builder", [])):
+            if isinstance(sanitized, dict) and isinstance(recorded, dict) and "stage" in recorded:
+                sanitized["stage"] = recorded["stage"]
+        return payload
 
     def write_jsonl(self) -> None:
         if not (self.enabled and self.output_path):

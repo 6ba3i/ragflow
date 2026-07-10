@@ -15,6 +15,7 @@
 #
 
 import asyncio
+import hashlib
 import logging
 import re
 from typing import Any, List
@@ -23,10 +24,13 @@ import json_repair
 from copy import deepcopy
 from rag.advanced_rag.agentic_retrieval import (
     AgenticPlannerError,
+    AgenticRefinementConfig,
+    AgenticRefinementError,
     AgenticRetrievalConfig,
     build_planner_input,
     execute_bounded_plan,
     generate_llm_plan,
+    run_refinement_loop,
     should_plan,
 )
 from api.db.services.doc_metadata_service import DocMetadataService
@@ -97,6 +101,15 @@ _FOLLOWUP_WEAK_SINGLETONS = _FOLLOWUP_LEADING_NOISE | frozenset(
 )
 _FOLLOWUP_PRONOUN_REFERENCE = re.compile(r"\b(?:it|its|they|them|their|this|that|these|those|he|she|his|her)\b", re.I)
 _FOLLOWUP_YEAR_RE = re.compile(r"\b(?:1[5-9]\d{2}|20\d{2}|2100)\b")
+
+
+def _refinement_storage_identity(chunk: dict[str, Any]) -> str:
+    if chunk.get("chunk_id"):
+        return f"chunk:{chunk['chunk_id']}"
+    doc_id = str(chunk.get("doc_id") or "")
+    content = str(chunk.get("content_with_weight") or chunk.get("content") or "")
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return f"doc_content:{doc_id}:{content_hash}"
 
 
 def _clean_followup_entity_candidate(candidate: str | None) -> str:
@@ -210,6 +223,7 @@ class RAGTools:
                  trace: RagTraceCollector | None = None,
                  context_builder_config: EvidenceBundleConfig | None = None,
                  agentic_retrieval_config: AgenticRetrievalConfig | None = None,
+                 agentic_refinement_config: AgenticRefinementConfig | None = None,
                  ):
         self.tenant_ids = tenant_ids
         self.chat_mdl = deepcopy(chat_mdl)
@@ -238,6 +252,7 @@ class RAGTools:
         self.trace = trace
         self.context_builder_config = context_builder_config or EvidenceBundleConfig.from_env()
         self.agentic_retrieval_config = agentic_retrieval_config or AgenticRetrievalConfig.from_env()
+        self.agentic_refinement_config = agentic_refinement_config or AgenticRefinementConfig.from_env()
         # Accumulator for chunks/doc_aggs across tool calls within a turn —
         # populated by ``search_knowledge_bases`` and ``search_structured_data``
         # so the final answer can cite everything retrieved so far.
@@ -282,6 +297,13 @@ class RAGTools:
 
     def _prompt_start_idx(self, start_idx: int) -> int:
         return 0 if self.context_builder_config.enabled else start_idx
+
+    def _selected_phase5_kbinfos(self, kbinfos: dict[str, Any], *, question: str) -> dict[str, Any]:
+        return apply_context_builder_to_kbinfos(
+            deepcopy(kbinfos),
+            self.context_builder_config,
+            query=question,
+        ).kbinfos
 
     def _trace_tool_start(self, name: str, args: dict[str, Any] | None = None, *, retrieval_mode: str | None = None) -> str | None:
         if not self.trace:
@@ -604,6 +626,93 @@ class RAGTools:
                 result.append((doc.id, doc.name))
                 if len(result) >= max_docs:
                     return None
+        return result
+
+    async def _try_agentic_refinement(
+        self,
+        *,
+        question: str,
+        agentic_result: Any,
+        docid_scope: list[str] | None,
+        top_n: int,
+        similarity_threshold: float,
+    ) -> Any | None:
+        """Run Phase 6 only on a successful Phase 5 bounded retrieval result."""
+        cfg = self.agentic_refinement_config
+        if not cfg.enabled or cfg.mode == "off":
+            return None
+
+        plan = getattr(agentic_result, "plan", None)
+        plan_id = getattr(plan, "plan_id", None)
+        if plan is None or getattr(agentic_result, "fallback_to_baseline", True):
+            if self.trace:
+                self.trace.add_agentic_refinement_event(
+                    "refinement_skip",
+                    mode=cfg.mode,
+                    plan_id=plan_id,
+                    stop_reason="phase5_unavailable",
+                )
+            return None
+        if cfg.mode == "active" and self.agentic_retrieval_config.mode != "active":
+            if self.trace:
+                self.trace.add_agentic_refinement_event(
+                    "refinement_skip",
+                    mode=cfg.mode,
+                    plan_id=plan_id,
+                    stop_reason="phase5_not_active",
+                )
+            return None
+
+        candidate_kbinfos = deepcopy(agentic_result.kbinfos)
+        selected_kbinfos = self._selected_phase5_kbinfos(candidate_kbinfos, question=question)
+        try:
+            result = await run_refinement_loop(
+                question=question,
+                plan=plan,
+                kbinfos=selected_kbinfos,
+                candidate_kbinfos=candidate_kbinfos,
+                retriever=settings.retriever,
+                chat_mdl=self.chat_mdl,
+                embd_mdl=self.embed_mdl,
+                tenant_ids=self.tenant_ids,
+                kb_ids=self.kb_ids,
+                doc_ids=docid_scope,
+                similarity_threshold=similarity_threshold,
+                vector_similarity_weight=0.7 if self.embed_mdl else 0.0,
+                top_k=max(1, top_n),
+                rank_feature=label_question(question, self.kbs),
+                refinement_cfg=cfg,
+                retrieval_cfg=self.agentic_retrieval_config,
+                context_builder_config=self.context_builder_config,
+                rag_trace=self.trace,
+                metadata_filters=self.meta_data_filter,
+                rerank_mdl=None,
+                apply_children=True,
+                apply_toc=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except AgenticRefinementError as exc:
+            if self.trace:
+                self.trace.add_agentic_refinement_event(
+                    "refinement_fallback_to_previous_context",
+                    mode=cfg.mode,
+                    plan_id=plan_id,
+                    fallback_reason=exc.reason,
+                    detail=exc.detail,
+                )
+            return None
+        except Exception as exc:
+            if self.trace:
+                self.trace.add_agentic_refinement_event(
+                    "refinement_fallback_to_previous_context",
+                    mode=cfg.mode,
+                    plan_id=plan_id,
+                    fallback_reason="refinement_error",
+                    detail=str(exc),
+                )
+            return None
+
         return result
 
     def _with_citation_guidelines(self, output: Any) -> Any:
@@ -996,6 +1105,23 @@ class RAGTools:
                 and self.agentic_retrieval_config.mode == "active"
                 and not agentic_result.fallback_to_baseline
             )
+            refinement_result = None
+            if self.agentic_refinement_config.enabled and self.agentic_refinement_config.mode != "off":
+                refinement_result = await self._try_agentic_refinement(
+                    question=question,
+                    agentic_result=agentic_result,
+                    docid_scope=docid_scope,
+                    top_n=top_n,
+                    similarity_threshold=similarity_threshold,
+                )
+            use_refinement_result = (
+                use_agentic_result
+                and refinement_result is not None
+                and self.agentic_refinement_config.mode == "active"
+                and refinement_result.changed
+                and not refinement_result.fallback_to_previous_context
+                and refinement_result.selected_new_evidence_count >= self.agentic_refinement_config.min_new_evidence
+            )
 
             search_terms = keywords.strip() if keywords else ""
             if not search_terms or using_embedding:
@@ -1014,7 +1140,41 @@ class RAGTools:
             start_idx = len(self.kbinfos.get("chunks", []))
             retrieval_call_id = None
             embd_mdl = None
-            if use_agentic_result:
+            if use_refinement_result:
+                kbinfos = deepcopy(refinement_result.kbinfos)
+                allowed_refinement_keys = {
+                    _refinement_storage_identity(chunk)
+                    for chunk in agentic_result.kbinfos.get("chunks", [])
+                    if isinstance(chunk, dict)
+                }
+                allowed_refinement_keys.update(
+                    _refinement_storage_identity(chunk)
+                    for chunk in refinement_result.accepted_chunks
+                    if isinstance(chunk, dict)
+                )
+                kbinfos["chunks"] = [
+                    chunk
+                    for chunk in kbinfos.get("chunks", [])
+                    if isinstance(chunk, dict) and _refinement_storage_identity(chunk) in allowed_refinement_keys
+                ]
+                selected_doc_ids = {chunk.get("doc_id") for chunk in kbinfos["chunks"] if chunk.get("doc_id")}
+                selected_doc_names = {
+                    chunk.get("docnm_kwd") or chunk.get("document_name") or chunk.get("title")
+                    for chunk in kbinfos["chunks"]
+                    if chunk.get("docnm_kwd") or chunk.get("document_name") or chunk.get("title")
+                }
+                if isinstance(kbinfos.get("doc_aggs"), list):
+                    kbinfos["doc_aggs"] = [
+                        doc_agg
+                        for doc_agg in kbinfos["doc_aggs"]
+                        if isinstance(doc_agg, dict)
+                        and (
+                            doc_agg.get("doc_id") in selected_doc_ids
+                            or (doc_agg.get("doc_name") or doc_agg.get("docnm_kwd") or doc_agg.get("document_name")) in selected_doc_names
+                        )
+                    ]
+                kbinfos["total"] = len(kbinfos["chunks"])
+            elif use_agentic_result:
                 assert agentic_result is not None
                 kbinfos = agentic_result.kbinfos
             else:
@@ -1073,16 +1233,64 @@ class RAGTools:
                         start_citation_index=start_idx,
                     )
 
+            appended_refinement_evidence_count = 0
             if kbinfos:
                 if self.context_builder_config.enabled:
                     mark_chunks_source_type(kbinfos.get("chunks", []), "kb")
-                self.kbinfos["chunks"].extend(kbinfos.get("chunks", []))
+                chunks_to_append = list(kbinfos.get("chunks", []))
+                if use_refinement_result:
+                    existing_keys = {
+                        _refinement_storage_identity(chunk)
+                        for chunk in self.kbinfos.get("chunks", [])
+                        if isinstance(chunk, dict)
+                    }
+                    deduped_chunks = []
+                    accepted_keys = {
+                        _refinement_storage_identity(chunk)
+                        for chunk in refinement_result.accepted_chunks
+                        if isinstance(chunk, dict)
+                    }
+                    for chunk in chunks_to_append:
+                        identity = _refinement_storage_identity(chunk)
+                        if identity in existing_keys:
+                            raw_agentic = chunk.get("_ragflow_agentic_retrieval")
+                            lineage = raw_agentic if isinstance(raw_agentic, dict) else {}
+                            followup_id = chunk.get("followup_id") or lineage.get("followup_id")
+                            if followup_id and self.trace:
+                                self.trace.add_agentic_refinement_event(
+                                    "refinement_evidence_rejected",
+                                    mode=self.agentic_refinement_config.mode,
+                                    plan_id=chunk.get("plan_id") or lineage.get("plan_id"),
+                                    iteration_id=chunk.get("iteration_id") or lineage.get("iteration_id"),
+                                    followup_id=followup_id,
+                                    facet_id=chunk.get("facet_id") or lineage.get("facet_id"),
+                                    evidence_id=chunk.get("chunk_id") or chunk.get("id"),
+                                    rejection_reason="duplicate_accumulated_evidence",
+                                )
+                            continue
+                        existing_keys.add(identity)
+                        deduped_chunks.append(chunk)
+                        if identity in accepted_keys:
+                            appended_refinement_evidence_count += 1
+                    chunks_to_append = deduped_chunks
+                self.kbinfos["chunks"].extend(chunks_to_append)
                 self.kbinfos["doc_aggs"].extend(kbinfos.get("doc_aggs", []))
             self._last_context_query = question
-            followup_hint = _missing_attribute_query(question, keywords, question, retrieved_evidence=kbinfos.get("chunks", []))
+            followup_hint = None
+            if not self.agentic_refinement_config.enabled:
+                followup_hint = _missing_attribute_query(question, keywords, question, retrieved_evidence=kbinfos.get("chunks", []))
             if followup_hint and self.trace:
                 self.trace.add_context_builder_summary(followup_hint, stage="rag_agent.followup_hint")
-            prompt_kbinfos = self.context_kbinfos(stage="rag_agent.search_knowledge_bases", start_citation_index=self._prompt_start_idx(start_idx), query=question)
+            context_stage = "rag_agent.search_knowledge_bases"
+            if use_refinement_result:
+                accepted_iterations = [
+                    index
+                    for index, iteration in enumerate(refinement_result.iterations, start=1)
+                    if iteration.accepted_new_evidence_count > 0
+                ]
+                if accepted_iterations:
+                    context_stage = f"refinement.iteration.{accepted_iterations[-1]}"
+            prompt_kbinfos = self.context_kbinfos(stage=context_stage, start_citation_index=self._prompt_start_idx(start_idx), query=question)
             result = self._with_citation_guidelines(
                 kb_prompt(prompt_kbinfos, self.chat_mdl.max_length, self._prompt_start_idx(start_idx))
             )
@@ -1093,14 +1301,16 @@ class RAGTools:
                     "retrieval_call_id": retrieval_call_id,
                     "chunk_count": len(kbinfos.get("chunks", [])),
                     "doc_agg_count": len(kbinfos.get("doc_aggs", [])),
-                    "retrieval_mode": "agentic" if use_agentic_result else mode,
-                    "retrieval_variant": "llm_bounded_plan" if use_agentic_result else variant_knobs["retrieval_variant"],
+                    "retrieval_mode": "agentic_refined" if use_refinement_result else ("agentic" if use_agentic_result else mode),
+                    "retrieval_variant": "llm_refined_plan" if use_refinement_result else ("llm_bounded_plan" if use_agentic_result else variant_knobs["retrieval_variant"]),
                     "similarity_threshold": variant_knobs["similarity_threshold"],
                     "vector_similarity_weight": vector_weight,
                     "doc_scope_enabled": bool(docid_scope),
                     "metadata_filter_enabled": bool(self.meta_data_filter),
                     "embedding_retry_used": bool(embd_mdl),
-                    "effective_mode": "agentic_bounded" if use_agentic_result else ("fusion" if (kbinfos.get("diagnostics", {}).get("fusion") or {}).get("enabled") else mode),
+                    "effective_mode": "agentic_refined" if use_refinement_result else ("agentic_bounded" if use_agentic_result else ("fusion" if (kbinfos.get("diagnostics", {}).get("fusion") or {}).get("enabled") else mode)),
+                    "refinement_selected_new_evidence_count": refinement_result.selected_new_evidence_count if use_refinement_result else 0,
+                    "refinement_appended_new_evidence_count": appended_refinement_evidence_count,
                 },
             )
             return result

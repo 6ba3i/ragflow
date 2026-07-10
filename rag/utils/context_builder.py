@@ -312,6 +312,8 @@ def evidence_records_from_kbinfos(
             "plan_id",
             "facet_id",
             "subquery_id",
+            "iteration_id",
+            "followup_id",
             "retrieval_call_id",
             "lineage_rank",
             "merge_rank",
@@ -955,7 +957,7 @@ def _sync_record_chunk_context_metadata(record: EvidenceRecord) -> None:
         record.chunk["citation_index"] = record.citation_index
     raw_agentic = record.metadata.get("agentic_retrieval")
     agentic: dict[str, Any] = dict(raw_agentic) if isinstance(raw_agentic, dict) else {}
-    for key in ("plan_id", "facet_id", "subquery_id", "retrieval_call_id", "lineage_rank", "merge_rank", "retrieval_variant"):
+    for key in ("plan_id", "facet_id", "subquery_id", "iteration_id", "followup_id", "retrieval_call_id", "lineage_rank", "merge_rank", "retrieval_variant"):
         if key in record.metadata and record.metadata.get(key) is not None:
             record.chunk[key] = record.metadata.get(key)
             agentic[key] = record.metadata.get(key)
@@ -980,20 +982,22 @@ def _agentic_lineage_summary(records: list[EvidenceRecord], selected: list[Evide
         if not lineage_value(record, "plan_id"):
             continue
         selected_for_context = id(record) in selected_ids
-        lineage.append(
-            {
-                "evidence_id": record.evidence_id,
-                "chunk_id": record.chunk_id,
-                "plan_id": lineage_value(record, "plan_id"),
-                "subquery_id": lineage_value(record, "subquery_id"),
-                "facet_id": lineage_value(record, "facet_id"),
-                "retrieval_call_id": record.retrieval_call_id or lineage_value(record, "retrieval_call_id"),
-                "lineage_rank": lineage_value(record, "lineage_rank"),
-                "merge_rank": lineage_value(record, "merge_rank"),
-                "selected_for_context": selected_for_context,
-                "rejection_reason": None if selected_for_context else record.rejection_reason,
-            }
-        )
+        item = {
+            "evidence_id": record.evidence_id,
+            "chunk_id": record.chunk_id,
+            "plan_id": lineage_value(record, "plan_id"),
+            "subquery_id": lineage_value(record, "subquery_id"),
+            "facet_id": lineage_value(record, "facet_id"),
+            "retrieval_call_id": record.retrieval_call_id or lineage_value(record, "retrieval_call_id"),
+            "lineage_rank": lineage_value(record, "lineage_rank"),
+            "merge_rank": lineage_value(record, "merge_rank"),
+            "selected_for_context": selected_for_context,
+            "rejection_reason": None if selected_for_context else record.rejection_reason,
+        }
+        for key in ("iteration_id", "followup_id"):
+            if lineage_value(record, key) is not None:
+                item[key] = lineage_value(record, key)
+        lineage.append(item)
     return lineage
 
 

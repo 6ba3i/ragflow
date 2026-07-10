@@ -20,13 +20,14 @@ import re
 import time
 import uuid
 from collections import defaultdict
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Literal
 
 from rag.utils.retrieval_diagnostics import make_retrieval_variant, resolve_variant_knobs
 
 AgenticRetrievalMode = Literal["off", "diagnostic", "shadow", "active"]
+AgenticRefinementJudgeMode = Literal["heuristic", "llm", "hybrid"]
 RetrievalVariant = Literal["hybrid_default", "keyword_first", "embedding_retry"]
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -36,6 +37,7 @@ _YEAR_RE = re.compile(r"\b(?:1[5-9]\d{2}|20\d{2}|2100)\b")
 _QUOTED_RE = re.compile(r'"([^"]+)"|\'([^\']+)\'')
 _PROPER_NOUN_RE = re.compile(r"\b[A-Z][\w-]*(?:\s+[A-Z][\w-]*){0,5}")
 _SMALL_TALK = {"hi", "hello", "hey", "thanks", "thank you", "ok", "okay"}
+_LEADING_QUERY_COMMANDS = {"find", "give", "identify", "locate", "look", "retrieve", "search", "show", "tell"}
 _STOPWORDS = {
     "about",
     "after",
@@ -98,10 +100,32 @@ _REQUIRED_PLANNER_KEYS = {
     "merge_policy",
     "drift_controls",
 }
+_REQUIRED_JUDGE_KEYS = {
+    "sufficient",
+    "confidence",
+    "covered_facets",
+    "missing_facets",
+    "contradictions",
+    "exact_fact_gaps",
+    "refusal_justified",
+    "recommended_followups",
+}
+_SUPPORTED_FACET_SUPPORT = {"strong", "weak"}
+_SUPPORTED_EXACT_FACT_TYPES = {"date", "number", "name"}
+_MAX_REFINEMENT_FOLLOWUP_TOP_N = 20
 
 
 class AgenticPlannerError(Exception):
     """Raised when the LLM planner cannot produce a valid bounded plan."""
+
+    def __init__(self, reason: str, detail: str | None = None):
+        self.reason = reason
+        self.detail = detail
+        super().__init__(reason if detail is None else f"{reason}: {detail}")
+
+
+class AgenticRefinementError(Exception):
+    """Raised when Phase 6 cannot safely refine the Phase 5 evidence."""
 
     def __init__(self, reason: str, detail: str | None = None):
         self.reason = reason
@@ -148,6 +172,56 @@ class AgenticRetrievalConfig:
 
 
 @dataclass(frozen=True)
+class AgenticRefinementConfig:
+    enabled: bool = False
+    mode: AgenticRetrievalMode = "off"
+    max_iterations: int = 1
+    max_followup_queries: int = 2
+    min_new_evidence: int = 1
+    judge: AgenticRefinementJudgeMode = "hybrid"
+    judge_timeout_ms: int = 1000
+    max_drift_rate: float = 0.05
+    confidence_threshold: float = 0.72
+
+    @classmethod
+    def from_env(cls, overrides: dict[str, Any] | None = None) -> "AgenticRefinementConfig":
+        overrides = overrides or {}
+        enabled = _bool_setting(overrides.get("agentic_refinement_enabled"), "AGENTIC_REFINEMENT_ENABLED", False)
+        mode = str(overrides.get("agentic_refinement_mode") or os.getenv("AGENTIC_REFINEMENT_MODE") or "off").strip().lower()
+        if mode not in {"off", "diagnostic", "shadow", "active"} or not enabled:
+            mode = "off"
+        judge = str(overrides.get("agentic_refinement_judge") or os.getenv("AGENTIC_REFINEMENT_JUDGE") or "hybrid").strip().lower()
+        if judge not in {"heuristic", "llm", "hybrid"}:
+            judge = "hybrid"
+        return cls(
+            enabled=enabled,
+            mode=mode,  # type: ignore[arg-type]
+            max_iterations=_bounded_int_setting(overrides.get("agentic_refinement_max_iterations"), "AGENTIC_REFINEMENT_MAX_ITERATIONS", 1, 1, 4),
+            max_followup_queries=_bounded_int_setting(overrides.get("agentic_refinement_max_followup_queries"), "AGENTIC_REFINEMENT_MAX_FOLLOWUP_QUERIES", 2, 1, 4),
+            min_new_evidence=_bounded_int_setting(overrides.get("agentic_refinement_min_new_evidence"), "AGENTIC_REFINEMENT_MIN_NEW_EVIDENCE", 1, 1, 20),
+            judge=judge,  # type: ignore[arg-type]
+            judge_timeout_ms=_bounded_int_setting(overrides.get("agentic_refinement_judge_timeout_ms"), "AGENTIC_REFINEMENT_JUDGE_TIMEOUT_MS", 1000, 1, 10000),
+            max_drift_rate=_nonnegative_float_setting(overrides.get("agentic_refinement_max_drift_rate"), "AGENTIC_REFINEMENT_MAX_DRIFT_RATE", 0.05),
+            confidence_threshold=_bounded_float_setting(overrides.get("agentic_refinement_confidence_threshold"), "AGENTIC_REFINEMENT_CONFIDENCE_THRESHOLD", 0.72),
+        )
+
+    def normalized(self) -> "AgenticRefinementConfig":
+        mode = self.mode if self.enabled and self.mode in {"off", "diagnostic", "shadow", "active"} else "off"
+        judge = self.judge if self.judge in {"heuristic", "llm", "hybrid"} else "hybrid"
+        return replace(
+            self,
+            mode=mode,
+            judge=judge,
+            max_iterations=max(1, min(int(self.max_iterations), 4)),
+            max_followup_queries=max(1, min(int(self.max_followup_queries), 4)),
+            min_new_evidence=max(1, min(int(self.min_new_evidence), 20)),
+            judge_timeout_ms=max(1, min(int(self.judge_timeout_ms), 10000)),
+            max_drift_rate=max(0.0, min(float(self.max_drift_rate), 1.0)),
+            confidence_threshold=max(0.0, min(float(self.confidence_threshold), 1.0)),
+        )
+
+
+@dataclass(frozen=True)
 class PlanningTrigger:
     enabled: bool
     mode: AgenticRetrievalMode
@@ -181,6 +255,8 @@ class SubquerySpec:
     must_have_terms: tuple[str, ...] = ()
     forbidden_new_entities: tuple[str, ...] = ()
     rationale: str = ""
+    iteration_id: str | None = None
+    followup_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -207,6 +283,86 @@ class BoundedRetrievalResult:
     fallback_to_baseline: bool = False
     fallback_reason: str | None = None
     diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FollowupQuerySpec:
+    plan_id: str
+    facet_id: str
+    query: str
+    iteration_id: str = ""
+    followup_id: str = ""
+    keywords: str | None = None
+    top_n: int = 5
+    retrieval_variant: RetrievalVariant = "hybrid_default"
+
+
+@dataclass(frozen=True)
+class SufficiencyJudge:
+    sufficient: bool
+    confidence: float
+    covered_facets: tuple[dict[str, Any], ...]
+    missing_facets: tuple[dict[str, Any], ...]
+    contradictions: tuple[dict[str, Any], ...]
+    exact_fact_gaps: tuple[dict[str, Any], ...]
+    refusal_justified: bool
+    recommended_followups: tuple[FollowupQuerySpec, ...]
+
+    def to_trace_dict(self) -> dict[str, Any]:
+        return {
+            "sufficient": self.sufficient,
+            "confidence": self.confidence,
+            "covered_facets": [dict(item) for item in self.covered_facets],
+            "missing_facets": [dict(item) for item in self.missing_facets],
+            "contradictions": [dict(item) for item in self.contradictions],
+            "exact_fact_gaps": [dict(item) for item in self.exact_fact_gaps],
+            "refusal_justified": self.refusal_justified,
+            "recommended_followups": [asdict(item) for item in self.recommended_followups],
+        }
+
+
+@dataclass(frozen=True)
+class RefinementIteration:
+    iteration_id: str
+    judge: SufficiencyJudge | None
+    followups: tuple[FollowupQuerySpec, ...]
+    accepted_new_evidence_count: int
+    rejected_evidence_count: int
+    coverage_before: float
+    coverage_after: float
+    marginal_gain: float
+    latency_ms: float
+    stop_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class RefinementResult:
+    kbinfos: dict[str, Any]
+    iterations: tuple[RefinementIteration, ...]
+    candidate_kbinfos: dict[str, Any] | None = None
+    accepted_chunks: tuple[dict[str, Any], ...] = ()
+    rejected_chunks: tuple[dict[str, Any], ...] = ()
+    changed: bool = False
+    fallback_to_previous_context: bool = False
+    fallback_reason: str | None = None
+    stop_reason: str | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def selected_new_evidence_count(self) -> int:
+        return len(self.accepted_chunks)
+
+
+@dataclass(frozen=True)
+class EvidenceAcceptanceResult:
+    kbinfos: dict[str, Any]
+    accepted_chunks: tuple[dict[str, Any], ...]
+    rejected_chunks: tuple[dict[str, Any], ...]
+    candidate_kbinfos: dict[str, Any] | None = None
+
+    @property
+    def selected_new_evidence_count(self) -> int:
+        return len(self.accepted_chunks)
 
 
 @dataclass(frozen=True)
@@ -533,6 +689,858 @@ def validate_plan(plan: BoundedRetrievalPlan | dict[str, Any], cfg: AgenticRetri
     return PlanValidationResult(fallback_reason is None and bool(kept_subqueries), errors, normalized, fallback_reason=fallback_reason)
 
 
+def detect_missing_facets(question: str, plan: BoundedRetrievalPlan, kbinfos: dict[str, Any]) -> dict[str, Any]:
+    """Return cheap coverage diagnostics without generating semantic followups."""
+    chunks = [chunk for chunk in ((kbinfos or {}).get("chunks") or []) if isinstance(chunk, dict)]
+    covered: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    exact_fact_gaps: list[dict[str, str]] = []
+    contradictions: list[dict[str, Any]] = []
+    for facet in plan.required_facets:
+        supporting: list[dict[str, Any]] = []
+        for chunk in chunks:
+            metadata = chunk.get("_ragflow_agentic_retrieval") or {}
+            facet_ids = set(str(value) for value in metadata.get("facet_ids") or [])
+            facet_id = str(chunk.get("facet_id") or metadata.get("facet_id") or "")
+            if facet.facet_id == facet_id or facet.facet_id in facet_ids or _text_has_any_anchor(_chunk_text(chunk), facet.anchors):
+                supporting.append(chunk)
+        combined = "\n".join(_chunk_text(chunk) for chunk in supporting)
+        missing_anchors = [anchor for anchor in facet.anchors if not _phrase_in_text(anchor, combined)]
+        evidence_ids = [_evidence_id(chunk) for chunk in supporting]
+        unique_sources = {_chunk_source_id(chunk) for chunk in supporting if _chunk_source_id(chunk)}
+        duplicate_count = len(supporting) - len({_refinement_chunk_identity(chunk) for chunk in supporting})
+        support = "strong" if supporting and not missing_anchors and len(unique_sources) >= 2 and not duplicate_count else "weak"
+        if not supporting:
+            missing.append({"facet_id": facet.facet_id, "reason": "no_selected_evidence", "required_anchors": list(facet.anchors)})
+        elif missing_anchors:
+            missing.append({"facet_id": facet.facet_id, "reason": "required_anchors_absent", "required_anchors": missing_anchors})
+        elif len(unique_sources) < 2:
+            missing.append({"facet_id": facet.facet_id, "reason": "weak_source_diversity", "required_anchors": list(facet.anchors)})
+        elif duplicate_count:
+            missing.append({"facet_id": facet.facet_id, "reason": "redundant_selected_evidence", "required_anchors": list(facet.anchors)})
+        else:
+            covered.append({"facet_id": facet.facet_id, "evidence_ids": evidence_ids, "support": support})
+
+        gap = _exact_fact_gap(question, facet, combined)
+        if gap:
+            exact_fact_gaps.append(gap)
+            missing = [
+                item
+                for item in missing
+                if item["facet_id"] != facet.facet_id or item["reason"] not in {"weak_source_diversity", "redundant_selected_evidence"}
+            ]
+            if not any(item["facet_id"] == facet.facet_id and item["reason"] == "exact_fact_absent" for item in missing):
+                missing.append({"facet_id": facet.facet_id, "reason": "exact_fact_absent", "required_anchors": list(facet.anchors)})
+
+        conflicting_ids = [_evidence_id(chunk) for chunk in supporting if _chunk_has_contradiction_signal(chunk)]
+        if conflicting_ids:
+            contradictions.append(
+                {
+                    "facet_id": facet.facet_id,
+                    "evidence_ids": conflicting_ids,
+                    "description": "metadata_conflict_signal",
+                }
+            )
+    coverage = len(covered) / max(1, len(plan.required_facets))
+    return {
+        "covered_facets": covered,
+        "missing_facets": missing,
+        "contradictions": contradictions,
+        "exact_fact_gaps": exact_fact_gaps,
+        "coverage": round(coverage, 6),
+        "obviously_sufficient": bool(plan.required_facets) and not missing and not contradictions and not exact_fact_gaps and all(item["support"] == "strong" for item in covered),
+    }
+
+
+def parse_sufficiency_judge_json(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, str):
+        raise AgenticRefinementError("refinement_judge_invalid_json", f"non_string_response:{type(raw).__name__}")
+    text = raw.strip()
+    if not text:
+        raise AgenticRefinementError("refinement_judge_invalid_json", "empty_response")
+    if "```" in text:
+        raise AgenticRefinementError("refinement_judge_invalid_json", "markdown_fence")
+    if not text.startswith("{") or not text.endswith("}"):
+        raise AgenticRefinementError("refinement_judge_invalid_json", "response_not_single_json_object")
+    try:
+        parsed, end = json.JSONDecoder().raw_decode(text)
+    except json.JSONDecodeError as exc:
+        raise AgenticRefinementError("refinement_judge_invalid_json", str(exc)) from exc
+    if text[end:].strip():
+        raise AgenticRefinementError("refinement_judge_invalid_json", "multiple_json_or_trailing_text")
+    if not isinstance(parsed, dict) or not parsed:
+        raise AgenticRefinementError("refinement_judge_invalid_json", "json_not_nonempty_object")
+    missing = sorted(_REQUIRED_JUDGE_KEYS.difference(parsed))
+    if missing:
+        raise AgenticRefinementError("refinement_judge_validation_failed", "missing_keys:" + ",".join(missing))
+    return parsed
+
+
+def validate_sufficiency_judge(
+    raw: dict[str, Any],
+    plan: BoundedRetrievalPlan,
+    cfg: AgenticRefinementConfig,
+    iteration_id: str = "",
+    selected_evidence_ids: set[str] | None = None,
+) -> SufficiencyJudge:
+    if not isinstance(raw, dict) or not raw:
+        raise AgenticRefinementError("refinement_judge_validation_failed", "judge_not_nonempty_object")
+    missing_keys = sorted(_REQUIRED_JUDGE_KEYS.difference(raw))
+    if missing_keys:
+        raise AgenticRefinementError("refinement_judge_validation_failed", "missing_keys:" + ",".join(missing_keys))
+    unknown_keys = sorted(set(raw).difference(_REQUIRED_JUDGE_KEYS))
+    if unknown_keys:
+        raise AgenticRefinementError("refinement_judge_validation_failed", "unknown_keys:" + ",".join(unknown_keys))
+    if not isinstance(raw["sufficient"], bool) or not isinstance(raw["refusal_justified"], bool):
+        raise AgenticRefinementError("refinement_judge_validation_failed", "boolean_fields_invalid")
+    confidence = raw["confidence"]
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0.0 <= float(confidence) <= 1.0:
+        raise AgenticRefinementError("refinement_judge_validation_failed", "confidence_out_of_range")
+    for key in ("covered_facets", "missing_facets", "contradictions", "exact_fact_gaps", "recommended_followups"):
+        if not isinstance(raw[key], list):
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"{key}_not_array")
+
+    facet_ids = {facet.facet_id for facet in plan.required_facets}
+    covered: list[dict[str, Any]] = []
+    for index, item in enumerate(raw["covered_facets"], start=1):
+        if not isinstance(item, dict):
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"covered_facet_{index}_not_object")
+        if set(item) != {"facet_id", "evidence_ids", "support"}:
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"covered_facet_{index}_schema_invalid")
+        facet_id = str(item.get("facet_id") or "")
+        support = str(item.get("support") or "")
+        evidence_ids = item.get("evidence_ids")
+        if facet_id not in facet_ids:
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"unknown_facet:{facet_id}")
+        if support not in _SUPPORTED_FACET_SUPPORT:
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"unsupported_support:{support}")
+        if not isinstance(evidence_ids, list) or not evidence_ids or any(not isinstance(value, str) or not value.strip() for value in evidence_ids):
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"invalid_evidence_ids:{facet_id}")
+        if selected_evidence_ids is not None and any(value not in selected_evidence_ids for value in evidence_ids):
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"unknown_evidence_id:{facet_id}")
+        covered.append({"facet_id": facet_id, "evidence_ids": list(evidence_ids), "support": support})
+
+    missing: list[dict[str, Any]] = []
+    for index, item in enumerate(raw["missing_facets"], start=1):
+        if not isinstance(item, dict):
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"missing_facet_{index}_not_object")
+        if set(item) != {"facet_id", "reason", "required_anchors"}:
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"missing_facet_{index}_schema_invalid")
+        facet_id = str(item.get("facet_id") or "")
+        anchors = item.get("required_anchors")
+        if facet_id not in facet_ids:
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"unknown_facet:{facet_id}")
+        if not isinstance(item.get("reason"), str) or not item["reason"].strip():
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"missing_reason:{facet_id}")
+        if not isinstance(anchors, list) or any(not isinstance(value, str) or not value.strip() for value in anchors):
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"invalid_required_anchors:{facet_id}")
+        facet = next(facet for facet in plan.required_facets if facet.facet_id == facet_id)
+        grounding_text = "\n".join((plan.original_question, facet.description, *facet.anchors))
+        if any(not _phrase_in_text(anchor, grounding_text) for anchor in anchors):
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"ungrounded_required_anchor:{facet_id}")
+        missing.append({"facet_id": facet_id, "reason": item["reason"].strip(), "required_anchors": list(anchors)})
+    missing_ids = {item["facet_id"] for item in missing}
+    covered_ids = {item["facet_id"] for item in covered}
+    if covered_ids.intersection(missing_ids):
+        raise AgenticRefinementError("refinement_judge_validation_failed", "facet_both_covered_and_missing")
+
+    contradictions: list[dict[str, Any]] = []
+    for index, item in enumerate(raw["contradictions"], start=1):
+        if not isinstance(item, dict):
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"contradiction_{index}_not_object")
+        if set(item) != {"facet_id", "evidence_ids", "description"}:
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"contradiction_{index}_schema_invalid")
+        facet_id = str(item.get("facet_id") or "")
+        evidence_ids = item.get("evidence_ids")
+        if facet_id not in facet_ids:
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"unknown_facet:{facet_id}")
+        if not isinstance(evidence_ids, list) or len(evidence_ids) < 2 or any(not isinstance(value, str) or not value.strip() for value in evidence_ids):
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"invalid_contradiction_evidence:{facet_id}")
+        if selected_evidence_ids is not None and any(value not in selected_evidence_ids for value in evidence_ids):
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"unknown_contradiction_evidence_id:{facet_id}")
+        if not isinstance(item.get("description"), str) or not item["description"].strip():
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"invalid_contradiction_description:{facet_id}")
+        contradictions.append({"facet_id": facet_id, "evidence_ids": list(evidence_ids), "description": item["description"].strip()})
+
+    gaps: list[dict[str, str]] = []
+    for index, item in enumerate(raw["exact_fact_gaps"], start=1):
+        if not isinstance(item, dict):
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"exact_fact_gap_{index}_not_object")
+        if set(item) != {"type", "description"}:
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"exact_fact_gap_{index}_schema_invalid")
+        gap_type = str(item.get("type") or "")
+        description = str(item.get("description") or "").strip()
+        if gap_type not in _SUPPORTED_EXACT_FACT_TYPES or not description:
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"invalid_exact_fact_gap:{index}")
+        gaps.append({"type": gap_type, "description": description})
+
+    if len(raw["recommended_followups"]) > cfg.normalized().max_followup_queries:
+        raise AgenticRefinementError("refinement_judge_validation_failed", "followup_limit_exceeded")
+    followups: list[FollowupQuerySpec] = []
+    for index, item in enumerate(raw["recommended_followups"], start=1):
+        if not isinstance(item, dict):
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"followup_{index}_not_object")
+        if set(item) != {"facet_id", "query", "keywords", "top_n"}:
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"followup_{index}_schema_invalid")
+        facet_id = str(item.get("facet_id") or "")
+        query = str(item.get("query") or "").strip()
+        keywords = item.get("keywords")
+        top_n = item.get("top_n")
+        if facet_id not in missing_ids:
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"followup_facet_not_missing:{facet_id}")
+        if not query:
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"followup_empty_query:{index}")
+        if keywords is not None and not isinstance(keywords, str):
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"followup_keywords_invalid:{index}")
+        if isinstance(top_n, bool) or not isinstance(top_n, int) or top_n < 1 or top_n > _MAX_REFINEMENT_FOLLOWUP_TOP_N:
+            raise AgenticRefinementError("refinement_judge_validation_failed", f"followup_top_n_invalid:{index}")
+        followups.append(
+            FollowupQuerySpec(
+                plan_id=plan.plan_id,
+                iteration_id=iteration_id,
+                followup_id=f"{iteration_id or 'iteration'}.followup.{index}",
+                facet_id=facet_id,
+                query=query,
+                keywords=keywords,
+                top_n=top_n,
+            )
+        )
+    if raw["sufficient"] and (missing or contradictions or gaps or followups):
+        raise AgenticRefinementError("refinement_judge_validation_failed", "sufficient_with_unresolved_gaps")
+    return SufficiencyJudge(
+        sufficient=raw["sufficient"],
+        confidence=float(confidence),
+        covered_facets=tuple(covered),
+        missing_facets=tuple(missing),
+        contradictions=tuple(contradictions),
+        exact_fact_gaps=tuple(gaps),
+        refusal_justified=raw["refusal_justified"],
+        recommended_followups=tuple(followups),
+    )
+
+
+def build_sufficiency_judge_prompt(
+    question: str,
+    plan: BoundedRetrievalPlan,
+    kbinfos: dict[str, Any],
+    cfg: AgenticRefinementConfig,
+) -> tuple[str, list[dict[str, str]]]:
+    facets = [asdict(facet) for facet in plan.required_facets]
+    evidence = [
+        {
+            "evidence_id": _evidence_id(chunk),
+            "document": str(chunk.get("docnm_kwd") or chunk.get("document_name") or chunk.get("title") or "")[:200],
+            "text": re.sub(r"\s+", " ", str(chunk.get("content_with_weight") or chunk.get("content") or "")).strip()[:800],
+            "facet_ids": _chunk_facet_ids(chunk),
+        }
+        for chunk in ((kbinfos or {}).get("chunks") or [])[:20]
+        if isinstance(chunk, dict)
+    ]
+    system_prompt = (
+        "You are a sufficiency judge for RAGFlow retrieval evidence.\n"
+        "Evaluate evidence only; do not answer the user, retrieve documents, or call tools.\n"
+        "Return exactly one strict JSON object without markdown or prose.\n"
+        "Recommended followups may target only missing facet IDs from the supplied Phase 5 plan."
+    )
+    payload = {
+        "original_question": question,
+        "plan_id": plan.plan_id,
+        "required_facets": facets,
+        "selected_evidence": evidence,
+        "limits": {"max_followup_queries": cfg.normalized().max_followup_queries, "max_top_n": _MAX_REFINEMENT_FOLLOWUP_TOP_N},
+        "output_schema": {
+            "sufficient": False,
+            "confidence": 0.0,
+            "covered_facets": [{"facet_id": "f1", "evidence_ids": ["e1"], "support": "strong|weak"}],
+            "missing_facets": [{"facet_id": "f2", "reason": "string", "required_anchors": ["string"]}],
+            "contradictions": [{"facet_id": "f3", "evidence_ids": ["e2", "e7"], "description": "string"}],
+            "exact_fact_gaps": [{"type": "date|number|name", "description": "string"}],
+            "refusal_justified": False,
+            "recommended_followups": [{"facet_id": "f2", "query": "string", "keywords": None, "top_n": 5}],
+        },
+    }
+    return system_prompt, [{"role": "user", "content": json.dumps(payload, ensure_ascii=False, sort_keys=True)}]
+
+
+async def generate_sufficiency_judge(
+    *,
+    question: str,
+    plan: BoundedRetrievalPlan,
+    kbinfos: dict[str, Any],
+    cfg: AgenticRefinementConfig,
+    chat_mdl: Any,
+    rag_trace: Any = None,
+    iteration_id: str = "",
+) -> SufficiencyJudge:
+    if chat_mdl is None or not callable(getattr(chat_mdl, "async_chat", None)):
+        raise AgenticRefinementError("refinement_judge_missing_chat_model")
+    system_prompt, messages = build_sufficiency_judge_prompt(question, plan, kbinfos, cfg)
+    started = time.monotonic()
+    _trace_refinement_event(rag_trace, "refinement_judge_start", {"plan_id": plan.plan_id, "iteration_id": iteration_id, "mode": cfg.mode})
+    try:
+        raw = await asyncio.wait_for(
+            chat_mdl.async_chat(system_prompt, messages, {"temperature": 0.0, "top_p": 0.1}),
+            timeout=max(0.001, cfg.normalized().judge_timeout_ms / 1000.0),
+        )
+    except asyncio.TimeoutError as exc:
+        latency_ms = round((time.monotonic() - started) * 1000.0, 3)
+        _trace_refinement_event(rag_trace, "refinement_judge_timeout", {"plan_id": plan.plan_id, "iteration_id": iteration_id, "mode": cfg.mode, "latency_ms": latency_ms})
+        raise AgenticRefinementError("refinement_judge_timeout") from exc
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _trace_refinement_event(rag_trace, "refinement_judge_validation_failed", {"plan_id": plan.plan_id, "iteration_id": iteration_id, "mode": cfg.mode, "fallback_reason": "judge_error"})
+        raise AgenticRefinementError("refinement_judge_error", str(exc)) from exc
+    try:
+        parsed = parse_sufficiency_judge_json(raw)
+        selected_evidence_ids = {
+            _evidence_id(chunk)
+            for chunk in ((kbinfos or {}).get("chunks") or [])
+            if isinstance(chunk, dict)
+        }
+        judge = validate_sufficiency_judge(
+            parsed,
+            plan,
+            cfg,
+            iteration_id=iteration_id,
+            selected_evidence_ids=selected_evidence_ids,
+        )
+    except AgenticRefinementError as exc:
+        latency_ms = round((time.monotonic() - started) * 1000.0, 3)
+        event = "refinement_judge_invalid_json" if exc.reason == "refinement_judge_invalid_json" else "refinement_judge_validation_failed"
+        _trace_refinement_event(rag_trace, event, {"plan_id": plan.plan_id, "iteration_id": iteration_id, "mode": cfg.mode, "latency_ms": latency_ms, "fallback_reason": exc.reason, "detail": exc.detail})
+        raise
+    latency_ms = round((time.monotonic() - started) * 1000.0, 3)
+    _trace_refinement_event(
+        rag_trace,
+        "refinement_judge_success",
+        {
+            "plan_id": plan.plan_id,
+            "iteration_id": iteration_id,
+            "mode": cfg.mode,
+            "latency_ms": latency_ms,
+            "confidence": judge.confidence,
+            "sufficient": judge.sufficient,
+            "missing_facet_count": len(judge.missing_facets),
+            "contradiction_count": len(judge.contradictions),
+            "followup_count": len(judge.recommended_followups),
+        },
+    )
+    return judge
+
+
+def validate_followup_queries(
+    judge: SufficiencyJudge,
+    plan: BoundedRetrievalPlan,
+    cfg: AgenticRefinementConfig,
+    iteration_id: str = "",
+) -> tuple[tuple[FollowupQuerySpec, ...], tuple[dict[str, Any], ...]]:
+    config = cfg.normalized()
+    missing_ids = {item["facet_id"] for item in judge.missing_facets}
+    missing_required_anchors = {
+        item["facet_id"]: tuple(item.get("required_anchors") or ())
+        for item in judge.missing_facets
+    }
+    facets = {facet.facet_id: facet for facet in plan.required_facets}
+    accepted: list[FollowupQuerySpec] = []
+    rejected: list[dict[str, Any]] = []
+    for index, followup in enumerate(judge.recommended_followups[: config.max_followup_queries], start=1):
+        reason = None
+        facet = facets.get(followup.facet_id)
+        if facet is None:
+            reason = "unknown_facet"
+        elif followup.facet_id not in missing_ids:
+            reason = "facet_not_missing"
+        elif not followup.query.strip():
+            reason = "empty_query"
+        else:
+            allowed_anchors = _required_drift_anchors(
+                facet,
+                plan.original_question,
+                missing_required_anchors.get(followup.facet_id, ()),
+            )
+            if not _text_satisfies_required_anchors(followup.query, allowed_anchors):
+                reason = "anchor_drift"
+            allowed_entity_text = "\n".join((plan.original_question, facet.description, *facet.anchors))
+            new_entities = [entity for entity in _proper_entities_for_drift(followup.query) if not _phrase_in_text(entity, allowed_entity_text)]
+            if new_entities:
+                reason = "unrelated_proper_noun"
+        if reason:
+            rejected.append({"followup_id": followup.followup_id, "facet_id": followup.facet_id, "rejection_reason": reason})
+            continue
+        accepted.append(
+            replace(
+                followup,
+                plan_id=plan.plan_id,
+                iteration_id=iteration_id or followup.iteration_id,
+                followup_id=followup.followup_id or f"{iteration_id or 'iteration'}.followup.{index}",
+                top_n=max(1, min(followup.top_n, _MAX_REFINEMENT_FOLLOWUP_TOP_N)),
+            )
+        )
+    return tuple(accepted), tuple(rejected)
+
+
+def accept_followup_evidence(
+    *,
+    current_kbinfos: dict[str, Any],
+    candidate_kbinfos: dict[str, Any] | None = None,
+    lane_results: list[dict[str, Any]],
+    plan: BoundedRetrievalPlan,
+    missing_facet_ids: set[str],
+    missing_required_anchors: dict[str, tuple[str, ...]] | None = None,
+    question: str,
+    context_builder_config: Any = None,
+) -> EvidenceAcceptanceResult:
+    current = deepcopy(current_kbinfos or {"total": 0, "chunks": [], "doc_aggs": []})
+    candidates = deepcopy(candidate_kbinfos if candidate_kbinfos is not None else current)
+    selected_chunks = [chunk for chunk in (current.get("chunks") or []) if isinstance(chunk, dict)]
+    candidate_chunks = [chunk for chunk in (candidates.get("chunks") or []) if isinstance(chunk, dict)]
+    existing_keys = {_refinement_chunk_identity(chunk) for chunk in candidate_chunks}
+    eligible: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    facets = {facet.facet_id: facet for facet in plan.required_facets}
+    for lane in lane_results:
+        followup = lane.get("followup")
+        if not isinstance(followup, FollowupQuerySpec):
+            spec = lane.get("subquery")
+            if isinstance(spec, SubquerySpec):
+                followup = FollowupQuerySpec(plan_id=plan.plan_id, facet_id=spec.facet_id, query=spec.query, followup_id=spec.subquery_id, keywords=spec.keywords, top_n=spec.top_n, retrieval_variant=spec.retrieval_variant)
+        chunks = [chunk for chunk in ((lane.get("kbinfos") or {}).get("chunks") or []) if isinstance(chunk, dict)]
+        if not lane.get("accepted") or not isinstance(followup, FollowupQuerySpec):
+            for chunk in chunks:
+                rejected.append(_mark_refinement_chunk(chunk, followup, selected=False, reason=str(lane.get("rejection_reason") or "retrieval_rejected")))
+            continue
+        facet = facets.get(followup.facet_id)
+        allowed_anchors = (
+            _required_drift_anchors(
+                facet,
+                question,
+                (missing_required_anchors or {}).get(followup.facet_id, ()),
+            )
+            if facet
+            else tuple(_anchors_for_text(question))
+        )
+        existing_facet_quality = max(
+            (
+                quality
+                for chunk in selected_chunks
+                if (followup.facet_id in _chunk_facet_ids(chunk) or _text_satisfies_required_anchors(_chunk_text(chunk), allowed_anchors))
+                for quality in [_chunk_quality(chunk)]
+                if quality is not None
+            ),
+            default=None,
+        )
+        group_text = "\n".join(_chunk_text(chunk) for chunk in chunks[: min(3, len(chunks))])
+        if (
+            followup.facet_id not in missing_facet_ids
+            or not _text_satisfies_required_anchors(group_text, allowed_anchors)
+        ):
+            for chunk in chunks:
+                rejected.append(_mark_refinement_chunk(chunk, followup, selected=False, reason="result_facet_or_title_drift"))
+            continue
+        for chunk in chunks:
+            key = _refinement_chunk_identity(chunk)
+            if key in existing_keys:
+                rejected.append(_mark_refinement_chunk(chunk, followup, selected=False, reason="duplicate_evidence"))
+                continue
+            chunk_text = _chunk_text(chunk)
+            if not _text_satisfies_required_anchors(chunk_text, allowed_anchors):
+                rejected.append(_mark_refinement_chunk(chunk, followup, selected=False, reason="evidence_anchor_drift"))
+                continue
+            quality = _chunk_quality(chunk)
+            if quality is not None and existing_facet_quality is not None and quality < existing_facet_quality:
+                rejected.append(_mark_refinement_chunk(chunk, followup, selected=False, reason="lower_quality_than_selected_evidence"))
+                continue
+            marked = _mark_refinement_chunk(chunk, followup, selected=None, reason=None)
+            eligible.append(marked)
+            existing_keys.add(key)
+
+    if not eligible:
+        return EvidenceAcceptanceResult(kbinfos=current, accepted_chunks=(), rejected_chunks=tuple(rejected), candidate_kbinfos=candidates)
+    staged_candidate = deepcopy(candidates)
+    staged_candidate["chunks"] = candidate_chunks + eligible
+    staged_candidate["total"] = len(staged_candidate["chunks"])
+    staged_candidate["doc_aggs"] = _merge_doc_aggs([], staged_candidate["chunks"])
+    selected = deepcopy(staged_candidate)
+    if context_builder_config is not None and getattr(context_builder_config, "enabled", False):
+        from rag.utils.context_builder import apply_context_builder_to_kbinfos
+
+        selected = apply_context_builder_to_kbinfos(staged_candidate, context_builder_config, query=question).kbinfos
+    selected_keys = {_refinement_chunk_identity(chunk) for chunk in selected.get("chunks", []) if isinstance(chunk, dict)}
+    accepted: list[dict[str, Any]] = []
+    for chunk in eligible:
+        if _refinement_chunk_identity(chunk) in selected_keys:
+            accepted.append(_mark_refinement_chunk(chunk, _followup_from_chunk(chunk), selected=True, reason=None))
+        else:
+            rejected.append(_mark_refinement_chunk(chunk, _followup_from_chunk(chunk), selected=False, reason="context_builder_rejected"))
+    if not accepted:
+        return EvidenceAcceptanceResult(kbinfos=current, accepted_chunks=(), rejected_chunks=tuple(rejected), candidate_kbinfos=candidates)
+    accepted_by_key = {_refinement_chunk_identity(chunk): chunk for chunk in accepted}
+    selected["chunks"] = [
+        accepted_by_key.get(_refinement_chunk_identity(chunk), chunk)
+        for chunk in selected.get("chunks", [])
+        if isinstance(chunk, dict)
+    ]
+    selected["total"] = len(selected["chunks"])
+    selected["doc_aggs"] = _merge_doc_aggs([], selected["chunks"])
+    committed_candidate = deepcopy(candidates)
+    committed_candidate["chunks"] = candidate_chunks + accepted
+    committed_candidate["total"] = len(committed_candidate["chunks"])
+    committed_candidate["doc_aggs"] = _merge_doc_aggs([], committed_candidate["chunks"])
+    return EvidenceAcceptanceResult(kbinfos=selected, accepted_chunks=tuple(accepted), rejected_chunks=tuple(rejected), candidate_kbinfos=committed_candidate)
+
+
+async def run_refinement_loop(
+    *,
+    question: str,
+    plan: BoundedRetrievalPlan,
+    kbinfos: dict[str, Any],
+    candidate_kbinfos: dict[str, Any] | None = None,
+    retriever: Any,
+    chat_mdl: Any,
+    embd_mdl: Any,
+    tenant_ids: list[str],
+    kb_ids: list[str],
+    doc_ids: list[str] | None,
+    similarity_threshold: float,
+    vector_similarity_weight: float,
+    top_k: int,
+    rank_feature: dict[str, Any] | None,
+    refinement_cfg: AgenticRefinementConfig = AgenticRefinementConfig(),
+    retrieval_cfg: AgenticRetrievalConfig = AgenticRetrievalConfig(),
+    context_builder_config: Any = None,
+    rag_trace: Any = None,
+    metadata_filters: Any = None,
+    rerank_mdl: Any = None,
+    apply_children: bool = True,
+    apply_toc: bool = False,
+) -> RefinementResult:
+    """Run the bounded Phase 6 loop without mutating the caller's Phase 5 state."""
+    config = refinement_cfg.normalized()
+    previous = deepcopy(kbinfos or {"total": 0, "chunks": [], "doc_aggs": []})
+    previous_candidates = deepcopy(candidate_kbinfos if candidate_kbinfos is not None else previous)
+    if not config.enabled or config.mode == "off":
+        _trace_refinement_event(rag_trace, "refinement_skip", {"mode": config.mode, "plan_id": getattr(plan, "plan_id", None), "stop_reason": "disabled"})
+        return RefinementResult(kbinfos=previous, candidate_kbinfos=previous_candidates, iterations=(), stop_reason="disabled")
+    if not isinstance(plan, BoundedRetrievalPlan) or not plan.required_facets or not question.strip():
+        _trace_refinement_event(rag_trace, "refinement_skip", {"mode": config.mode, "plan_id": getattr(plan, "plan_id", None), "stop_reason": "phase5_plan_unavailable"})
+        return RefinementResult(kbinfos=previous, candidate_kbinfos=previous_candidates, iterations=(), fallback_to_previous_context=True, fallback_reason="phase5_plan_unavailable", stop_reason="phase5_plan_unavailable")
+
+    initial_diagnostics = detect_missing_facets(question, plan, previous)
+    _trace_refinement_event(
+        rag_trace,
+        "refinement_start",
+        {
+            "mode": config.mode,
+            "plan_id": plan.plan_id,
+            "facet_ids": [facet.facet_id for facet in plan.required_facets],
+            "coverage_before": initial_diagnostics["coverage"],
+            "missing_facet_count": len(initial_diagnostics["missing_facets"]),
+        },
+    )
+    if config.mode == "diagnostic":
+        diagnostic_payload = {
+            "mode": config.mode,
+            "plan_id": plan.plan_id,
+            "stop_reason": "diagnostic_only",
+            "coverage_before": initial_diagnostics["coverage"],
+            "coverage_after": initial_diagnostics["coverage"],
+            "marginal_gain": 0.0,
+            "followup_count": 0,
+            "rejected_followup_count": 0,
+        }
+        _trace_refinement_event(rag_trace, "refinement_stop", diagnostic_payload)
+        return RefinementResult(kbinfos=previous, candidate_kbinfos=previous_candidates, iterations=(), stop_reason="diagnostic_only", diagnostics={"heuristic": initial_diagnostics, **diagnostic_payload})
+
+    current = previous
+    current_candidates = previous_candidates
+    iterations: list[RefinementIteration] = []
+    accepted_all: list[dict[str, Any]] = []
+    rejected_all: list[dict[str, Any]] = []
+    calls_used = 0
+    loop_started = time.monotonic()
+    previous_contradictions: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    initial_coverage = float(initial_diagnostics["coverage"])
+    current_coverage = initial_coverage
+    followup_count_total = 0
+    rejected_followup_count_total = 0
+
+    def stop_result(
+        stop_reason: str,
+        latency_ms: float,
+        *,
+        fallback: bool = False,
+        fallback_reason: str | None = None,
+    ) -> RefinementResult:
+        marginal_gain = (current_coverage - initial_coverage) / max(1, followup_count_total)
+        return _refinement_stop_result(
+            current,
+            current_candidates,
+            iterations,
+            accepted_all,
+            rejected_all,
+            plan,
+            config,
+            rag_trace,
+            stop_reason,
+            latency_ms,
+            fallback=fallback,
+            fallback_reason=fallback_reason,
+            coverage_before=initial_coverage,
+            coverage_after=current_coverage,
+            marginal_gain=marginal_gain,
+            followup_count=followup_count_total,
+            rejected_followup_count=rejected_followup_count_total,
+        )
+
+    for iteration_number in range(1, config.max_iterations + 1):
+        iteration_started = time.monotonic()
+        iteration_id = f"refinement.iteration.{iteration_number}"
+        elapsed_ms = (iteration_started - loop_started) * 1000.0
+        if elapsed_ms >= retrieval_cfg.latency_budget_ms:
+            return stop_result("latency_budget_exceeded", elapsed_ms, fallback=True)
+        diagnostics_before = detect_missing_facets(question, plan, current)
+        coverage_before = float(diagnostics_before["coverage"])
+        if config.judge == "heuristic" or (config.judge == "hybrid" and diagnostics_before["obviously_sufficient"]):
+            judge = _heuristic_judge(diagnostics_before, plan, sufficient=bool(diagnostics_before["obviously_sufficient"]))
+            _trace_refinement_event(
+                rag_trace,
+                "refinement_judge_success",
+                {
+                    "mode": config.mode,
+                    "plan_id": plan.plan_id,
+                    "iteration_id": iteration_id,
+                    "judge_mode": "heuristic_guardrail",
+                    "confidence": judge.confidence,
+                    "sufficient": judge.sufficient,
+                    "missing_facet_count": len(judge.missing_facets),
+                    "followup_count": 0,
+                },
+            )
+        else:
+            try:
+                judge = await generate_sufficiency_judge(
+                    question=question,
+                    plan=plan,
+                    kbinfos=current,
+                    cfg=config,
+                    chat_mdl=chat_mdl,
+                    rag_trace=rag_trace,
+                    iteration_id=iteration_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except AgenticRefinementError as exc:
+                return stop_result(exc.reason, (time.monotonic() - loop_started) * 1000.0, fallback=True, fallback_reason=exc.reason)
+
+        if (time.monotonic() - loop_started) * 1000.0 >= retrieval_cfg.latency_budget_ms:
+            return stop_result("latency_budget_exceeded", (time.monotonic() - loop_started) * 1000.0, fallback=True)
+        if judge.confidence < config.confidence_threshold:
+            return stop_result("judge_confidence_below_threshold", (time.monotonic() - loop_started) * 1000.0, fallback=True)
+        if judge.sufficient:
+            iterations.append(
+                RefinementIteration(
+                    iteration_id=iteration_id,
+                    judge=judge,
+                    followups=(),
+                    accepted_new_evidence_count=0,
+                    rejected_evidence_count=0,
+                    coverage_before=coverage_before,
+                    coverage_after=coverage_before,
+                    marginal_gain=0.0,
+                    latency_ms=round((time.monotonic() - iteration_started) * 1000.0, 3),
+                    stop_reason="sufficient",
+                )
+            )
+            return stop_result("sufficient", (time.monotonic() - loop_started) * 1000.0)
+
+        contradiction_key = tuple(sorted((item["facet_id"], tuple(sorted(item["evidence_ids"]))) for item in judge.contradictions))
+        if contradiction_key and contradiction_key == previous_contradictions:
+            return stop_result("persistent_contradiction", (time.monotonic() - loop_started) * 1000.0, fallback=True)
+        previous_contradictions = contradiction_key
+
+        followups, rejected_followups = validate_followup_queries(judge, plan, config, iteration_id=iteration_id)
+        rejected_followup_count_total += len(rejected_followups)
+        for rejected in rejected_followups:
+            _trace_refinement_event(rag_trace, "refinement_followup_rejected", {"mode": config.mode, "plan_id": plan.plan_id, "iteration_id": iteration_id, **rejected})
+        if rejected_followups:
+            drift_rate = len(rejected_followups) / max(1, len(judge.recommended_followups))
+            if drift_rate > config.max_drift_rate:
+                return stop_result("drift_rejection", (time.monotonic() - loop_started) * 1000.0, fallback=True)
+        if not followups:
+            iterations.append(
+                RefinementIteration(
+                    iteration_id=iteration_id,
+                    judge=judge,
+                    followups=(),
+                    accepted_new_evidence_count=0,
+                    rejected_evidence_count=0,
+                    coverage_before=coverage_before,
+                    coverage_after=coverage_before,
+                    marginal_gain=0.0,
+                    latency_ms=round((time.monotonic() - iteration_started) * 1000.0, 3),
+                    stop_reason="no_followups",
+                )
+            )
+            return stop_result("no_followups", (time.monotonic() - loop_started) * 1000.0)
+        remaining_calls = config.max_followup_queries - calls_used
+        if remaining_calls <= 0:
+            return stop_result("max_followup_calls", (time.monotonic() - loop_started) * 1000.0)
+        followups = followups[:remaining_calls]
+        calls_used += len(followups)
+        followup_count_total += len(followups)
+        for followup in followups:
+            _trace_refinement_event(rag_trace, "refinement_followup_built", {"mode": config.mode, "plan_id": plan.plan_id, "iteration_id": iteration_id, "followup_id": followup.followup_id, "facet_id": followup.facet_id, "top_n": followup.top_n})
+        _trace_refinement_event(rag_trace, "refinement_followup_execute_start", {"mode": config.mode, "plan_id": plan.plan_id, "iteration_id": iteration_id, "followup_count": len(followups)})
+        tasks = []
+        for followup in followups:
+            facet = next(facet for facet in plan.required_facets if facet.facet_id == followup.facet_id)
+            spec = SubquerySpec(
+                plan_id=plan.plan_id,
+                subquery_id=followup.followup_id,
+                facet_id=followup.facet_id,
+                query=followup.query,
+                keywords=followup.keywords,
+                docid_scope=doc_ids,
+                top_n=min(followup.top_n, retrieval_cfg.subquery_top_n),
+                retrieval_variant=followup.retrieval_variant,
+                must_have_terms=facet.anchors,
+                iteration_id=iteration_id,
+                followup_id=followup.followup_id,
+            )
+            tasks.append(
+                asyncio.create_task(
+                    _execute_subquery(
+                        spec,
+                        plan,
+                        retriever=retriever,
+                        embd_mdl=embd_mdl,
+                        tenant_ids=tenant_ids,
+                        kb_ids=kb_ids,
+                        doc_ids=doc_ids,
+                        similarity_threshold=similarity_threshold,
+                        vector_similarity_weight=vector_similarity_weight,
+                        top_k=top_k,
+                        rank_feature=rank_feature,
+                        rerank_mdl=rerank_mdl,
+                        cfg=retrieval_cfg,
+                        rag_trace=rag_trace,
+                        metadata_filters=metadata_filters,
+                        apply_children=apply_children,
+                        apply_toc=apply_toc,
+                        chat_mdl=chat_mdl,
+                        enforce_result_anchor_drift=True,
+                    )
+                )
+            )
+        remaining_latency_s = max(0.001, (retrieval_cfg.latency_budget_ms - (time.monotonic() - loop_started) * 1000.0) / 1000.0)
+        try:
+            lane_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=remaining_latency_s)
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            raise
+        except asyncio.TimeoutError:
+            for task in tasks:
+                task.cancel()
+            return stop_result("latency_budget_exceeded", (time.monotonic() - loop_started) * 1000.0, fallback=True)
+        normalized_lanes: list[dict[str, Any]] = []
+        for followup, result in zip(followups, lane_results):
+            lane = _normalize_lane_result(result)
+            lane["followup"] = followup
+            normalized_lanes.append(lane)
+        if any(not lane.get("accepted") for lane in normalized_lanes):
+            for lane in normalized_lanes:
+                if not lane.get("accepted"):
+                    for chunk in (lane.get("kbinfos") or {}).get("chunks", []):
+                        rejected_all.append(_mark_refinement_chunk(chunk, lane.get("followup"), selected=False, reason=str(lane.get("rejection_reason") or "bounded_retrieval_failure")))
+            return stop_result("bounded_retrieval_failure", (time.monotonic() - loop_started) * 1000.0, fallback=True)
+        _trace_refinement_event(rag_trace, "refinement_followup_execute_success", {"mode": config.mode, "plan_id": plan.plan_id, "iteration_id": iteration_id, "followup_count": len(followups)})
+
+        acceptance = accept_followup_evidence(
+            current_kbinfos=current,
+            candidate_kbinfos=current_candidates,
+            lane_results=normalized_lanes,
+            plan=plan,
+            missing_facet_ids={item["facet_id"] for item in judge.missing_facets},
+            missing_required_anchors={
+                item["facet_id"]: tuple(item.get("required_anchors") or ())
+                for item in judge.missing_facets
+            },
+            question=question,
+            context_builder_config=context_builder_config,
+        )
+        for chunk in acceptance.rejected_chunks:
+            _trace_refinement_event(rag_trace, "refinement_evidence_rejected", {"mode": config.mode, "plan_id": plan.plan_id, "iteration_id": iteration_id, "evidence_id": _evidence_id(chunk), "facet_id": chunk.get("facet_id"), "rejection_reason": chunk.get("rejection_reason")})
+        if acceptance.selected_new_evidence_count < config.min_new_evidence:
+            threshold_rejected = [
+                _mark_refinement_chunk(chunk, _followup_from_chunk(chunk), selected=False, reason="min_new_evidence_not_met")
+                for chunk in acceptance.accepted_chunks
+            ]
+            for chunk in threshold_rejected:
+                _trace_refinement_event(rag_trace, "refinement_evidence_rejected", {"mode": config.mode, "plan_id": plan.plan_id, "iteration_id": iteration_id, "evidence_id": _evidence_id(chunk), "facet_id": chunk.get("facet_id"), "rejection_reason": "min_new_evidence_not_met"})
+            rejected_all.extend(acceptance.rejected_chunks)
+            rejected_all.extend(threshold_rejected)
+            iterations.append(
+                RefinementIteration(
+                    iteration_id=iteration_id,
+                    judge=judge,
+                    followups=followups,
+                    accepted_new_evidence_count=0,
+                    rejected_evidence_count=len(acceptance.rejected_chunks) + len(threshold_rejected),
+                    coverage_before=coverage_before,
+                    coverage_after=coverage_before,
+                    marginal_gain=0.0,
+                    latency_ms=round((time.monotonic() - iteration_started) * 1000.0, 3),
+                    stop_reason="no_selected_new_evidence",
+                )
+            )
+            return stop_result("no_selected_new_evidence", (time.monotonic() - loop_started) * 1000.0)
+
+        for chunk in acceptance.accepted_chunks:
+            _trace_refinement_event(rag_trace, "refinement_evidence_accepted", {"mode": config.mode, "plan_id": plan.plan_id, "iteration_id": iteration_id, "evidence_id": _evidence_id(chunk), "facet_id": chunk.get("facet_id")})
+        current = acceptance.kbinfos
+        current_candidates = acceptance.candidate_kbinfos or current_candidates
+        accepted_all.extend(acceptance.accepted_chunks)
+        rejected_all.extend(acceptance.rejected_chunks)
+        diagnostics_after = detect_missing_facets(question, plan, current)
+        coverage_after = float(diagnostics_after["coverage"])
+        current_coverage = coverage_after
+        marginal_gain = (coverage_after - coverage_before) / max(1, len(followups))
+        iteration_latency_ms = round((time.monotonic() - iteration_started) * 1000.0, 3)
+        iterations.append(
+            RefinementIteration(
+                iteration_id=iteration_id,
+                judge=judge,
+                followups=followups,
+                accepted_new_evidence_count=acceptance.selected_new_evidence_count,
+                rejected_evidence_count=len(acceptance.rejected_chunks),
+                coverage_before=coverage_before,
+                coverage_after=coverage_after,
+                marginal_gain=round(marginal_gain, 6),
+                latency_ms=iteration_latency_ms,
+            )
+        )
+        _trace_refinement_event(
+            rag_trace,
+            "refinement_context_recomputed",
+            {
+                "mode": config.mode,
+                "plan_id": plan.plan_id,
+                "iteration_id": iteration_id,
+                "accepted_new_evidence_count": acceptance.selected_new_evidence_count,
+                "rejected_evidence_count": len(acceptance.rejected_chunks),
+                "coverage_before": coverage_before,
+                "coverage_after": coverage_after,
+                "marginal_gain": round(marginal_gain, 6),
+                "marginal_gain_formula": "(coverage_after - coverage_before) / max(1, extra_calls)",
+                "latency_ms": iteration_latency_ms,
+            },
+        )
+
+    return stop_result("max_iterations", (time.monotonic() - loop_started) * 1000.0)
+
+
 async def execute_bounded_plan(
     plan: BoundedRetrievalPlan,
     *,
@@ -818,6 +1826,8 @@ def attach_planning_metadata(
     retrieval_variant: str | None = None,
     selected_for_context: bool | None = None,
     rejection_reason: str | None = None,
+    iteration_id: str | None = None,
+    followup_id: str | None = None,
 ) -> None:
     for offset, chunk in enumerate(chunks or []):
         if not isinstance(chunk, dict):
@@ -834,6 +1844,10 @@ def attach_planning_metadata(
             chunk["selected_for_context"] = selected_for_context
         if rejection_reason is not None:
             chunk["rejection_reason"] = rejection_reason
+        if iteration_id is not None:
+            chunk["iteration_id"] = iteration_id
+        if followup_id is not None:
+            chunk["followup_id"] = followup_id
         metadata = dict(chunk.get("_ragflow_agentic_retrieval") or {})
         metadata.update(
             {
@@ -845,6 +1859,8 @@ def attach_planning_metadata(
                 "retrieval_variant": retrieval_variant,
                 "selected_for_context": selected_for_context,
                 "rejection_reason": rejection_reason,
+                "iteration_id": iteration_id,
+                "followup_id": followup_id,
             }
         )
         chunk["_ragflow_agentic_retrieval"] = metadata
@@ -1127,9 +2143,23 @@ async def _execute_subquery_work(
     if apply_children:
         kbinfos["chunks"] = retriever.retrieval_by_children(kbinfos.get("chunks", []), tenant_ids)
 
+    facet = next((f for f in plan.required_facets if f.facet_id == spec.facet_id), None)
+    anchors = tuple(dict.fromkeys(list(spec.must_have_terms) + list(facet.anchors if facet else ()) + _anchors_for_text(plan.original_question)[:3]))
+    result_anchor_drift = enforce_result_anchor_drift and not _result_group_has_anchor(kbinfos.get("chunks", []), anchors)
     retrieval_call_id = None
+    attach_planning_metadata(
+        kbinfos.get("chunks", []),
+        plan_id=plan.plan_id,
+        facet_id=spec.facet_id,
+        subquery_id=spec.subquery_id,
+        retrieval_variant=knobs["retrieval_variant"],
+        selected_for_context=False if result_anchor_drift else None,
+        rejection_reason="result_anchor_drift" if result_anchor_drift else None,
+        iteration_id=spec.iteration_id,
+        followup_id=spec.followup_id,
+    )
     if rag_trace:
-        retrieval_call_id = rag_trace.add_retrieval_call(
+        retrieval_trace_fields = dict(
             mode="agentic_subquery",
             query_text=spec.query,
             keywords=spec.keywords,
@@ -1152,6 +2182,15 @@ async def _execute_subquery_work(
             facet_id=spec.facet_id,
             subquery_id=spec.subquery_id,
         )
+        if spec.iteration_id is not None:
+            retrieval_trace_fields["iteration_id"] = spec.iteration_id
+        if spec.followup_id is not None:
+            retrieval_trace_fields["followup_id"] = spec.followup_id
+        try:
+            retrieval_call_id = rag_trace.add_retrieval_call(**retrieval_trace_fields)
+        except TypeError:
+            retrieval_trace_fields.pop("followup_id", None)
+            retrieval_call_id = rag_trace.add_retrieval_call(**retrieval_trace_fields)
     attach_planning_metadata(
         kbinfos.get("chunks", []),
         plan_id=plan.plan_id,
@@ -1159,25 +2198,23 @@ async def _execute_subquery_work(
         subquery_id=spec.subquery_id,
         retrieval_call_id=retrieval_call_id,
         retrieval_variant=knobs["retrieval_variant"],
+        selected_for_context=False if result_anchor_drift else None,
+        rejection_reason="result_anchor_drift" if result_anchor_drift else None,
+        iteration_id=spec.iteration_id,
+        followup_id=spec.followup_id,
     )
     if rag_trace:
         rag_trace.add_evidence_from_chunks(kbinfos.get("chunks", []), source_type="kb", retrieval_call_id=retrieval_call_id)
 
-    facet = next((f for f in plan.required_facets if f.facet_id == spec.facet_id), None)
-    anchors = tuple(dict.fromkeys(list(spec.must_have_terms) + list(facet.anchors if facet else ()) + _anchors_for_text(plan.original_question)[:3]))
-    if enforce_result_anchor_drift and not _result_group_has_anchor(kbinfos.get("chunks", []), anchors):
-        attach_planning_metadata(
-            kbinfos.get("chunks", []),
-            plan_id=plan.plan_id,
-            facet_id=spec.facet_id,
-            subquery_id=spec.subquery_id,
-            retrieval_call_id=retrieval_call_id,
-            retrieval_variant=knobs["retrieval_variant"],
-            selected_for_context=False,
-            rejection_reason="result_anchor_drift",
-        )
+    if result_anchor_drift:
         _trace_agentic_event(rag_trace, "subquery_rejected", {"plan_id": plan.plan_id, "subquery_id": spec.subquery_id, "reason": "result_anchor_drift"})
-        return {"subquery": spec, "accepted": False, "rejection_reason": "result_anchor_drift", "retrieval_call_id": retrieval_call_id}
+        return {
+            "subquery": spec,
+            "accepted": False,
+            "kbinfos": kbinfos,
+            "rejection_reason": "result_anchor_drift",
+            "retrieval_call_id": retrieval_call_id,
+        }
     return {"subquery": spec, "accepted": True, "kbinfos": kbinfos, "retrieval_call_id": retrieval_call_id}
 
 
@@ -1228,6 +2265,8 @@ def _coerce_plan(plan: BoundedRetrievalPlan | dict[str, Any], cfg: AgenticRetrie
                 must_have_terms=tuple(str(term) for term in raw.get("must_have_terms") or []),
                 forbidden_new_entities=tuple(str(term) for term in raw.get("forbidden_new_entities") or []),
                 rationale=str(raw.get("rationale") or ""),
+                iteration_id=str(raw.get("iteration_id")) if raw.get("iteration_id") else None,
+                followup_id=str(raw.get("followup_id")) if raw.get("followup_id") else None,
             )
         )
     return BoundedRetrievalPlan(
@@ -1288,6 +2327,30 @@ def _safe_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _bounded_int_setting(value: Any, env_name: str, default: int, lower: int, upper: int) -> int:
+    if value is None:
+        value = os.getenv(env_name)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(lower, min(parsed, upper))
+
+
+def _nonnegative_float_setting(value: Any, env_name: str, default: float) -> float:
+    if value is None:
+        value = os.getenv(env_name)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(0.0, min(parsed, 1.0))
+
+
+def _bounded_float_setting(value: Any, env_name: str, default: float) -> float:
+    return _nonnegative_float_setting(value, env_name, default)
 
 
 def _bool_setting(value: Any, env_name: str, default: bool) -> bool:
@@ -1377,12 +2440,38 @@ def _proper_entities(text: str) -> list[str]:
     return _dedupe_preserve_order(entities)
 
 
+def _proper_entities_for_drift(text: str) -> list[str]:
+    entities: list[str] = []
+    for entity in _proper_entities(text):
+        parts = entity.split()
+        if parts and parts[0].lower() in _LEADING_QUERY_COMMANDS:
+            entity = " ".join(parts[1:]).strip()
+        if entity:
+            entities.append(entity)
+    return _dedupe_preserve_order(entities)
+
+
 def _anchor_overlap(text: str, anchors: tuple[str, ...] | list[str]) -> float:
     anchors = [anchor for anchor in anchors if anchor]
     if not anchors:
         return 1.0
     matched = sum(1 for anchor in anchors if _phrase_in_text(anchor, text))
     return matched / len(anchors)
+
+
+def _required_drift_anchors(
+    facet: RequiredFacet,
+    original_question: str,
+    additional_anchors: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    facet_anchors = tuple(anchor for anchor in facet.anchors if anchor)
+    if facet_anchors or additional_anchors:
+        return tuple(_dedupe_preserve_order([*facet_anchors, *additional_anchors]))
+    return tuple(_anchors_for_text(original_question))
+
+
+def _text_satisfies_required_anchors(text: str, anchors: tuple[str, ...]) -> bool:
+    return not anchors or all(_phrase_in_text(anchor, text) for anchor in anchors)
 
 
 def _phrase_in_text(phrase: str, text: str) -> bool:
@@ -1431,6 +2520,187 @@ def _chunk_identity(chunk: dict[str, Any]) -> str:
         return f"section:{section}"
     content = chunk.get("content_with_weight") or chunk.get("content") or ""
     return "content:" + hashlib.sha256(str(content).encode("utf-8")).hexdigest()[:16]
+
+
+def _refinement_chunk_identity(chunk: dict[str, Any]) -> str:
+    if chunk.get("chunk_id"):
+        return f"chunk:{chunk['chunk_id']}"
+    doc_id = str(chunk.get("doc_id") or "")
+    content = str(chunk.get("content_with_weight") or chunk.get("content") or "")
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return f"doc_content:{doc_id}:{content_hash}"
+
+
+def _evidence_id(chunk: dict[str, Any]) -> str:
+    return str(chunk.get("evidence_id") or chunk.get("chunk_id") or _refinement_chunk_identity(chunk))
+
+
+def _chunk_source_id(chunk: dict[str, Any]) -> str:
+    return str(chunk.get("doc_id") or chunk.get("document_id") or chunk.get("docnm_kwd") or chunk.get("document_name") or "")
+
+
+def _chunk_quality(chunk: dict[str, Any]) -> float | None:
+    for key in ("similarity", "similarity_score", "relevance_score", "score", "vector_similarity"):
+        value = chunk.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def _chunk_facet_ids(chunk: dict[str, Any]) -> list[str]:
+    metadata = chunk.get("_ragflow_agentic_retrieval") or {}
+    values = list(metadata.get("facet_ids") or [])
+    value = chunk.get("facet_id") or metadata.get("facet_id")
+    if value:
+        values.append(value)
+    return _dedupe_preserve_order([str(item) for item in values])
+
+
+def _chunk_has_contradiction_signal(chunk: dict[str, Any]) -> bool:
+    metadata = chunk.get("_ragflow_agentic_retrieval") or chunk.get("document_metadata") or chunk.get("metadata") or {}
+    return bool(
+        chunk.get("contradiction")
+        or chunk.get("conflicting")
+        or metadata.get("contradiction")
+        or metadata.get("conflicting")
+        or metadata.get("contradiction_with")
+    )
+
+
+def _exact_fact_gap(question: str, facet: RequiredFacet, evidence_text: str) -> dict[str, str] | None:
+    evidence_type = facet.evidence_type.lower()
+    description = facet.description.lower()
+    if evidence_type == "date" or any(term in description for term in ("date", "year", "when")):
+        required_years = _YEAR_RE.findall(" ".join((question, facet.description, *facet.anchors)))
+        if required_years and not any(year in evidence_text for year in required_years):
+            return {"type": "date", "description": f"exact date evidence missing for {facet.facet_id}"}
+        if not required_years and not _YEAR_RE.search(evidence_text):
+            return {"type": "date", "description": f"date evidence missing for {facet.facet_id}"}
+    if evidence_type == "numeric" or any(term in description for term in ("number", "count", "amount", "revenue", "population")):
+        if not re.search(r"\b\d[\d,]*(?:\.\d+)?\b", evidence_text):
+            return {"type": "number", "description": f"numeric evidence missing for {facet.facet_id}"}
+    if any(term in description for term in ("name", "who", "person")) and not _proper_entities(evidence_text):
+        return {"type": "name", "description": f"name evidence missing for {facet.facet_id}"}
+    return None
+
+
+def _mark_refinement_chunk(
+    chunk: dict[str, Any],
+    followup: FollowupQuerySpec | None,
+    *,
+    selected: bool | None,
+    reason: str | None,
+) -> dict[str, Any]:
+    marked = deepcopy(chunk)
+    if followup is None:
+        return marked
+    metadata = dict(marked.get("_ragflow_agentic_retrieval") or {})
+    metadata.update(
+        {
+            "plan_id": followup.plan_id,
+            "facet_id": followup.facet_id,
+            "subquery_id": followup.followup_id,
+            "iteration_id": followup.iteration_id,
+            "followup_id": followup.followup_id,
+            "retrieval_variant": followup.retrieval_variant,
+            "selected_for_context": selected,
+            "rejection_reason": reason,
+        }
+    )
+    for key, value in metadata.items():
+        if value is not None:
+            marked[key] = value
+    marked["_ragflow_agentic_retrieval"] = metadata
+    document_metadata = dict(marked.get("document_metadata") or marked.get("metadata") or {})
+    document_metadata.update({key: value for key, value in metadata.items() if value is not None})
+    marked["document_metadata"] = document_metadata
+    return marked
+
+
+def _followup_from_chunk(chunk: dict[str, Any]) -> FollowupQuerySpec | None:
+    metadata = chunk.get("_ragflow_agentic_retrieval") or {}
+    followup_id = str(chunk.get("followup_id") or metadata.get("followup_id") or "")
+    facet_id = str(chunk.get("facet_id") or metadata.get("facet_id") or "")
+    plan_id = str(chunk.get("plan_id") or metadata.get("plan_id") or "")
+    if not followup_id or not facet_id:
+        return None
+    return FollowupQuerySpec(
+        plan_id=plan_id,
+        facet_id=facet_id,
+        query="",
+        iteration_id=str(chunk.get("iteration_id") or metadata.get("iteration_id") or ""),
+        followup_id=followup_id,
+        retrieval_variant=str(chunk.get("retrieval_variant") or metadata.get("retrieval_variant") or "hybrid_default"),  # type: ignore[arg-type]
+    )
+
+
+def _heuristic_judge(diagnostics: dict[str, Any], plan: BoundedRetrievalPlan, *, sufficient: bool) -> SufficiencyJudge:
+    return SufficiencyJudge(
+        sufficient=sufficient,
+        confidence=1.0 if sufficient else 0.0,
+        covered_facets=tuple(diagnostics.get("covered_facets") or []),
+        missing_facets=tuple(diagnostics.get("missing_facets") or []),
+        contradictions=tuple(diagnostics.get("contradictions") or []),
+        exact_fact_gaps=tuple(diagnostics.get("exact_fact_gaps") or []),
+        refusal_justified=False,
+        recommended_followups=(),
+    )
+
+
+def _refinement_stop_result(
+    current: dict[str, Any],
+    candidate_current: dict[str, Any],
+    iterations: list[RefinementIteration],
+    accepted: list[dict[str, Any]],
+    rejected: list[dict[str, Any]],
+    plan: BoundedRetrievalPlan,
+    cfg: AgenticRefinementConfig,
+    rag_trace: Any,
+    stop_reason: str,
+    latency_ms: float,
+    *,
+    fallback: bool = False,
+    fallback_reason: str | None = None,
+    coverage_before: float = 0.0,
+    coverage_after: float = 0.0,
+    marginal_gain: float = 0.0,
+    followup_count: int = 0,
+    rejected_followup_count: int = 0,
+) -> RefinementResult:
+    payload = {
+        "mode": cfg.mode,
+        "plan_id": plan.plan_id,
+        "stop_reason": stop_reason,
+        "fallback_reason": fallback_reason or (stop_reason if fallback else None),
+        "accepted_new_evidence_count": len(accepted),
+        "rejected_evidence_count": len(rejected),
+        "latency_ms": round(latency_ms, 3),
+        "iteration_count": len(iterations),
+        "l_added_ms_estimate": round(latency_ms, 3),
+        "l_added_formula": "N_iter * (L_judge + max_parallel(L_followups))",
+        "coverage_before": round(coverage_before, 6),
+        "coverage_after": round(coverage_after, 6),
+        "marginal_gain": round(marginal_gain, 6),
+        "followup_count": followup_count,
+        "rejected_followup_count": rejected_followup_count,
+    }
+    if fallback:
+        _trace_refinement_event(rag_trace, "refinement_fallback_to_previous_context", payload)
+    _trace_refinement_event(rag_trace, "refinement_stop", payload)
+    return RefinementResult(
+        kbinfos=deepcopy(current),
+        candidate_kbinfos=deepcopy(candidate_current),
+        iterations=tuple(iterations),
+        accepted_chunks=tuple(deepcopy(accepted)),
+        rejected_chunks=tuple(deepcopy(rejected)),
+        changed=bool(accepted),
+        fallback_to_previous_context=fallback,
+        fallback_reason=fallback_reason or (stop_reason if fallback else None),
+        stop_reason=stop_reason,
+        diagnostics=payload,
+    )
 
 
 def _merge_doc_aggs(lane_results: list[dict[str, Any]], chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1485,3 +2755,19 @@ def _trace_agentic_event(trace: Any, stage: str, payload: dict[str, Any]) -> Non
     add_event = getattr(trace, "add_agentic_retrieval_event", None)
     if callable(add_event):
         add_event(stage, payload)
+
+
+def _trace_refinement_event(trace: Any, event_name: str, payload: dict[str, Any]) -> None:
+    if not trace:
+        return
+    payload = dict(payload or {})
+    add_event = getattr(trace, "add_agentic_refinement_event", None)
+    if callable(add_event):
+        try:
+            add_event(event_name, **payload)
+        except TypeError:
+            add_event(event_name, payload)
+        return
+    add_retrieval_event = getattr(trace, "add_agentic_retrieval_event", None)
+    if callable(add_retrieval_event):
+        add_retrieval_event(event_name, payload)
