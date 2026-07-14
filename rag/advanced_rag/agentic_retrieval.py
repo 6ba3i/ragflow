@@ -20,6 +20,7 @@ import re
 import time
 import uuid
 from collections import defaultdict
+from collections.abc import Mapping
 from copy import copy, deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Literal
@@ -36,6 +37,7 @@ _TOKEN_RE = re.compile(r"[\w]+", re.UNICODE)
 _YEAR_RE = re.compile(r"\b(?:1[5-9]\d{2}|20\d{2}|2100)\b")
 _QUOTED_RE = re.compile(r'"([^"]+)"|\'([^\']+)\'')
 _PROPER_NOUN_RE = re.compile(r"\b[A-Z][\w-]*(?:\s+[A-Z][\w-]*){0,5}")
+_NATIVE_LLM_ERROR_RE = re.compile(r"\*\*ERROR\*\*: (?P<code>[A-Z][A-Z0-9_]*) - .+", re.DOTALL)
 _SMALL_TALK = {"hi", "hello", "hey", "thanks", "thank you", "ok", "okay"}
 _LEADING_QUERY_COMMANDS = {"find", "give", "identify", "locate", "look", "retrieve", "search", "show", "tell"}
 _STOPWORDS = {
@@ -118,9 +120,24 @@ _MAX_REFINEMENT_FOLLOWUP_TOP_N = 20
 class AgenticPlannerError(Exception):
     """Raised when the LLM planner cannot produce a valid bounded plan."""
 
-    def __init__(self, reason: str, detail: str | None = None):
+    def __init__(
+        self,
+        reason: str,
+        detail: str | None = None,
+        *,
+        failure_class: str = "unknown",
+        retryable: bool = False,
+        status_code: int | None = None,
+        bounded_retry_after_ms: int | None = None,
+        safe_category: str | None = None,
+    ):
         self.reason = reason
         self.detail = detail
+        self.failure_class = failure_class
+        self.retryable = retryable
+        self.status_code = status_code
+        self.bounded_retry_after_ms = bounded_retry_after_ms
+        self.safe_category = safe_category or failure_class
         super().__init__(reason if detail is None else f"{reason}: {detail}")
 
 
@@ -139,12 +156,16 @@ class AgenticRetrievalConfig:
     mode: AgenticRetrievalMode = "off"
     max_subqueries: int = 3
     subquery_top_n: int = 6
-    planner_timeout_ms: int = 1200
-    retrieval_timeout_ms: int = 1500
+    planner_timeout_ms: int = 25000
+    planner_max_attempts_per_key: int = 2
+    planner_max_calls_per_turn: int = 4
+    planner_total_budget_ms: int = 45000
+    plan_cache_enabled: bool = False
+    retrieval_timeout_ms: int = 6000
     max_extra_retrieval_calls: int = 3
     min_anchor_overlap: float = 0.5
     simple_query_bypass: bool = True
-    latency_budget_ms: int = 2500
+    latency_budget_ms: int = 12000
     rrf_k: int = 60
 
     @classmethod
@@ -161,12 +182,16 @@ class AgenticRetrievalConfig:
             mode=mode,  # type: ignore[arg-type]
             max_subqueries=_int_setting(overrides.get("agentic_retrieval_max_subqueries"), "AGENTIC_RETRIEVAL_MAX_SUBQUERIES", 3) or 3,
             subquery_top_n=_int_setting(overrides.get("agentic_retrieval_subquery_top_n"), "AGENTIC_RETRIEVAL_SUBQUERY_TOP_N", 6) or 6,
-            planner_timeout_ms=_int_setting(overrides.get("agentic_retrieval_planner_timeout_ms"), "AGENTIC_RETRIEVAL_PLANNER_TIMEOUT_MS", 1200) or 1200,
-            retrieval_timeout_ms=_int_setting(overrides.get("agentic_retrieval_retrieval_timeout_ms"), "AGENTIC_RETRIEVAL_RETRIEVAL_TIMEOUT_MS", 1500) or 1500,
+            planner_timeout_ms=_bounded_int_setting(overrides.get("agentic_retrieval_planner_timeout_ms"), "AGENTIC_RETRIEVAL_PLANNER_TIMEOUT_MS", 25000, 1, 60000),
+            planner_max_attempts_per_key=_bounded_int_setting(overrides.get("agentic_retrieval_planner_max_attempts_per_key"), "AGENTIC_RETRIEVAL_PLANNER_MAX_ATTEMPTS_PER_KEY", 2, 1, 4),
+            planner_max_calls_per_turn=_bounded_int_setting(overrides.get("agentic_retrieval_planner_max_calls_per_turn"), "AGENTIC_RETRIEVAL_PLANNER_MAX_CALLS_PER_TURN", 4, 1, 16),
+            planner_total_budget_ms=_bounded_int_setting(overrides.get("agentic_retrieval_planner_total_budget_ms"), "AGENTIC_RETRIEVAL_PLANNER_TOTAL_BUDGET_MS", 45000, 1, 120000),
+            plan_cache_enabled=_bool_setting(overrides.get("agentic_retrieval_plan_cache_enabled"), "AGENTIC_RETRIEVAL_PLAN_CACHE_ENABLED", False),
+            retrieval_timeout_ms=_bounded_int_setting(overrides.get("agentic_retrieval_retrieval_timeout_ms"), "AGENTIC_RETRIEVAL_RETRIEVAL_TIMEOUT_MS", 6000, 1, 30000),
             max_extra_retrieval_calls=_int_setting(overrides.get("agentic_retrieval_max_extra_retrieval_calls"), "AGENTIC_RETRIEVAL_MAX_EXTRA_RETRIEVAL_CALLS", 3) or 3,
             min_anchor_overlap=_float_setting(overrides.get("agentic_retrieval_drift_min_anchor_overlap"), "AGENTIC_RETRIEVAL_DRIFT_MIN_ANCHOR_OVERLAP", 0.5) or 0.5,
             simple_query_bypass=_bool_setting(overrides.get("agentic_retrieval_simple_query_bypass"), "AGENTIC_RETRIEVAL_SIMPLE_QUERY_BYPASS", True),
-            latency_budget_ms=_int_setting(overrides.get("agentic_retrieval_latency_budget_ms"), "AGENTIC_RETRIEVAL_LATENCY_BUDGET_MS", 2500) or 2500,
+            latency_budget_ms=_bounded_int_setting(overrides.get("agentic_retrieval_latency_budget_ms"), "AGENTIC_RETRIEVAL_LATENCY_BUDGET_MS", 12000, 1, 60000),
             rrf_k=_int_setting(overrides.get("agentic_retrieval_rrf_k"), "AGENTIC_RETRIEVAL_RRF_K", 60) or 60,
         )
 
@@ -175,11 +200,12 @@ class AgenticRetrievalConfig:
 class AgenticRefinementConfig:
     enabled: bool = False
     mode: AgenticRetrievalMode = "off"
-    max_iterations: int = 1
-    max_followup_queries: int = 2
+    max_iterations: int = 2
+    max_followup_queries: int = 4
     min_new_evidence: int = 1
     judge: AgenticRefinementJudgeMode = "hybrid"
-    judge_timeout_ms: int = 1000
+    judge_timeout_ms: int = 15000
+    latency_budget_ms: int = 50000
     max_drift_rate: float = 0.05
     confidence_threshold: float = 0.72
 
@@ -196,11 +222,12 @@ class AgenticRefinementConfig:
         return cls(
             enabled=enabled,
             mode=mode,  # type: ignore[arg-type]
-            max_iterations=_bounded_int_setting(overrides.get("agentic_refinement_max_iterations"), "AGENTIC_REFINEMENT_MAX_ITERATIONS", 1, 1, 4),
-            max_followup_queries=_bounded_int_setting(overrides.get("agentic_refinement_max_followup_queries"), "AGENTIC_REFINEMENT_MAX_FOLLOWUP_QUERIES", 2, 1, 4),
+            max_iterations=_bounded_int_setting(overrides.get("agentic_refinement_max_iterations"), "AGENTIC_REFINEMENT_MAX_ITERATIONS", 2, 1, 4),
+            max_followup_queries=_bounded_int_setting(overrides.get("agentic_refinement_max_followup_queries"), "AGENTIC_REFINEMENT_MAX_FOLLOWUP_QUERIES", 4, 1, 4),
             min_new_evidence=_bounded_int_setting(overrides.get("agentic_refinement_min_new_evidence"), "AGENTIC_REFINEMENT_MIN_NEW_EVIDENCE", 1, 1, 20),
             judge=judge,  # type: ignore[arg-type]
-            judge_timeout_ms=_bounded_int_setting(overrides.get("agentic_refinement_judge_timeout_ms"), "AGENTIC_REFINEMENT_JUDGE_TIMEOUT_MS", 1000, 1, 10000),
+            judge_timeout_ms=_bounded_int_setting(overrides.get("agentic_refinement_judge_timeout_ms"), "AGENTIC_REFINEMENT_JUDGE_TIMEOUT_MS", 15000, 1, 30000),
+            latency_budget_ms=_bounded_int_setting(overrides.get("agentic_refinement_latency_budget_ms"), "AGENTIC_REFINEMENT_LATENCY_BUDGET_MS", 50000, 1, 120000),
             max_drift_rate=_nonnegative_float_setting(overrides.get("agentic_refinement_max_drift_rate"), "AGENTIC_REFINEMENT_MAX_DRIFT_RATE", 0.05),
             confidence_threshold=_bounded_float_setting(overrides.get("agentic_refinement_confidence_threshold"), "AGENTIC_REFINEMENT_CONFIDENCE_THRESHOLD", 0.72),
         )
@@ -215,7 +242,8 @@ class AgenticRefinementConfig:
             max_iterations=max(1, min(int(self.max_iterations), 4)),
             max_followup_queries=max(1, min(int(self.max_followup_queries), 4)),
             min_new_evidence=max(1, min(int(self.min_new_evidence), 20)),
-            judge_timeout_ms=max(1, min(int(self.judge_timeout_ms), 10000)),
+            judge_timeout_ms=max(1, min(int(self.judge_timeout_ms), 30000)),
+            latency_budget_ms=max(1, min(int(self.latency_budget_ms), 120000)),
             max_drift_rate=max(0.0, min(float(self.max_drift_rate), 1.0)),
             confidence_threshold=max(0.0, min(float(self.confidence_threshold), 1.0)),
         )
@@ -471,7 +499,12 @@ def build_planner_input(
     }
 
 
-def build_llm_planner_prompt(planner_input: dict[str, Any], cfg: AgenticRetrievalConfig) -> tuple[str, list[dict[str, str]]]:
+def build_llm_planner_prompt(
+    planner_input: dict[str, Any],
+    cfg: AgenticRetrievalConfig,
+    *,
+    repair_errors: tuple[str, ...] = (),
+) -> tuple[str, list[dict[str, str]]]:
     """Build the strict JSON-only prompt for the LLM retrieval planner."""
     plan_id = str(planner_input.get("plan_id") or f"plan-{uuid.uuid4().hex[:12]}")
     prompt_input = {
@@ -514,7 +547,209 @@ def build_llm_planner_prompt(planner_input: dict[str, Any], cfg: AgenticRetrieva
         "Return only JSON matching the output_schema.\n\n"
         + json.dumps(prompt_input, ensure_ascii=False, sort_keys=True)
     )
+    if repair_errors:
+        user_prompt += (
+            "\n\nThe previous response failed strict parsing or validation. "
+            "Return one complete replacement JSON object from scratch; do not return a patch.\n"
+            "Sanitized machine errors: "
+            + json.dumps(list(repair_errors), ensure_ascii=True, sort_keys=True)
+        )
     return system_prompt, [{"role": "user", "content": user_prompt}]
+
+
+def _bounded_retry_after_ms(value: Any) -> int | None:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        return None
+    return min(int(seconds * 1000), 60000)
+
+
+def _status_code_from(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        status = int(value)
+    except (TypeError, ValueError):
+        return None
+    return status if 100 <= status <= 599 else None
+
+
+def _provider_failure(
+    *,
+    status_code: int | None,
+    retry_after_ms: int | None = None,
+    timeout: bool = False,
+) -> dict[str, Any]:
+    if timeout:
+        return {
+            "failure_class": "timeout",
+            "retryable": True,
+            "status_code": status_code,
+            "bounded_retry_after_ms": retry_after_ms,
+            "safe_category": "provider_timeout",
+        }
+    if status_code == 429:
+        category = "rate_limit"
+        retryable = True
+    elif status_code is not None and 500 <= status_code <= 599:
+        category = "transient_server"
+        retryable = True
+    elif status_code in {401, 403}:
+        category = "auth"
+        retryable = False
+    else:
+        category = "unknown"
+        retryable = False
+    return {
+        "failure_class": category,
+        "retryable": retryable,
+        "status_code": status_code,
+        "bounded_retry_after_ms": retry_after_ms,
+        "safe_category": f"provider_{category}",
+    }
+
+
+def classify_planner_exception(exc: BaseException) -> dict[str, Any]:
+    """Classify a provider exception chain without retaining exception text."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    status_code: int | None = None
+    retry_after_ms: int | None = None
+    timeout = False
+    safe_class_category: str | None = None
+    auth_status_code: int | None = None
+    auth_detected = False
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        class_name = type(current).__name__.lower()
+        timeout = timeout or isinstance(current, (asyncio.TimeoutError, TimeoutError)) or class_name in {
+            "apitimeouterror",
+            "connecttimeout",
+            "pooltimeout",
+            "readtimeout",
+            "writetimeout",
+        }
+        if class_name in {"ratelimiterror", "toomanyrequestserror"}:
+            safe_class_category = safe_class_category or "rate_limit"
+        elif class_name in {"authenticationerror", "permissiondeniederror", "unauthorizederror", "forbiddenerror"}:
+            auth_detected = True
+            safe_class_category = safe_class_category or "auth"
+        elif class_name in {"internalservererror", "serviceunavailableerror", "badgatewayerror"}:
+            safe_class_category = safe_class_category or "transient_server"
+        current_status_code = _status_code_from(getattr(current, "status_code", None))
+        if current_status_code in {401, 403}:
+            auth_detected = True
+            auth_status_code = auth_status_code or current_status_code
+        status_code = status_code or current_status_code
+        response = getattr(current, "response", None)
+        if response is not None:
+            response_status_code = _status_code_from(getattr(response, "status_code", None))
+            if response_status_code in {401, 403}:
+                auth_detected = True
+                auth_status_code = auth_status_code or response_status_code
+            status_code = status_code or response_status_code
+            headers = getattr(response, "headers", None)
+            if isinstance(headers, Mapping):
+                retry_after_ms = retry_after_ms or _bounded_retry_after_ms(headers.get("retry-after") or headers.get("Retry-After"))
+        retry_after_ms = retry_after_ms or _bounded_retry_after_ms(getattr(current, "retry_after", None))
+        current = current.__cause__ or current.__context__
+    if auth_detected:
+        failure = _provider_failure(status_code=auth_status_code or 401, retry_after_ms=retry_after_ms)
+        if auth_status_code is None:
+            failure["status_code"] = None
+        return failure
+    failure = _provider_failure(status_code=status_code, retry_after_ms=retry_after_ms, timeout=timeout)
+    if status_code is None and not timeout and safe_class_category is not None:
+        synthetic_status = {"rate_limit": 429, "auth": 401, "transient_server": 500}[safe_class_category]
+        failure = _provider_failure(status_code=synthetic_status, retry_after_ms=retry_after_ms)
+        failure["status_code"] = None
+    return failure
+
+
+def _provider_error_envelope(raw: Any) -> dict[str, Any] | None:
+    """Recognize allowlisted provider error envelopes before planner parsing."""
+    parsed = raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text.startswith("{") or not text.endswith("}"):
+            return None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(parsed, Mapping):
+        return None
+    error = parsed.get("error")
+    has_error_shape = isinstance(error, Mapping) or ("errors" in parsed and isinstance(parsed.get("errors"), list))
+    if not has_error_shape:
+        return None
+    error_map = error if isinstance(error, Mapping) else {}
+    status_code = (
+        _status_code_from(parsed.get("status_code"))
+        or _status_code_from(parsed.get("status"))
+        or _status_code_from(error_map.get("status_code"))
+        or _status_code_from(error_map.get("status"))
+        or _status_code_from(error_map.get("code"))
+    )
+    retry_after_ms = _bounded_retry_after_ms(parsed.get("retry_after") or error_map.get("retry_after"))
+    failure = _provider_failure(status_code=status_code, retry_after_ms=retry_after_ms)
+    if status_code is None:
+        safe_type = str(error_map.get("type") or error_map.get("code") or "").strip().lower()
+        if safe_type in {"rate_limit", "rate_limit_error", "too_many_requests"}:
+            failure = _provider_failure(status_code=429, retry_after_ms=retry_after_ms)
+        elif safe_type in {"authentication_error", "permission_error", "unauthorized", "forbidden"}:
+            failure = _provider_failure(status_code=401, retry_after_ms=retry_after_ms)
+        elif safe_type in {"server_error", "service_unavailable", "internal_server_error"}:
+            failure = _provider_failure(status_code=500, retry_after_ms=retry_after_ms)
+    return failure
+
+
+def _native_provider_error_sentinel(raw: Any) -> dict[str, Any] | None:
+    """Recognize RAGFlow native returned errors without retaining their suffix."""
+    if not isinstance(raw, str):
+        return None
+    match = _NATIVE_LLM_ERROR_RE.fullmatch(raw)
+    if match is None:
+        return None
+    code = match.group("code")
+    if code == "RATE_LIMIT_EXCEEDED":
+        return _provider_failure(status_code=429)
+    if code == "SERVER_ERROR":
+        return _provider_failure(status_code=500)
+    if code == "AUTH_ERROR":
+        return _provider_failure(status_code=401)
+    if code == "TIMEOUT":
+        return _provider_failure(status_code=None, timeout=True)
+    if code == "CONNECTION_ERROR":
+        failure = _provider_failure(status_code=500)
+        failure["status_code"] = None
+        return failure
+    return _provider_failure(status_code=None)
+
+
+def _safe_planner_validation_errors(errors: list[str]) -> list[str]:
+    allowlisted = (
+        "schema_invalid",
+        "empty_original_question",
+        "unsupported_complexity",
+        "no_subqueries",
+        "unsupported_evidence_type",
+        "unknown_facet",
+        "empty_query",
+        "unsupported_variant",
+        "anchor_drift",
+        "new_entities",
+        "no_valid_subqueries",
+    )
+    sanitized = []
+    for error in errors:
+        code = next((candidate for candidate in allowlisted if candidate in str(error)), "validation_failed")
+        if code not in sanitized:
+            sanitized.append(code)
+    return sanitized or ["validation_failed"]
 
 
 def parse_llm_planner_json(raw: Any) -> dict[str, Any]:
@@ -550,28 +785,96 @@ async def generate_llm_plan(
     *,
     chat_mdl: Any,
     rag_trace: Any = None,
+    repair_errors: tuple[str, ...] = (),
+    attempt_timeout_ms: int | None = None,
+    operation_id: str | None = None,
+    cleanup_callback: Any = None,
 ) -> BoundedRetrievalPlan:
     if chat_mdl is None or not callable(getattr(chat_mdl, "async_chat", None)):
         _trace_planner_event(rag_trace, "planner_missing_chat_model", {"plan_id": planner_input.get("plan_id"), "mode": cfg.mode})
-        raise AgenticPlannerError("planner_missing_chat_model", "chat_mdl.async_chat is required")
+        raise AgenticPlannerError(
+            "planner_missing_chat_model",
+            "chat_model_unavailable",
+            failure_class="configuration",
+            safe_category="missing_chat_model",
+        )
     plan_id = str(planner_input.get("plan_id") or f"plan-{uuid.uuid4().hex[:12]}")
     planner_input = {**planner_input, "plan_id": plan_id}
-    system_prompt, messages = build_llm_planner_prompt(planner_input, cfg)
+    system_prompt, messages = build_llm_planner_prompt(planner_input, cfg, repair_errors=repair_errors)
     gen_conf = {"temperature": 0.0, "top_p": 0.1}
-    timeout_s = max(0.001, cfg.planner_timeout_ms / 1000.0)
+    effective_timeout_ms = max(1, min(int(attempt_timeout_ms or cfg.planner_timeout_ms), int(cfg.planner_timeout_ms)))
+    timeout_s = effective_timeout_ms / 1000.0
     model_name = str(getattr(chat_mdl, "llm_name", None) or getattr(chat_mdl, "model_name", None) or getattr(chat_mdl, "model_config", {}).get("llm_name", ""))
     started = time.monotonic()
-    _trace_planner_event(rag_trace, "planner_llm_start", {"plan_id": plan_id, "mode": cfg.mode, "model": model_name})
+    base_trace = {
+        "plan_id": plan_id,
+        "mode": cfg.mode,
+        "model": model_name,
+        "operation_id": operation_id,
+        "repair": bool(repair_errors),
+        "attempt_timeout_ms": effective_timeout_ms,
+    }
+    _trace_planner_event(rag_trace, "planner_llm_start", base_trace)
+    chat_task = asyncio.create_task(chat_mdl.async_chat(system_prompt, messages, gen_conf))
     try:
-        raw = await asyncio.wait_for(chat_mdl.async_chat(system_prompt, messages, gen_conf), timeout=timeout_s)
-    except asyncio.TimeoutError as exc:
+        done, _ = await asyncio.wait({chat_task}, timeout=timeout_s)
+    except asyncio.CancelledError:
+        cleanup_ms = await _cancel_and_drain_tasks([chat_task])
+        if callable(cleanup_callback):
+            cleanup_callback(cleanup_ms, "upstream_cancellation")
+        _trace_planner_event(
+            rag_trace,
+            "planner_llm_cleanup",
+            {**base_trace, "cleanup_latency_ms": cleanup_ms, "timeout_owner": "upstream_cancellation", "admitted_new_work": False},
+        )
+        raise
+    if not done:
+        cleanup_ms = await _cancel_and_drain_tasks([chat_task])
+        if callable(cleanup_callback):
+            cleanup_callback(cleanup_ms, "planner_attempt")
         latency_ms = round((time.monotonic() - started) * 1000.0, 3)
-        _trace_planner_event(rag_trace, "planner_llm_timeout", {"plan_id": plan_id, "mode": cfg.mode, "latency_ms": latency_ms, "model": model_name})
-        raise AgenticPlannerError("planner_timeout", f"timeout_ms={cfg.planner_timeout_ms}") from exc
+        failure = classify_planner_exception(asyncio.TimeoutError())
+        _trace_planner_event(
+            rag_trace,
+            "planner_llm_cleanup",
+            {**base_trace, "cleanup_latency_ms": cleanup_ms, "timeout_owner": "planner_attempt", "admitted_new_work": False},
+        )
+        _trace_planner_event(
+            rag_trace,
+            "planner_llm_timeout",
+            {**base_trace, "latency_ms": latency_ms, "cleanup_latency_ms": cleanup_ms, **failure, "timeout_owner": "planner_attempt"},
+        )
+        raise AgenticPlannerError("planner_timeout", "attempt_deadline_exceeded", **failure)
+    try:
+        raw = await chat_task
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         latency_ms = round((time.monotonic() - started) * 1000.0, 3)
-        _trace_planner_event(rag_trace, "planner_llm_error", {"plan_id": plan_id, "mode": cfg.mode, "latency_ms": latency_ms, "model": model_name, "error": str(exc)})
-        raise AgenticPlannerError("planner_error", str(exc)) from exc
+        failure = classify_planner_exception(exc)
+        _trace_planner_event(rag_trace, "planner_llm_error", {**base_trace, "latency_ms": latency_ms, **failure})
+        raise AgenticPlannerError("planner_provider_error", failure_class=failure["failure_class"], retryable=failure["retryable"], status_code=failure["status_code"], bounded_retry_after_ms=failure["bounded_retry_after_ms"], safe_category=failure["safe_category"]) from exc
+
+    returned_failure = _native_provider_error_sentinel(raw)
+    returned_error_shape = "native_sentinel"
+    if returned_failure is None:
+        returned_failure = _provider_error_envelope(raw)
+        returned_error_shape = "provider_envelope"
+    if returned_failure is not None:
+        latency_ms = round((time.monotonic() - started) * 1000.0, 3)
+        _trace_planner_event(
+            rag_trace,
+            "planner_llm_error",
+            {**base_trace, "latency_ms": latency_ms, **returned_failure, "returned_error_shape": returned_error_shape},
+        )
+        raise AgenticPlannerError(
+            "planner_provider_error",
+            failure_class=returned_failure["failure_class"],
+            retryable=returned_failure["retryable"],
+            status_code=returned_failure["status_code"],
+            bounded_retry_after_ms=returned_failure["bounded_retry_after_ms"],
+            safe_category=returned_failure["safe_category"],
+        )
 
     try:
         raw_plan = parse_llm_planner_json(raw)
@@ -580,9 +883,9 @@ async def generate_llm_plan(
         _trace_planner_event(
             rag_trace,
             "planner_llm_invalid_json",
-            {"plan_id": plan_id, "mode": cfg.mode, "latency_ms": latency_ms, "model": model_name, "raw_response_chars": len(str(raw or "")), "fallback_reason": exc.reason, "detail": exc.detail},
+            {**base_trace, "latency_ms": latency_ms, "raw_response_chars": len(str(raw or "")), "fallback_reason": exc.reason, "detail": exc.detail, "failure_class": "invalid_json", "retryable": True},
         )
-        raise
+        raise AgenticPlannerError(exc.reason, exc.detail, failure_class="invalid_json", retryable=True, safe_category="planner_invalid_json") from exc
 
     raw_plan["plan_id"] = plan_id
     raw_plan["original_question"] = str(planner_input.get("original_question") or planner_input.get("question") or raw_plan.get("original_question") or "")
@@ -592,18 +895,35 @@ async def generate_llm_plan(
     validation = validate_plan(raw_plan, cfg, original_question=raw_plan["original_question"])
     latency_ms = round((time.monotonic() - started) * 1000.0, 3)
     if not validation.valid or validation.errors:
+        safe_validation_errors = _safe_planner_validation_errors(validation.errors)
+        policy_drift = any(error in {"anchor_drift", "new_entities"} for error in safe_validation_errors)
+        failure_class = "policy_drift" if policy_drift else "validation"
+        retryable = not policy_drift
+        safe_category = "planner_policy_drift" if policy_drift else "planner_validation"
         _trace_planner_event(
             rag_trace,
             "planner_llm_validation_failed",
-            {"plan_id": plan_id, "mode": cfg.mode, "latency_ms": latency_ms, "model": model_name, "validation_errors": validation.errors, "fallback_reason": validation.fallback_reason},
+            {
+                **base_trace,
+                "latency_ms": latency_ms,
+                "validation_errors": safe_validation_errors,
+                "fallback_reason": ";".join(safe_validation_errors),
+                "failure_class": failure_class,
+                "retryable": retryable,
+            },
         )
-        raise AgenticPlannerError("planner_validation_failed", ";".join(validation.errors))
+        raise AgenticPlannerError(
+            "planner_validation_failed",
+            ";".join(safe_validation_errors),
+            failure_class=failure_class,
+            retryable=retryable,
+            safe_category=safe_category,
+        )
     _trace_planner_event(
         rag_trace,
         "planner_llm_success",
         {
-            "plan_id": plan_id,
-            "mode": cfg.mode,
+            **base_trace,
             "latency_ms": latency_ms,
             "model": model_name,
             "raw_response_chars": len(str(raw or "")),
@@ -971,21 +1291,68 @@ async def generate_sufficiency_judge(
     chat_mdl: Any,
     rag_trace: Any = None,
     iteration_id: str = "",
+    timeout_ms: int | None = None,
+    remaining_budget_ms: float | None = None,
+    cleanup_callback: Any = None,
 ) -> SufficiencyJudge:
     if chat_mdl is None or not callable(getattr(chat_mdl, "async_chat", None)):
         raise AgenticRefinementError("refinement_judge_missing_chat_model")
     system_prompt, messages = build_sufficiency_judge_prompt(question, plan, kbinfos, cfg)
     started = time.monotonic()
-    _trace_refinement_event(rag_trace, "refinement_judge_start", {"plan_id": plan.plan_id, "iteration_id": iteration_id, "mode": cfg.mode})
+    effective_timeout_ms = max(1, min(int(timeout_ms or cfg.normalized().judge_timeout_ms), cfg.normalized().judge_timeout_ms))
+    _trace_refinement_event(
+        rag_trace,
+        "refinement_judge_start",
+        {"plan_id": plan.plan_id, "iteration_id": iteration_id, "mode": cfg.mode, "judge_timeout_ms": effective_timeout_ms, "remaining_refinement_budget_ms": remaining_budget_ms},
+    )
+    judge_task = asyncio.create_task(chat_mdl.async_chat(system_prompt, messages, {"temperature": 0.0, "top_p": 0.1}))
     try:
-        raw = await asyncio.wait_for(
-            chat_mdl.async_chat(system_prompt, messages, {"temperature": 0.0, "top_p": 0.1}),
-            timeout=max(0.001, cfg.normalized().judge_timeout_ms / 1000.0),
+        done, _ = await asyncio.wait(
+            {judge_task},
+            timeout=effective_timeout_ms / 1000.0,
         )
-    except asyncio.TimeoutError as exc:
+    except asyncio.CancelledError:
+        cleanup_ms = await _cancel_and_drain_tasks([judge_task])
+        if callable(cleanup_callback):
+            cleanup_callback(cleanup_ms, "upstream_cancellation")
+        _trace_refinement_event(
+            rag_trace,
+            "refinement_cleanup",
+            {
+                "plan_id": plan.plan_id,
+                "iteration_id": iteration_id,
+                "mode": cfg.mode,
+                "cleanup_latency_ms": cleanup_ms,
+                "timeout_owner": "upstream_cancellation",
+                "admitted_new_work": False,
+            },
+        )
+        raise
+    if not done:
+        cleanup_ms = await _cancel_and_drain_tasks([judge_task])
+        if callable(cleanup_callback):
+            cleanup_callback(cleanup_ms, "phase6_judge")
         latency_ms = round((time.monotonic() - started) * 1000.0, 3)
-        _trace_refinement_event(rag_trace, "refinement_judge_timeout", {"plan_id": plan.plan_id, "iteration_id": iteration_id, "mode": cfg.mode, "latency_ms": latency_ms})
-        raise AgenticRefinementError("refinement_judge_timeout") from exc
+        _trace_refinement_event(
+            rag_trace,
+            "refinement_cleanup",
+            {
+                "plan_id": plan.plan_id,
+                "iteration_id": iteration_id,
+                "mode": cfg.mode,
+                "cleanup_latency_ms": cleanup_ms,
+                "timeout_owner": "phase6_judge",
+                "admitted_new_work": False,
+            },
+        )
+        _trace_refinement_event(
+            rag_trace,
+            "refinement_judge_timeout",
+            {"plan_id": plan.plan_id, "iteration_id": iteration_id, "mode": cfg.mode, "latency_ms": latency_ms, "cleanup_latency_ms": cleanup_ms, "judge_timeout_ms": effective_timeout_ms, "judge_outcome": "timeout", "remaining_refinement_budget_ms": remaining_budget_ms, "timeout_owner": "phase6_judge"},
+        )
+        raise AgenticRefinementError("refinement_judge_timeout")
+    try:
+        raw = await judge_task
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -1008,7 +1375,18 @@ async def generate_sufficiency_judge(
     except AgenticRefinementError as exc:
         latency_ms = round((time.monotonic() - started) * 1000.0, 3)
         event = "refinement_judge_invalid_json" if exc.reason == "refinement_judge_invalid_json" else "refinement_judge_validation_failed"
-        _trace_refinement_event(rag_trace, event, {"plan_id": plan.plan_id, "iteration_id": iteration_id, "mode": cfg.mode, "latency_ms": latency_ms, "fallback_reason": exc.reason, "detail": exc.detail})
+        _trace_refinement_event(
+            rag_trace,
+            event,
+            {
+                "plan_id": plan.plan_id,
+                "iteration_id": iteration_id,
+                "mode": cfg.mode,
+                "latency_ms": latency_ms,
+                "fallback_reason": exc.reason,
+                "failure_class": exc.reason,
+            },
+        )
         raise
     latency_ms = round((time.monotonic() - started) * 1000.0, 3)
     _trace_refinement_event(
@@ -1019,6 +1397,9 @@ async def generate_sufficiency_judge(
             "iteration_id": iteration_id,
             "mode": cfg.mode,
             "latency_ms": latency_ms,
+            "judge_timeout_ms": effective_timeout_ms,
+            "judge_outcome": "success",
+            "remaining_refinement_budget_ms": remaining_budget_ms,
             "confidence": judge.confidence,
             "sufficient": judge.sufficient,
             "missing_facet_count": len(judge.missing_facets),
@@ -1190,6 +1571,35 @@ def accept_followup_evidence(
     return EvidenceAcceptanceResult(kbinfos=selected, accepted_chunks=tuple(accepted), rejected_chunks=tuple(rejected), candidate_kbinfos=committed_candidate)
 
 
+async def _cancel_and_drain_tasks(tasks: list[asyncio.Task[Any]]) -> float:
+    cleanup_started = time.monotonic()
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return round((time.monotonic() - cleanup_started) * 1000.0, 3)
+
+
+async def _wait_for_ordered_task_results(tasks: list[asyncio.Task[Any]], timeout_s: float) -> list[Any]:
+    if not tasks:
+        return []
+    done, pending = await asyncio.wait(tasks, timeout=timeout_s)
+    # A child cancellation is an upstream cancellation signal even when a
+    # sibling is still pending; callers will cancel and drain the full set.
+    if any(task.cancelled() for task in done):
+        raise asyncio.CancelledError
+    if pending:
+        raise asyncio.TimeoutError
+    results: list[Any] = []
+    for task in tasks:
+        if task.cancelled():
+            raise asyncio.CancelledError
+        exception = task.exception()
+        results.append(exception if exception is not None else task.result())
+    return results
+
+
 async def run_refinement_loop(
     *,
     question: str,
@@ -1214,6 +1624,7 @@ async def run_refinement_loop(
     rerank_mdl: Any = None,
     apply_children: bool = True,
     apply_toc: bool = False,
+    cleanup_callback: Any = None,
 ) -> RefinementResult:
     """Run the bounded Phase 6 loop without mutating the caller's Phase 5 state."""
     config = refinement_cfg.normalized()
@@ -1264,6 +1675,7 @@ async def run_refinement_loop(
     current_coverage = initial_coverage
     followup_count_total = 0
     rejected_followup_count_total = 0
+    cleanup_ms_total = 0.0
 
     def stop_result(
         stop_reason: str,
@@ -1271,13 +1683,23 @@ async def run_refinement_loop(
         *,
         fallback: bool = False,
         fallback_reason: str | None = None,
+        timeout_owner: str | None = None,
     ) -> RefinementResult:
-        marginal_gain = (current_coverage - initial_coverage) / max(1, followup_count_total)
+        if latency_ms >= config.latency_budget_ms:
+            stop_reason = "latency_budget_exceeded"
+            fallback = True
+            fallback_reason = "latency_budget_exceeded"
+            timeout_owner = timeout_owner or "phase6_total"
+        result_current = previous if fallback else current
+        result_candidates = previous_candidates if fallback else current_candidates
+        result_accepted = [] if fallback else accepted_all
+        result_coverage = initial_coverage if fallback else current_coverage
+        marginal_gain = (result_coverage - initial_coverage) / max(1, followup_count_total)
         return _refinement_stop_result(
-            current,
-            current_candidates,
+            result_current,
+            result_candidates,
             iterations,
-            accepted_all,
+            result_accepted,
             rejected_all,
             plan,
             config,
@@ -1287,17 +1709,20 @@ async def run_refinement_loop(
             fallback=fallback,
             fallback_reason=fallback_reason,
             coverage_before=initial_coverage,
-            coverage_after=current_coverage,
+            coverage_after=result_coverage,
             marginal_gain=marginal_gain,
             followup_count=followup_count_total,
             rejected_followup_count=rejected_followup_count_total,
+            cleanup_latency_ms=cleanup_ms_total,
+            timeout_owner=timeout_owner,
         )
 
     for iteration_number in range(1, config.max_iterations + 1):
         iteration_started = time.monotonic()
         iteration_id = f"refinement.iteration.{iteration_number}"
         elapsed_ms = (iteration_started - loop_started) * 1000.0
-        if elapsed_ms >= retrieval_cfg.latency_budget_ms:
+        remaining_refinement_ms = config.latency_budget_ms - elapsed_ms
+        if remaining_refinement_ms <= 0:
             return stop_result("latency_budget_exceeded", elapsed_ms, fallback=True)
         diagnostics_before = detect_missing_facets(question, plan, current)
         coverage_before = float(diagnostics_before["coverage"])
@@ -1315,9 +1740,19 @@ async def run_refinement_loop(
                     "sufficient": judge.sufficient,
                     "missing_facet_count": len(judge.missing_facets),
                     "followup_count": 0,
+                    "remaining_refinement_budget_ms": round(remaining_refinement_ms, 3),
+                    "judge_outcome": "heuristic",
                 },
             )
         else:
+            judge_timeout_ms = max(1, min(config.judge_timeout_ms, int(remaining_refinement_ms)))
+
+            def account_judge_cleanup(cleanup_ms: float, timeout_owner: str) -> None:
+                nonlocal cleanup_ms_total
+                cleanup_ms_total += cleanup_ms
+                if callable(cleanup_callback):
+                    cleanup_callback(cleanup_ms, timeout_owner)
+
             try:
                 judge = await generate_sufficiency_judge(
                     question=question,
@@ -1327,13 +1762,16 @@ async def run_refinement_loop(
                     chat_mdl=chat_mdl,
                     rag_trace=rag_trace,
                     iteration_id=iteration_id,
+                    timeout_ms=judge_timeout_ms,
+                    remaining_budget_ms=remaining_refinement_ms,
+                    cleanup_callback=account_judge_cleanup,
                 )
             except asyncio.CancelledError:
                 raise
             except AgenticRefinementError as exc:
                 return stop_result(exc.reason, (time.monotonic() - loop_started) * 1000.0, fallback=True, fallback_reason=exc.reason)
 
-        if (time.monotonic() - loop_started) * 1000.0 >= retrieval_cfg.latency_budget_ms:
+        if (time.monotonic() - loop_started) * 1000.0 >= config.latency_budget_ms:
             return stop_result("latency_budget_exceeded", (time.monotonic() - loop_started) * 1000.0, fallback=True)
         if judge.confidence < config.confidence_threshold:
             return stop_result("judge_confidence_below_threshold", (time.monotonic() - loop_started) * 1000.0, fallback=True)
@@ -1360,6 +1798,22 @@ async def run_refinement_loop(
         previous_contradictions = contradiction_key
 
         followups, rejected_followups = validate_followup_queries(judge, plan, config, iteration_id=iteration_id)
+        elapsed_ms = (time.monotonic() - loop_started) * 1000.0
+        if elapsed_ms >= config.latency_budget_ms:
+            return stop_result("latency_budget_exceeded", elapsed_ms, fallback=True)
+        _trace_refinement_event(
+            rag_trace,
+            "refinement_followup_validation",
+            {
+                "mode": config.mode,
+                "plan_id": plan.plan_id,
+                "iteration_id": iteration_id,
+                "proposed_followup_count": len(judge.recommended_followups),
+                "validated_followup_count": len(followups),
+                "rejected_followup_count": len(rejected_followups),
+                "remaining_refinement_budget_ms": round(max(0.0, config.latency_budget_ms - (time.monotonic() - loop_started) * 1000.0), 3),
+            },
+        )
         rejected_followup_count_total += len(rejected_followups)
         for rejected in rejected_followups:
             _trace_refinement_event(rag_trace, "refinement_followup_rejected", {"mode": config.mode, "plan_id": plan.plan_id, "iteration_id": iteration_id, **rejected})
@@ -1433,16 +1887,30 @@ async def run_refinement_loop(
                     )
                 )
             )
-        remaining_latency_s = max(0.001, (retrieval_cfg.latency_budget_ms - (time.monotonic() - loop_started) * 1000.0) / 1000.0)
+        remaining_latency_s = max(0.001, (config.latency_budget_ms - (time.monotonic() - loop_started) * 1000.0) / 1000.0)
         try:
-            lane_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=remaining_latency_s)
+            lane_results = await _wait_for_ordered_task_results(tasks, remaining_latency_s)
         except asyncio.CancelledError:
-            for task in tasks:
-                task.cancel()
+            cleanup_ms = await _cancel_and_drain_tasks(tasks)
+            cleanup_ms_total += cleanup_ms
+            if callable(cleanup_callback):
+                cleanup_callback(cleanup_ms, "upstream_cancellation")
+            _trace_refinement_event(
+                rag_trace,
+                "refinement_cleanup",
+                {"mode": config.mode, "plan_id": plan.plan_id, "iteration_id": iteration_id, "cleanup_latency_ms": cleanup_ms, "timeout_owner": "upstream_cancellation", "admitted_new_work": False},
+            )
             raise
         except asyncio.TimeoutError:
-            for task in tasks:
-                task.cancel()
+            cleanup_ms = await _cancel_and_drain_tasks(tasks)
+            cleanup_ms_total += cleanup_ms
+            if callable(cleanup_callback):
+                cleanup_callback(cleanup_ms, "phase6_total")
+            _trace_refinement_event(
+                rag_trace,
+                "refinement_cleanup",
+                {"mode": config.mode, "plan_id": plan.plan_id, "iteration_id": iteration_id, "cleanup_latency_ms": cleanup_ms, "timeout_owner": "phase6_total", "admitted_new_work": False},
+            )
             return stop_result("latency_budget_exceeded", (time.monotonic() - loop_started) * 1000.0, fallback=True)
         normalized_lanes: list[dict[str, Any]] = []
         for followup, result in zip(followups, lane_results):
@@ -1470,6 +1938,9 @@ async def run_refinement_loop(
             question=question,
             context_builder_config=context_builder_config,
         )
+        elapsed_ms = (time.monotonic() - loop_started) * 1000.0
+        if elapsed_ms >= config.latency_budget_ms:
+            return stop_result("latency_budget_exceeded", elapsed_ms, fallback=True, timeout_owner="phase6_total")
         for chunk in acceptance.rejected_chunks:
             _trace_refinement_event(rag_trace, "refinement_evidence_rejected", {"mode": config.mode, "plan_id": plan.plan_id, "iteration_id": iteration_id, "evidence_id": _evidence_id(chunk), "facet_id": chunk.get("facet_id"), "rejection_reason": chunk.get("rejection_reason")})
         if acceptance.selected_new_evidence_count < config.min_new_evidence:
@@ -1530,6 +2001,9 @@ async def run_refinement_loop(
                 "iteration_id": iteration_id,
                 "accepted_new_evidence_count": acceptance.selected_new_evidence_count,
                 "rejected_evidence_count": len(acceptance.rejected_chunks),
+                "retrieved_evidence_count": sum(len((lane.get("kbinfos") or {}).get("chunks", [])) for lane in normalized_lanes),
+                "eligible_evidence_count": len(acceptance.accepted_chunks) + len(acceptance.rejected_chunks),
+                "selected_evidence_count": len(acceptance.kbinfos.get("chunks", [])),
                 "coverage_before": coverage_before,
                 "coverage_after": coverage_after,
                 "marginal_gain": round(marginal_gain, 6),
@@ -1561,6 +2035,7 @@ async def execute_bounded_plan(
     apply_toc: bool = False,
     chat_mdl: Any = None,
     enforce_result_anchor_drift: bool = True,
+    cleanup_callback: Any = None,
 ) -> BoundedRetrievalResult:
     started = time.monotonic()
     tasks = [
@@ -1589,13 +2064,29 @@ async def execute_bounded_plan(
     ]
     overall_timeout = max(0.001, cfg.latency_budget_ms / 1000.0)
     try:
-        lane_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=overall_timeout)
+        lane_results = await _wait_for_ordered_task_results(tasks, overall_timeout)
     except BaseException as exc:
+        cleanup_ms = await _cancel_and_drain_tasks(tasks)
+        if callable(cleanup_callback):
+            cleanup_callback(cleanup_ms, "upstream_cancellation" if isinstance(exc, asyncio.CancelledError) else "phase5_retrieval")
+        _trace_agentic_event(
+            rag_trace,
+            "cleanup",
+            {
+                "plan_id": plan.plan_id,
+                "cleanup_latency_ms": cleanup_ms,
+                "timeout_owner": "upstream_cancellation" if isinstance(exc, asyncio.CancelledError) else "phase5_retrieval",
+                "admitted_new_work": False,
+            },
+        )
         if isinstance(exc, asyncio.CancelledError):
             raise
-        for task in tasks:
-            task.cancel()
-        diagnostics = {"accepted_subqueries": 0, "rejected_subqueries": len(tasks), "rejections": [{"rejection_reason": "overall_timeout_or_exception", "error": str(exc)}]}
+        diagnostics = {
+            "accepted_subqueries": 0,
+            "rejected_subqueries": len(tasks),
+            "rejections": [{"rejection_reason": "overall_timeout_or_exception", "failure_class": type(exc).__name__}],
+            "cleanup_latency_ms": cleanup_ms,
+        }
         _trace_agentic_event(rag_trace, "fallback", {"plan_id": plan.plan_id, "reason": "overall_timeout_or_exception", **diagnostics})
         return BoundedRetrievalResult(
             kbinfos={"total": 0, "chunks": [], "doc_aggs": []},
@@ -1693,7 +2184,11 @@ async def execute_bounded_plan(
 
 def _normalize_lane_result(result: Any) -> dict[str, Any]:
     if isinstance(result, BaseException):
-        return {"accepted": False, "rejection_reason": "lane_exception", "error": str(result)}
+        return {
+            "accepted": False,
+            "rejection_reason": "lane_exception",
+            "failure_class": type(result).__name__,
+        }
     if not isinstance(result, dict):
         return {"accepted": False, "rejection_reason": "invalid_lane_result", "error": type(result).__name__}
     normalized = dict(result)
@@ -2014,10 +2509,10 @@ async def run_agentic_retrieval(
         _trace_agentic_event(rag_trace, "planner_llm_fallback_to_baseline", {"reason": exc.reason, "detail": exc.detail, "mode": cfg.mode})
         _trace_planner_event(rag_trace, "planner_llm_fallback_to_baseline", {"fallback_reason": exc.reason, "detail": exc.detail, "mode": cfg.mode})
         return {"kbinfos": baseline, **baseline, "fallback_reason": exc.reason, "fallback_to_baseline": True}
-    except Exception as exc:
-        _trace_agentic_event(rag_trace, "planner_llm_fallback_to_baseline", {"reason": "planner_error", "detail": str(exc), "mode": cfg.mode})
-        _trace_planner_event(rag_trace, "planner_llm_fallback_to_baseline", {"fallback_reason": "planner_error", "detail": str(exc), "mode": cfg.mode})
-        return {"kbinfos": baseline, **baseline, "fallback_reason": f"planner_error:{exc}", "fallback_to_baseline": True}
+    except Exception:
+        _trace_agentic_event(rag_trace, "planner_llm_fallback_to_baseline", {"reason": "planner_error", "failure_class": "unknown", "mode": cfg.mode})
+        _trace_planner_event(rag_trace, "planner_llm_fallback_to_baseline", {"fallback_reason": "planner_error", "failure_class": "unknown", "mode": cfg.mode})
+        return {"kbinfos": baseline, **baseline, "fallback_reason": "planner_error", "fallback_to_baseline": True}
 
     if cfg.mode == "shadow":
         return {"kbinfos": baseline, **baseline, "mode": cfg.mode, "shadow_agentic": agentic_result.diagnostics}
@@ -2078,8 +2573,9 @@ async def _execute_subquery(
         if isinstance(exc, asyncio.CancelledError):
             raise
         rag_trace = kwargs.get("rag_trace")
-        _trace_agentic_event(rag_trace, "subquery_rejected", {"plan_id": plan.plan_id, "subquery_id": spec.subquery_id, "reason": "lane_timeout_or_exception", "error": str(exc)})
-        return {"subquery": spec, "accepted": False, "rejection_reason": "lane_timeout_or_exception", "error": str(exc)}
+        failure_class = type(exc).__name__
+        _trace_agentic_event(rag_trace, "subquery_rejected", {"plan_id": plan.plan_id, "subquery_id": spec.subquery_id, "reason": "lane_timeout_or_exception", "failure_class": failure_class})
+        return {"subquery": spec, "accepted": False, "rejection_reason": "lane_timeout_or_exception", "failure_class": failure_class}
 
 
 async def _execute_subquery_work(
@@ -2134,8 +2630,9 @@ async def _execute_subquery_work(
     try:
         kbinfos = await asyncio.wait_for(retrieval, timeout=max(0.001, cfg.retrieval_timeout_ms / 1000.0))
     except Exception as exc:
-        _trace_agentic_event(rag_trace, "subquery_rejected", {"plan_id": plan.plan_id, "subquery_id": spec.subquery_id, "reason": "retrieval_exception", "error": str(exc)})
-        return {"subquery": spec, "accepted": False, "rejection_reason": "retrieval_exception", "error": str(exc)}
+        failure_class = type(exc).__name__
+        _trace_agentic_event(rag_trace, "subquery_rejected", {"plan_id": plan.plan_id, "subquery_id": spec.subquery_id, "reason": "retrieval_exception", "failure_class": failure_class})
+        return {"subquery": spec, "accepted": False, "rejection_reason": "retrieval_exception", "failure_class": failure_class}
     if apply_toc and chat_mdl:
         cks = await retriever.retrieval_by_toc(spec.query, kbinfos.get("chunks", []), tenant_ids, chat_mdl, top_n)
         if cks:
@@ -2668,6 +3165,8 @@ def _refinement_stop_result(
     marginal_gain: float = 0.0,
     followup_count: int = 0,
     rejected_followup_count: int = 0,
+    cleanup_latency_ms: float = 0.0,
+    timeout_owner: str | None = None,
 ) -> RefinementResult:
     payload = {
         "mode": cfg.mode,
@@ -2685,6 +3184,8 @@ def _refinement_stop_result(
         "marginal_gain": round(marginal_gain, 6),
         "followup_count": followup_count,
         "rejected_followup_count": rejected_followup_count,
+        "cleanup_latency_ms": round(cleanup_latency_ms, 3),
+        "timeout_owner": timeout_owner,
     }
     if fallback:
         _trace_refinement_event(rag_trace, "refinement_fallback_to_previous_context", payload)
