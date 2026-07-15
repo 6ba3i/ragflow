@@ -163,6 +163,9 @@ class OSConnection(DocStoreConnection):
     def db_type(self) -> str:
         return "opensearch"
 
+    def supports_match_phrase(self) -> bool:
+        return True
+
     def health(self) -> dict:
         health_dict = dict(self.os.cluster.health())
         health_dict["type"] = "opensearch"
@@ -371,6 +374,10 @@ class OSConnection(DocStoreConnection):
         for m in match_expressions:
             if isinstance(m, MatchTextExpr):
                 use_text = True
+                if m.extra_options.get("query_type") == "match_phrase":
+                    bqry.must.append(Q("multi_match", fields=m.fields, type="phrase", query=m.matching_text, boost=1))
+                    bqry.boost = 1.0 - vector_similarity_weight
+                    continue
                 minimum_should_match = m.extra_options.get("minimum_should_match", 0.0)
                 if isinstance(minimum_should_match, float):
                     minimum_should_match = str(int(minimum_should_match * 100)) + "%"

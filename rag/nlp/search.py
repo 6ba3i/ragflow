@@ -23,13 +23,23 @@ from dataclasses import dataclass
 
 from rag.nlp import rag_tokenizer, query
 import numpy as np
-from common.doc_store.doc_store_base import MatchDenseExpr, FusionExpr, OrderByExpr, DocStoreConnection
+from common.doc_store.doc_store_base import MatchDenseExpr, MatchTextExpr, FusionExpr, OrderByExpr, DocStoreConnection
 from common.string_utils import remove_redundant_spaces
 from common.float_utils import get_float
 from common.constants import PAGERANK_FLD, TAG_FLD
 from common.tag_feature_utils import parse_tag_features
 from common import settings
-from rag.utils.retrieval_fusion import FusionConfig, fuse_retrieval_lanes, merge_child_fusion_metadata
+from rag.utils.retrieval_fusion import (
+    FusionConfig,
+    apply_post_rerank_controls,
+    fuse_retrieval_lanes,
+    lane_candidates_from_chunks,
+    merge_child_fusion_metadata,
+    query_fingerprint,
+    rerank_fused_candidates,
+    resolve_request_lane_weights,
+)
+from rag.utils.retrieval_query import RetrievalQueryBundle
 
 from common.misc_utils import thread_pool_exec
 
@@ -172,14 +182,30 @@ class Dealer:
                 highlightFields = []
             elif isinstance(highlight, list):
                 highlightFields = highlight
-            matchText, keywords = self.qryr.question(qst, min_match=0.3)
-            if emb_mdl is None:
-                matchExprs = [matchText]
-                res = await thread_pool_exec(self.dataStore.search, src, highlightFields, filters, matchExprs, orderBy, offset, limit,
-                                            idx_names, kb_ids, rank_feature=rank_feature)
-                total = self.dataStore.get_total(res)
-                logging.debug("Dealer.search TOTAL: {}".format(total))
-            else:
+            vector_similarity_weight = max(0.0, min(1.0, float(req.get("vector_similarity_weight", 0.3))))
+            retrieval_lane = req.get("retrieval_lane")
+            sparse_enabled = vector_similarity_weight < 1.0 and retrieval_lane != "original_dense"
+            dense_enabled = (
+                emb_mdl is not None
+                and vector_similarity_weight > 0.0
+                and retrieval_lane not in {"exact_phrase", "original_sparse", "expanded_sparse"}
+            )
+
+            keywords = []
+            matchText = None
+            if sparse_enabled:
+                if retrieval_lane == "exact_phrase":
+                    matchText = MatchTextExpr(
+                        self.qryr.query_fields,
+                        qst,
+                        topk,
+                        {"query_type": "match_phrase"},
+                    )
+                else:
+                    matchText, keywords = self.qryr.question(qst, min_match=0.3)
+
+            matchDense = None
+            if dense_enabled:
                 matchDense = await self.get_vector(qst, emb_mdl, topk, req.get("similarity", 0.1))
                 q_vec = matchDense.embedding_data
                 # ES path no longer fetches chunk vectors here. The clean
@@ -191,9 +217,27 @@ class Dealer:
                 if settings.DOC_ENGINE_OCEANBASE:
                     src.append(f"q_{len(q_vec)}_vec")
 
-                fusionExpr = FusionExpr("weighted_sum", topk, {"weights": "0.05,0.95"})
+            fusionExpr = None
+            if matchText is not None and matchDense is not None:
+                fusionExpr = FusionExpr(
+                    "weighted_sum",
+                    topk,
+                    {"weights": f"{1.0 - vector_similarity_weight},{vector_similarity_weight}"},
+                )
                 matchExprs = [matchText, matchDense, fusionExpr]
+            elif matchDense is not None:
+                matchExprs = [matchDense]
+            elif matchText is not None:
+                matchExprs = [matchText]
+            else:
+                matchExprs = []
 
+            if matchDense is None:
+                res = await thread_pool_exec(self.dataStore.search, src, highlightFields, filters, matchExprs, orderBy, offset, limit,
+                                            idx_names, kb_ids, rank_feature=rank_feature)
+                total = self.dataStore.get_total(res)
+                logging.debug("Dealer.search TOTAL: {}".format(total))
+            else:
                 res = await thread_pool_exec(self.dataStore.search, src, highlightFields, filters, matchExprs, orderBy, offset, limit,
                                             idx_names, kb_ids, rank_feature=rank_feature)
                 total = self.dataStore.get_total(res)
@@ -201,8 +245,24 @@ class Dealer:
 
                 # If result is empty, try again with lower min_match
                 if total == 0:
-                    if filters.get("doc_id"):
+                    if filters.get("doc_id") and matchText is not None:
                         res = await thread_pool_exec(self.dataStore.search, src, [], filters, [], orderBy, offset, limit, idx_names, kb_ids)
+                        total = self.dataStore.get_total(res)
+                    elif matchText is None:
+                        matchDense.extra_options["similarity"] = 0.17
+                        res = await thread_pool_exec(
+                            self.dataStore.search,
+                            src,
+                            highlightFields,
+                            filters,
+                            [matchDense],
+                            orderBy,
+                            offset,
+                            limit,
+                            idx_names,
+                            kb_ids,
+                            rank_feature=rank_feature,
+                        )
                         total = self.dataStore.get_total(res)
                     else:
                         matchText, _ = self.qryr.question(qst, min_match=0.1)
@@ -590,15 +650,18 @@ class Dealer:
             rank_feature: dict | None = {PAGERANK_FLD: 10},
             trace_id=None,
             _fusion_internal: bool = False,
+            _lane_mode: str | None = None,
     ):
         ranks = {"total": 0, "chunks": [], "doc_aggs": {}}
-        if not question:
+        query_bundle = question if isinstance(question, RetrievalQueryBundle) else None
+        effective_question = query_bundle.effective_base if query_bundle is not None else question
+        if not effective_question:
             return ranks
 
         fusion_config = FusionConfig.from_env()
-        if fusion_config.enabled and not _fusion_internal and rerank_mdl is None:
-            return await self._retrieval_with_fusion(
-                question,
+        if fusion_config.enabled and not _fusion_internal:
+            fused = await self._retrieval_with_fusion(
+                query_bundle or question,
                 embd_mdl,
                 tenant_ids,
                 kb_ids,
@@ -613,7 +676,20 @@ class Dealer:
                 rank_feature=rank_feature,
                 trace_id=trace_id,
                 config=fusion_config,
+                rerank_mdl=rerank_mdl,
             )
+            if query_bundle is not None:
+                fused.setdefault("diagnostics", {})["query_bundle"] = {
+                    "cross_language_status": query_bundle.cross_language_status,
+                    "exact_phrase_eligible": query_bundle.exact_phrase is not None,
+                    "expansion_status": query_bundle.expansion_status,
+                    "expanded_term_count": len(query_bundle.expanded_terms),
+                    "expansion_reason": query_bundle.expansion_reason,
+                    "expansion_rejection_reasons": list(query_bundle.expansion_rejection_reasons),
+                }
+            return fused
+
+        question = effective_question
 
         # Candidate window for block-based pagination. It MUST stay a multiple
         # of page_size so the block fetched (global_offset // RERANK_LIMIT) and
@@ -632,6 +708,8 @@ class Dealer:
             "vector": True,
             "topk": top,
             "similarity": similarity_threshold,
+            "vector_similarity_weight": vector_similarity_weight,
+            "retrieval_lane": _lane_mode,
             "available_int": 1,
         }
         logging.debug(f"[Search] global_offset={global_offset}, rerank_limit={RERANK_LIMIT}, page_size={page_size}, page={page}")
@@ -645,6 +723,7 @@ class Dealer:
         # Temporary retrieval-side guard: prune chunks whose parent document no
         # longer exists before reranking and returning results.
         sres = await self._prune_deleted_chunks(sres)
+        source_total = max(0, int(sres.total))
         if sres.total == 0:
             ranks["doc_aggs"] = []
             return ranks
@@ -791,6 +870,17 @@ class Dealer:
         else:
             ranks["doc_aggs"] = []
 
+        if _fusion_internal:
+            ranks["_fusion_source_total"] = source_total
+        if query_bundle is not None:
+            ranks.setdefault("diagnostics", {})["query_bundle"] = {
+                "cross_language_status": query_bundle.cross_language_status,
+                "exact_phrase_eligible": query_bundle.exact_phrase is not None,
+                "expansion_status": query_bundle.expansion_status,
+                "expanded_term_count": len(query_bundle.expanded_terms),
+                "expansion_reason": query_bundle.expansion_reason,
+                "expansion_rejection_reasons": list(query_bundle.expansion_rejection_reasons),
+            }
         return ranks
 
     async def _retrieval_with_fusion(
@@ -810,91 +900,221 @@ class Dealer:
             rank_feature: dict | None = None,
             trace_id=None,
             config: FusionConfig | None = None,
+            rerank_mdl=None,
     ):
-        """Opt-in Phase 2 sparse+dense fusion before Phase 3 context building."""
+        """Run bounded query-role lanes and fuse them before context building."""
         config = config or FusionConfig.from_env()
+        bundle = question if isinstance(question, RetrievalQueryBundle) else RetrievalQueryBundle.build(question)
+        vector_similarity_weight = max(0.0, min(1.0, float(vector_similarity_weight)))
+        fallback_notes: list[str] = []
+        phrase_capability = getattr(getattr(self, "dataStore", None), "supports_match_phrase", None)
+        try:
+            phrase_supported = True if phrase_capability is None else bool(phrase_capability())
+        except Exception:
+            phrase_supported = False
+        if vector_similarity_weight < 1.0 and bundle.exact_phrases and not phrase_supported:
+            fallback_notes.append("exact_phrase_fallback:backend_unsupported")
+        enabled_lanes = []
+        if vector_similarity_weight < 1.0:
+            if bundle.exact_phrases and phrase_supported:
+                enabled_lanes.append("exact_phrase")
+            enabled_lanes.append("original_sparse")
+            if bundle.validated_terms:
+                enabled_lanes.append("expanded_sparse")
+        if vector_similarity_weight > 0.0 and embd_mdl is not None:
+            enabled_lanes.append("original_dense")
         started_total = time.perf_counter()
         page = max(page, 1)
         global_offset = (page - 1) * page_size
-        lane_window = min(int(top), max(int(config.window), global_offset + page_size)) if top else max(int(config.window), global_offset + page_size)
-        lane_window = max(page_size, lane_window)
-        fallback_notes: list[str] = []
+        configured_window = max(1, int(config.window))
+        top_limit = max(0, int(top)) if top else 0
+        lane_window = max(page_size, min(configured_window, top_limit)) if top_limit else max(page_size, configured_window)
+        fusion_pool = min(lane_window, top_limit) if top_limit else lane_window
         latencies: dict[str, float] = {}
 
-        sparse_start = time.perf_counter()
-        sparse = await self.retrieval(
-            question,
-            None,
-            tenant_ids,
-            kb_ids,
-            1,
-            lane_window,
-            similarity_threshold,
-            vector_similarity_weight=0.0,
-            top=top,
-            doc_ids=doc_ids,
-            aggs=aggs,
-            rerank_mdl=None,
-            highlight=highlight,
-            rank_feature=rank_feature,
-            trace_id=trace_id,
-            _fusion_internal=True,
-        )
-        latencies["sparse"] = round((time.perf_counter() - sparse_start) * 1000, 3)
+        lane_results: dict[str, list[dict]] = {}
+        lane_queries: dict[str, list[str]] = {}
+        lane_totals: dict[str, int] = {}
+        lane_failures: dict[str, list[dict[str, str]]] = {}
+        aggregate_source = {"total": 0, "chunks": [], "doc_aggs": []}
 
-        dense = {"total": 0, "chunks": [], "doc_aggs": []}
-        if embd_mdl is None:
-            fallback_notes.append("dense_fallback:embedding_unavailable")
-        else:
-            dense_start = time.perf_counter()
-            dense = await self.retrieval(
-                question,
-                embd_mdl,
-                tenant_ids,
-                kb_ids,
-                1,
-                lane_window,
-                similarity_threshold,
-                vector_similarity_weight=1.0,
-                top=top,
-                doc_ids=doc_ids,
-                aggs=aggs,
-                rerank_mdl=None,
-                highlight=highlight,
-                rank_feature=rank_feature,
-                trace_id=trace_id,
-                _fusion_internal=True,
-            )
-            latencies["dense"] = round((time.perf_counter() - dense_start) * 1000, 3)
-            fallback_notes.append("dense_lane:dense_best_effort_existing_embedding_path")
+        async def run_lane(lane: str, lane_question: str, lane_embd_mdl, lane_weight: float, *, optional: bool = False) -> None:
+            nonlocal aggregate_source
+            lane_start = time.perf_counter()
+            lane_queries.setdefault(lane, []).append(lane_question)
+            try:
+                result = await self.retrieval(
+                    lane_question,
+                    lane_embd_mdl,
+                    tenant_ids,
+                    kb_ids,
+                    1,
+                    lane_window,
+                    similarity_threshold,
+                    vector_similarity_weight=lane_weight,
+                    top=lane_window,
+                    doc_ids=doc_ids,
+                    aggs=aggs,
+                    rerank_mdl=None,
+                    highlight=highlight,
+                    rank_feature=rank_feature,
+                    trace_id=trace_id,
+                    _fusion_internal=True,
+                    _lane_mode=lane,
+                )
+            except Exception as exc:
+                if not optional:
+                    raise
+                error_type = type(exc).__name__
+                note = f"lane_error:{lane}:{error_type}"
+                if note not in fallback_notes:
+                    fallback_notes.append(note)
+                lane_failures.setdefault(lane, []).append(
+                    {
+                        "error_type": error_type,
+                        "query_hash": query_fingerprint(lane_question),
+                    }
+                )
+                return
+            finally:
+                latencies[lane] = round(latencies.get(lane, 0.0) + (time.perf_counter() - lane_start) * 1000, 3)
+            if aggregate_source["total"] == 0:
+                aggregate_source = {
+                    key: value
+                    for key, value in result.items()
+                    if key != "_fusion_source_total"
+                }
+            lane_results.setdefault(lane, []).extend(result.get("chunks", []) if isinstance(result, dict) else [])
+            if isinstance(result, dict):
+                lane_total = max(0, int(result.get("_fusion_source_total", result.get("total", 0))))
+                lane_totals[lane] = lane_totals.get(lane, 0) + lane_total
 
+        if vector_similarity_weight < 1.0:
+            if phrase_supported:
+                for phrase in bundle.exact_phrases:
+                    await run_lane("exact_phrase", phrase, None, 0.0, optional=True)
+            await run_lane("original_sparse", bundle.original_sparse_query, None, 0.0)
+            if bundle.validated_terms:
+                await run_lane("expanded_sparse", ", ".join(bundle.validated_terms), None, 0.0, optional=True)
+
+        if vector_similarity_weight > 0.0:
+            if embd_mdl is None:
+                fallback_notes.append("dense_fallback:embedding_unavailable")
+            else:
+                await run_lane(
+                    "original_dense",
+                    bundle.original_dense_query,
+                    embd_mdl,
+                    1.0,
+                    optional=vector_similarity_weight < 1.0,
+                )
+
+        successful_lanes = [lane for lane in enabled_lanes if lane in lane_results]
         fusion_start = time.perf_counter()
-        sparse_chunks = sparse.get("chunks", []) if isinstance(sparse, dict) else []
-        dense_chunks = dense.get("chunks", []) if isinstance(dense, dict) else []
-        from rag.utils.retrieval_fusion import lane_candidates_from_chunks
-        sparse_candidates = lane_candidates_from_chunks(
-            sparse_chunks,
-            lane="sparse",
-            requested_lane="sparse",
-            effective_lane="sparse",
-        )
-        dense_candidates = lane_candidates_from_chunks(
-            dense_chunks,
-            lane="dense",
-            requested_lane="dense",
-            effective_lane="dense_best_effort" if embd_mdl is not None else "unavailable",
-            fallback_note="dense_best_effort_existing_embedding_path" if embd_mdl is not None else "embedding_unavailable",
+        lane_candidates = {
+            lane: lane_candidates_from_chunks(
+                chunks,
+                lane=lane,
+                requested_lane=lane,
+                effective_lane=lane,
+            )
+            for lane, chunks in lane_results.items()
+        }
+        contributing_lanes = [lane for lane in enabled_lanes if lane_candidates.get(lane)]
+        empty_lanes = [lane for lane in successful_lanes if lane not in contributing_lanes]
+        effective_config = resolve_request_lane_weights(
+            config,
+            vector_weight=vector_similarity_weight,
+            enabled_lanes=contributing_lanes,
         )
         fusion = fuse_retrieval_lanes(
-            {"sparse": sparse_candidates, "dense": dense_candidates},
-            config,
+            lane_candidates,
+            effective_config,
             fallback_notes=fallback_notes,
+            apply_controls=rerank_mdl is None,
+            max_candidates=fusion_pool,
         )
+        request_mode = "dense_only" if vector_similarity_weight == 1.0 else "sparse_only" if vector_similarity_weight == 0.0 else "hybrid"
+        fusion.diagnostics["weight_resolution"] = {
+            "source": "request",
+            "vector_weight": vector_similarity_weight,
+            "sparse_family_weight": 1.0 - vector_similarity_weight,
+            "enabled_lanes": contributing_lanes,
+            "sparse_allocation": "proportional_active_lane_weights",
+        }
+        fusion.diagnostics["lane_resolution"] = {
+            "mode": request_mode,
+            "requested_lanes": enabled_lanes,
+            "successful_lanes": successful_lanes,
+            "contributing_lanes": contributing_lanes,
+            "empty_lanes": empty_lanes,
+            "ordinary_sparse_fallback": vector_similarity_weight < 1.0,
+        }
+        fusion.diagnostics["lane_failures"] = {
+            lane: failures
+            for lane, failures in sorted(lane_failures.items())
+        }
+        if rerank_mdl is not None:
+            rerank_result = rerank_fused_candidates(
+                fusion.candidates,
+                original_question=bundle.raw_original,
+                rerank_mdl=rerank_mdl,
+                max_candidates=fusion_pool,
+            )
+            before_controls = list(rerank_result.candidates)
+            controlled, fusion_level, fallback_notes = apply_post_rerank_controls(
+                rerank_result.candidates,
+                effective_config,
+                fallback_notes=fusion.fallback_notes,
+            )
+            fusion.candidates = controlled
+            fusion.fallback_notes = fallback_notes
+            fusion.diagnostics["fusion_level"] = fusion_level
+            fusion.diagnostics["fused_count"] = len(controlled)
+            fusion.diagnostics["fallback_notes"] = fallback_notes
+            fusion.diagnostics["rerank"] = rerank_result.diagnostics
+            selected_ids = {candidate.candidate_id for candidate in controlled}
+            fusion.diagnostics["candidate_rejections"].extend(
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "reason": "post_rerank_control",
+                    "fused_rank": candidate.fused_rank,
+                    "rerank_rank": candidate.rerank_rank,
+                    "lane_ranks": dict(sorted(candidate.lane_ranks.items())),
+                }
+                for candidate in before_controls
+                if candidate.candidate_id not in selected_ids
+            )
+            fusion.diagnostics["final_lineage"] = [
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "fused_rank": candidate.fused_rank,
+                    "rerank_rank": candidate.rerank_rank,
+                    "final_rank": candidate.final_rank,
+                    "reserved_lanes": list(candidate.reserved_lanes),
+                }
+                for candidate in controlled
+            ]
+            fusion.diagnostics["candidates"] = [candidate.to_trace_dict() for candidate in controlled]
+        candidate_total = len(fusion.candidates)
+        aggregate_source["total"] = candidate_total
+        fusion.diagnostics["total_resolution"] = {
+            "basis": "bounded_accessible_fused_pool",
+            "lane_source_totals": dict(sorted(lane_totals.items())),
+            "lane_window": lane_window,
+            "fusion_pool": fusion_pool,
+            "top": max(0, int(top)) if top else None,
+            "resolved_total": candidate_total,
+        }
         latencies["fusion"] = round((time.perf_counter() - fusion_start) * 1000, 3)
         latencies["total"] = round((time.perf_counter() - started_total) * 1000, 3)
-        fused = fusion.to_kbinfos({"doc_aggs": sparse.get("doc_aggs", []), "total": sparse.get("total", 0)}, offset=global_offset, limit=page_size)
+        fused = fusion.to_kbinfos(aggregate_source, offset=global_offset, limit=page_size)
         fused.setdefault("diagnostics", {}).setdefault("fusion", fusion.diagnostics)
         fused["diagnostics"]["fusion"]["latency_ms"] = latencies
+        fused["diagnostics"]["fusion"]["lane_query_hashes"] = {
+            lane: [query_fingerprint(value) for value in values]
+            for lane, values in sorted(lane_queries.items())
+        }
         fused["fusion"] = fused["diagnostics"]["fusion"]
         if not aggs:
             fused["doc_aggs"] = []

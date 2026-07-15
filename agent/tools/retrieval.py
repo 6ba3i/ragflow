@@ -31,7 +31,8 @@ from api.db.joint_services.tenant_model_service import get_tenant_default_model_
 from common import settings
 from common.connection_utils import timeout
 from rag.app.tag import label_question
-from rag.prompts.generator import cross_languages, kb_prompt, memory_prompt
+from rag.prompts.generator import cross_languages_result, kb_prompt, memory_prompt
+from rag.utils.retrieval_query import RetrievalQueryBundle
 
 
 class RetrievalParam(ToolParamBase):
@@ -132,6 +133,7 @@ class Retrieval(ToolBase, ABC):
         vars = self.get_input_elements_from_text(query_text)
         vars = {k: o["value"] for k, o in vars.items()}
         query = self.string_format(query_text, vars)
+        raw_query = query
 
         doc_ids = []
         if self._param.meta_data_filter != {}:
@@ -193,13 +195,20 @@ class Retrieval(ToolBase, ABC):
                 metas_loader=_load_metas,
             )
 
-        if self._param.cross_languages:
-            query = await cross_languages(kbs[0].tenant_id, None, query, self._param.cross_languages)
+        cross_language = await cross_languages_result(kbs[0].tenant_id, None, query, self._param.cross_languages)
+        query = cross_language.query
+
+        query = re.sub(r"^user[:：\s]*", "", query, flags=re.IGNORECASE)
+        query_bundle = RetrievalQueryBundle.build(
+            raw_query,
+            effective_base=query,
+            cross_language_status=cross_language.status,
+            cross_language_identity=cross_language.identity,
+        )
 
         if kbs:
-            query = re.sub(r"^user[:：\s]*", "", query, flags=re.IGNORECASE)
             kbinfos = await settings.retriever.retrieval(
-                query,
+                query_bundle,
                 embd_mdl,
                 [kb.tenant_id for kb in kbs],
                 filtered_kb_ids,
@@ -211,7 +220,7 @@ class Retrieval(ToolBase, ABC):
                 doc_ids=doc_ids,
                 aggs=True,
                 rerank_mdl=rerank_mdl,
-                rank_feature=label_question(query, kbs),
+                rank_feature=label_question(query_bundle.effective_base, kbs),
             )
             if self.check_if_canceled("Retrieval processing"):
                 return
@@ -220,7 +229,7 @@ class Retrieval(ToolBase, ABC):
                 tenant_id = self._canvas._tenant_id
                 chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
                 chat_mdl = LLMBundle(tenant_id, chat_model_config)
-                cks = await settings.retriever.retrieval_by_toc(query, kbinfos["chunks"], [kb.tenant_id for kb in kbs],
+                cks = await settings.retriever.retrieval_by_toc(query_bundle.effective_base, kbinfos["chunks"], [kb.tenant_id for kb in kbs],
                                                           chat_mdl, self._param.top_n)
                 if self.check_if_canceled("Retrieval processing"):
                     return
@@ -231,7 +240,7 @@ class Retrieval(ToolBase, ABC):
             if self._param.use_kg:
                 tenant_id = self._canvas.get_tenant_id()
                 chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
-                ck = await settings.kg_retriever.retrieval(query,
+                ck = await settings.kg_retriever.retrieval(query_bundle.effective_base,
                                                      [kb.tenant_id for kb in kbs],
                                                      kb_ids,
                                                      embd_mdl,
@@ -245,7 +254,7 @@ class Retrieval(ToolBase, ABC):
 
         if self._param.use_kg and kbs:
             chat_model_config = get_tenant_default_model_by_type(kbs[0].tenant_id, LLMType.CHAT)
-            ck = await settings.kg_retriever.retrieval(query, [kb.tenant_id for kb in kbs], filtered_kb_ids, embd_mdl,
+            ck = await settings.kg_retriever.retrieval(query_bundle.effective_base, [kb.tenant_id for kb in kbs], filtered_kb_ids, embd_mdl,
                                                  LLMBundle(kbs[0].tenant_id, chat_model_config))
             if self.check_if_canceled("Retrieval processing"):
                 return

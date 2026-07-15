@@ -941,7 +941,8 @@ async def search(dataset_id: str, tenant_id: str, req: dict):
     from common.constants import LLMType
     from common.metadata_utils import apply_meta_data_filter
     from rag.app.tag import label_question
-    from rag.prompts.generator import cross_languages, keyword_extraction
+    from rag.prompts.generator import cross_languages_result, retrieval_keyword_expansion
+    from rag.utils.retrieval_query import KeywordExpansionResult, RetrievalQueryBundle
 
     logging.debug(
         "search(dataset=%s, tenant=%s, question_len=%s)",
@@ -1032,9 +1033,8 @@ async def search(dataset_id: str, tenant_id: str, req: dict):
     else:
         return False, "Only owner of dataset authorized for this operation."
 
-    _question = question
-    if langs:
-        _question = await cross_languages(kb.tenant_id, None, _question, langs)
+    cross_language = await cross_languages_result(kb.tenant_id, None, question, langs)
+    _question = cross_language.query
     if kb.embd_id:
         embd_model_config = get_model_config_from_provider_instance(kb.tenant_id, LLMType.EMBEDDING, kb.embd_id)
     else:
@@ -1047,14 +1047,23 @@ async def search(dataset_id: str, tenant_id: str, req: dict):
         rerank_model_config = get_model_config_from_provider_instance(kb.tenant_id, LLMType.RERANK.value, rerank_id)
         rerank_mdl = LLMBundle(kb.tenant_id, rerank_model_config)
 
+    expansion = KeywordExpansionResult(status="disabled")
     if search_config.get("keyword", req.get("keyword", False)):
         default_chat_model_config = get_tenant_default_model_by_type(kb.tenant_id, LLMType.CHAT)
         chat_mdl = LLMBundle(kb.tenant_id, default_chat_model_config)
-        _question += await keyword_extraction(chat_mdl, _question)
+        expansion = await retrieval_keyword_expansion(chat_mdl, _question)
 
-    labels = label_question(_question, [kb])
+    query_bundle = RetrievalQueryBundle.build(
+        question,
+        effective_base=_question,
+        cross_language_status=cross_language.status,
+        cross_language_identity=cross_language.identity,
+        expansion=expansion,
+    )
+
+    labels = label_question(query_bundle.effective_base, [kb])
     ranks = await settings.retriever.retrieval(
-        _question,
+        query_bundle,
         embd_mdl,
         tenant_ids,
         [dataset_id],
@@ -1072,13 +1081,12 @@ async def search(dataset_id: str, tenant_id: str, req: dict):
     if use_kg:
         try:
             default_chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
-            ck = await settings.kg_retriever.retrieval(_question, tenant_ids, [dataset_id], embd_mdl, LLMBundle(kb.tenant_id, default_chat_model_config))
+            ck = await settings.kg_retriever.retrieval(query_bundle.effective_base, tenant_ids, [dataset_id], embd_mdl, LLMBundle(kb.tenant_id, default_chat_model_config))
             if ck["content_with_weight"]:
                 ranks["chunks"].insert(0, ck)
         except Exception:
             logging.warning("search KG retrieval failed: dataset=%s tenant=%s", dataset_id, tenant_id, exc_info=True)
     ranks["chunks"] = settings.retriever.retrieval_by_children(ranks["chunks"], tenant_ids)
-    ranks["total"] = len(ranks["chunks"])
 
     for c in ranks["chunks"]:
         c.pop("vector", None)
@@ -1303,7 +1311,8 @@ async def search_datasets(tenant_id: str, req: dict):
     from common.constants import LLMType
     from common.metadata_utils import apply_meta_data_filter
     from rag.app.tag import label_question
-    from rag.prompts.generator import cross_languages, keyword_extraction
+    from rag.prompts.generator import cross_languages_result, retrieval_keyword_expansion
+    from rag.utils.retrieval_query import KeywordExpansionResult, RetrievalQueryBundle
 
     kb_ids = req.get("dataset_ids", [])
     page = int(req.get("page", 1))
@@ -1404,9 +1413,8 @@ async def search_datasets(tenant_id: str, req: dict):
         return False, "Only owner of datasets authorized for this operation."
 
     kb = kbs[0]
-    _question = question
-    if langs:
-        _question = await cross_languages(kb.tenant_id, None, _question, langs)
+    cross_language = await cross_languages_result(kb.tenant_id, None, question, langs)
+    _question = cross_language.query
     if kb.embd_id:
         embd_model_config = get_model_config_from_provider_instance(kb.tenant_id, LLMType.EMBEDDING, kb.embd_id)
     else:
@@ -1419,14 +1427,23 @@ async def search_datasets(tenant_id: str, req: dict):
         rerank_model_config = get_model_config_from_provider_instance(kb.tenant_id, LLMType.RERANK.value, rerank_id)
         rerank_mdl = LLMBundle(kb.tenant_id, rerank_model_config)
 
+    expansion = KeywordExpansionResult(status="disabled")
     if search_config.get("keyword", req.get("keyword", False)):
         default_chat_model_config = get_tenant_default_model_by_type(kb.tenant_id, LLMType.CHAT)
         chat_mdl = LLMBundle(kb.tenant_id, default_chat_model_config)
-        _question += await keyword_extraction(chat_mdl, _question)
+        expansion = await retrieval_keyword_expansion(chat_mdl, _question)
 
-    labels = label_question(_question, kbs)
+    query_bundle = RetrievalQueryBundle.build(
+        question,
+        effective_base=_question,
+        cross_language_status=cross_language.status,
+        cross_language_identity=cross_language.identity,
+        expansion=expansion,
+    )
+
+    labels = label_question(query_bundle.effective_base, kbs)
     ranks = await settings.retriever.retrieval(
-        _question,
+        query_bundle,
         embd_mdl,
         tenant_ids,
         kb_ids,
@@ -1444,13 +1461,12 @@ async def search_datasets(tenant_id: str, req: dict):
     if use_kg:
         try:
             default_chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
-            ck = await settings.kg_retriever.retrieval(_question, tenant_ids, kb_ids, embd_mdl, LLMBundle(kb.tenant_id, default_chat_model_config))
+            ck = await settings.kg_retriever.retrieval(query_bundle.effective_base, tenant_ids, kb_ids, embd_mdl, LLMBundle(kb.tenant_id, default_chat_model_config))
             if ck["content_with_weight"]:
                 ranks["chunks"].insert(0, ck)
         except Exception:
             logging.warning("search_datasets KG retrieval failed: datasets=%s tenant=%s", kb_ids, tenant_id, exc_info=True)
     ranks["chunks"] = settings.retriever.retrieval_by_children(ranks["chunks"], tenant_ids)
-    ranks["total"] = len(ranks["chunks"])
 
     for c in ranks["chunks"]:
         c.pop("vector", None)

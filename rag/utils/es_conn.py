@@ -201,6 +201,10 @@ class ESConnection(ESConnectionBase):
                 vector_similarity_weight = get_float(weights.split(",")[1])
         for m in match_expressions:
             if isinstance(m, MatchTextExpr):
+                if m.extra_options.get("query_type") == "match_phrase":
+                    bool_query.must.append(Q("multi_match", fields=m.fields, type="phrase", query=m.matching_text, boost=1))
+                    bool_query.boost = 1.0 - vector_similarity_weight
+                    continue
                 minimum_should_match = m.extra_options.get("minimum_should_match", 0.0)
                 if isinstance(minimum_should_match, float):
                     minimum_should_match = str(int(minimum_should_match * 100)) + "%"

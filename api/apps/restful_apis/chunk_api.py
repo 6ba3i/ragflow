@@ -60,7 +60,8 @@ from common.string_utils import is_content_empty, remove_redundant_spaces
 from common.tag_feature_utils import validate_tag_features
 from rag.app.tag import label_question
 from rag.nlp import search
-from rag.prompts.generator import cross_languages, keyword_extraction
+from rag.prompts.generator import cross_languages_result, retrieval_keyword_expansion
+from rag.utils.retrieval_query import KeywordExpansionResult, RetrievalQueryBundle
 
 
 DOC_STOP_PARSING_INVALID_STATE_MESSAGE = "Can't stop parsing document that has not started or already completed"
@@ -303,8 +304,8 @@ async def retrieval_test(tenant_id):
         return get_error_data_result("`question` is required.")
     page = int(req.get("page", 1))
     size = validate_rest_api_page_size(int(req.get("page_size", 30)))
-    question = req["question"].strip() if isinstance(req["question"], str) else req["question"]
-    if not question:
+    raw_question = req["question"].strip() if isinstance(req["question"], str) else req["question"]
+    if not raw_question:
         return get_result(data={"total": 0, "chunks": [], "doc_aggs": {}})
     doc_ids = req.get("document_ids", [])
     use_kg = req.get("use_kg", False)
@@ -356,26 +357,34 @@ async def retrieval_test(tenant_id):
             rerank_model_config = get_model_config_from_provider_instance(kb.tenant_id, LLMType.RERANK, req["rerank_id"])
             rerank_mdl = LLMBundle(kb.tenant_id, rerank_model_config)
 
-        if langs:
-            question = await cross_languages(kb.tenant_id, None, question, langs)
+        cross_language = await cross_languages_result(kb.tenant_id, None, raw_question, langs)
+        effective_question = cross_language.query
+        expansion = KeywordExpansionResult(status="disabled")
         if req.get("keyword", False):
             chat_model_config = get_tenant_default_model_by_type(kb.tenant_id, LLMType.CHAT)
-            question += await keyword_extraction(LLMBundle(kb.tenant_id, chat_model_config), question)
+            expansion = await retrieval_keyword_expansion(LLMBundle(kb.tenant_id, chat_model_config), effective_question)
+        query_bundle = RetrievalQueryBundle.build(
+            raw_question,
+            effective_base=effective_question,
+            cross_language_status=cross_language.status,
+            cross_language_identity=cross_language.identity,
+            expansion=expansion,
+        )
 
         ranks = await settings.retriever.retrieval(
-            question, embd_mdl, tenant_ids, kb_ids, page, size, similarity_threshold,
+            query_bundle, embd_mdl, tenant_ids, kb_ids, page, size, similarity_threshold,
             vector_similarity_weight, top, doc_ids, rerank_mdl=rerank_mdl,
-            highlight=highlight, rank_feature=label_question(question, kbs),
+            highlight=highlight, rank_feature=label_question(query_bundle.effective_base, kbs),
         )
         if toc_enhance:
             chat_model_config = get_tenant_default_model_by_type(kb.tenant_id, LLMType.CHAT)
-            cks = await settings.retriever.retrieval_by_toc(question, ranks["chunks"], tenant_ids, LLMBundle(kb.tenant_id, chat_model_config), size)
+            cks = await settings.retriever.retrieval_by_toc(query_bundle.effective_base, ranks["chunks"], tenant_ids, LLMBundle(kb.tenant_id, chat_model_config), size)
             if cks:
                 ranks["chunks"] = cks
         ranks["chunks"] = settings.retriever.retrieval_by_children(ranks["chunks"], tenant_ids)
         if use_kg:
             chat_model_config = get_tenant_default_model_by_type(kb.tenant_id, LLMType.CHAT)
-            ck = await settings.kg_retriever.retrieval(question, [k.tenant_id for k in kbs], kb_ids, embd_mdl, LLMBundle(kb.tenant_id, chat_model_config))
+            ck = await settings.kg_retriever.retrieval(query_bundle.effective_base, [k.tenant_id for k in kbs], kb_ids, embd_mdl, LLMBundle(kb.tenant_id, chat_model_config))
             if ck["content_with_weight"]:
                 ranks["chunks"].insert(0, ck)
 
@@ -420,7 +429,8 @@ async def list_chunks(tenant_id, dataset_id, document_id):
     req = request.args
     page = int(req.get("page", 1))
     size = validate_rest_api_page_size(int(req.get("page_size", 30)))
-    question = req.get("keywords", "")
+    query_bundle = RetrievalQueryBundle.build(req.get("keywords", ""))
+    question = query_bundle.effective_base
     query = {
         "doc_ids": [document_id],
         "page": page,

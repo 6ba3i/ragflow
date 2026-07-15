@@ -53,6 +53,7 @@ from rag.utils.rag_trace import RagTraceCollector, _now_ms
 from rag.utils.context_builder import EvidenceBundleConfig, apply_context_builder_to_kbinfos, mark_chunks_source_type
 from rag.utils.retrieval_diagnostics import make_retrieval_variant, resolve_variant_knobs
 from rag.utils.retrieval_fusion import FusionConfig
+from rag.utils.retrieval_query import RetrievalQueryBundle, parse_keyword_expansion
 
 
 def _refinement_storage_identity(chunk: dict[str, Any]) -> str:
@@ -62,6 +63,14 @@ def _refinement_storage_identity(chunk: dict[str, Any]) -> str:
     content = str(chunk.get("content_with_weight") or chunk.get("content") or "")
     content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
     return f"doc_content:{doc_id}:{content_hash}"
+
+
+def _agent_query_bundle(question: str, keywords: str) -> RetrievalQueryBundle:
+    terms = tuple(term.strip() for term in re.split(r"[,;\n]+", keywords or "") if term.strip())
+    if not terms:
+        return RetrievalQueryBundle.build(question)
+    expansion = parse_keyword_expansion(json.dumps({"keywords": terms}), question)
+    return RetrievalQueryBundle.build(question, expansion=expansion)
 
 
 def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -297,6 +306,7 @@ class RAGTools:
         similarity_threshold: float,
         docid_scope: list[str] | None,
     ) -> str:
+        query_bundle = _agent_query_bundle(question, keywords)
         return _agentic_fingerprint(
             {
                 "planner_input": planner_input,
@@ -307,6 +317,8 @@ class RAGTools:
                     "top_n": top_n,
                     "similarity_threshold": similarity_threshold,
                     "docid_scope": sorted(docid_scope or []),
+                    "query_bundle": query_bundle,
+                    "retrieval_policy_version": 2,
                 },
                 "scope": {
                     "tenant_ids": sorted(self.tenant_ids),
@@ -1590,9 +1602,7 @@ class RAGTools:
                 and refinement_result.selected_new_evidence_count >= self.agentic_refinement_config.min_new_evidence
             )
 
-            search_terms = keywords.strip() if keywords else ""
-            if not search_terms or using_embedding:
-                search_terms = question
+            query_bundle = _agent_query_bundle(question, keywords)
 
             variant_name = "embedding_retry" if using_embedding else "keyword_first"
             variant = make_retrieval_variant(variant_name)
@@ -1649,7 +1659,7 @@ class RAGTools:
                 embd_mdl = self.embed_mdl if (variant_knobs["using_embedding"] or fusion_config.enabled) else None
                 retrieval_started_ms = _now_ms()
                 kbinfos = await settings.retriever.retrieval(
-                    search_terms,
+                    query_bundle,
                     embd_mdl,
                     self.tenant_ids,
                     self.kb_ids,
@@ -1666,7 +1676,7 @@ class RAGTools:
                 if self.trace:
                     retrieval_call_id = self.trace.add_retrieval_call(
                         mode=mode,
-                        query_text=search_terms,
+                        query_text=query_bundle.effective_base,
                         keywords=keywords,
                         docid_scope=docid_scope,
                         metadata_filters=self.meta_data_filter,

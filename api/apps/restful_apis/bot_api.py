@@ -43,7 +43,8 @@ from api.utils.api_utils import get_error_data_result, get_json_result, \
     add_tenant_id_to_kwargs, get_result, get_request_json, server_error_response, validate_request
 from rag.app.tag import label_question
 from rag.prompts.template import load_prompt
-from rag.prompts.generator import cross_languages, keyword_extraction
+from rag.prompts.generator import cross_languages_result, retrieval_keyword_expansion
+from rag.utils.retrieval_query import KeywordExpansionResult, RetrievalQueryBundle
 from common.constants import RetCode, LLMType, StatusEnum
 from common import settings
 from api.utils.reference_metadata_utils import (
@@ -452,8 +453,8 @@ async def retrieval_test_embedded(tenant_id=None):
         if not e:
             return get_error_data_result(message="Knowledgebase not found!")
 
-        if langs:
-            _question = await cross_languages(kb.tenant_id, None, _question, langs)
+        cross_language = await cross_languages_result(kb.tenant_id, None, _question, langs)
+        _question = cross_language.query
         embd_model_config = await thread_pool_exec(get_model_config_from_provider_instance, kb.tenant_id, LLMType.EMBEDDING, kb.embd_id)
         embd_mdl = LLMBundle(kb.tenant_id, embd_model_config)
 
@@ -462,19 +463,28 @@ async def retrieval_test_embedded(tenant_id=None):
             rerank_model_config = await thread_pool_exec(get_model_config_from_provider_instance, tenant_id, LLMType.RERANK, rerank_id)
             rerank_mdl = LLMBundle(kb.tenant_id, rerank_model_config)
 
+        expansion = KeywordExpansionResult(status="disabled")
         if req.get("keyword", False):
             default_chat_model = await thread_pool_exec(get_tenant_default_model_by_type, kb.tenant_id, LLMType.CHAT)
             chat_mdl = LLMBundle(kb.tenant_id, default_chat_model)
-            _question += await keyword_extraction(chat_mdl, _question)
+            expansion = await retrieval_keyword_expansion(chat_mdl, _question)
 
-        labels = label_question(_question, [kb])
+        query_bundle = RetrievalQueryBundle.build(
+            question,
+            effective_base=_question,
+            cross_language_status=cross_language.status,
+            cross_language_identity=cross_language.identity,
+            expansion=expansion,
+        )
+
+        labels = label_question(query_bundle.effective_base, [kb])
         ranks = await settings.retriever.retrieval(
-            _question, embd_mdl, tenant_ids, kb_ids, page, size, similarity_threshold, vector_similarity_weight, top,
+            query_bundle, embd_mdl, tenant_ids, kb_ids, page, size, similarity_threshold, vector_similarity_weight, top,
             local_doc_ids, rerank_mdl=rerank_mdl, highlight=req.get("highlight"), rank_feature=labels
         )
         if use_kg:
             default_chat_model = await thread_pool_exec(get_tenant_default_model_by_type, kb.tenant_id, LLMType.CHAT)
-            ck = await settings.kg_retriever.retrieval(_question, tenant_ids, kb_ids, embd_mdl,
+            ck = await settings.kg_retriever.retrieval(query_bundle.effective_base, tenant_ids, kb_ids, embd_mdl,
                                                  LLMBundle(kb.tenant_id, default_chat_model))
             if ck["content_with_weight"]:
                 ranks["chunks"].insert(0, ck)

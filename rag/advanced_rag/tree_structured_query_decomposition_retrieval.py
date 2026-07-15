@@ -20,6 +20,7 @@ from api.db.services.llm_service import LLMBundle
 from rag.prompts import kb_prompt
 from rag.prompts.generator import sufficiency_check, multi_queries_gen
 from rag.utils.tavily_conn import Tavily
+from rag.utils.retrieval_query import RetrievalQueryBundle
 from timeit import default_timer as timer
 
 
@@ -40,10 +41,12 @@ class TreeStructuredQueryDecompositionRetrieval:
 
     async def _retrieve_information(self, search_query):
         """Retrieve information from different sources"""
+        query_bundle = search_query if isinstance(search_query, RetrievalQueryBundle) else RetrievalQueryBundle.build(search_query)
+        query_text = query_bundle.effective_base
         # 1. Knowledge base retrieval
         kbinfos = {"total": 0, "chunks": [], "doc_aggs": []}
         try:
-            kbinfos = await self._kb_retrieve(question=search_query) if self._kb_retrieve else {"total": 0, "chunks": [], "doc_aggs": []}
+            kbinfos = await self._kb_retrieve(question=query_bundle) if self._kb_retrieve else {"total": 0, "chunks": [], "doc_aggs": []}
             kbinfos.setdefault("total", 0)
         except Exception as e:
             logging.error(f"Knowledge base retrieval error: {e}")
@@ -52,7 +55,7 @@ class TreeStructuredQueryDecompositionRetrieval:
         try:
             if self.internet_enabled and self.prompt_config.get("tavily_api_key"):
                 tav = Tavily(self.prompt_config["tavily_api_key"])
-                tav_res = tav.retrieve_chunks(search_query)
+                tav_res = tav.retrieve_chunks(query_text)
                 kbinfos["chunks"].extend(tav_res["chunks"])
                 kbinfos["doc_aggs"].extend(tav_res["doc_aggs"])
         except Exception as e:
@@ -61,7 +64,7 @@ class TreeStructuredQueryDecompositionRetrieval:
         # 3. Knowledge graph retrieval (if configured)
         try:
             if self.prompt_config.get("use_kg") and self._kg_retrieve:
-                ck = await self._kg_retrieve(question=search_query)
+                ck = await self._kg_retrieve(question=query_text)
                 if ck["content_with_weight"]:
                     kbinfos["chunks"].insert(0, ck)
         except Exception as e:
@@ -106,10 +109,12 @@ class TreeStructuredQueryDecompositionRetrieval:
             #if callback:
             #    await callback("Reach the max search depth.")
             return ""
+        query_bundle = query if isinstance(query, RetrievalQueryBundle) else RetrievalQueryBundle.build(query)
+        query_text = query_bundle.effective_base
         if callback:
-            await callback(f"Searching by `{query}`...")
+            await callback(f"Searching by `{query_text}`...")
         st = timer()
-        ret = await self._retrieve_information(query)
+        ret = await self._retrieve_information(query_bundle)
         if callback:
             await callback("Retrieval %d results in %.1fms"%(len(ret["chunks"]), (timer()-st)*1000))
         await self._async_update_chunk_info(chunk_info, ret)
@@ -125,7 +130,7 @@ class TreeStructuredQueryDecompositionRetrieval:
 
         #if callback:
         #    await callback("The retrieved information is not sufficient. Planing next steps...")
-        succ_question_info = await multi_queries_gen(self.chat_mdl, question, query, suff.get("missing_information", []), ret)
+        succ_question_info = await multi_queries_gen(self.chat_mdl, question, query_text, suff.get("missing_information", []), ret)
         if callback:
             await callback("Next step is to search for the following questions:</br> - " + "</br> - ".join(step["question"] for step in succ_question_info["questions"]))
         steps = []

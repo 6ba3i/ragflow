@@ -34,6 +34,7 @@ _TRACE_SCHEMA_VERSION = "rag_trace.v1"
 _SENSITIVE_KEY_PARTS = ("api_key", "apikey", "secret", "password", "authorization", "credential")
 _SENSITIVE_EXACT_KEYS = {"token", "access_token", "refresh_token", "id_token", "auth_token", "api_token", "bearer_token"}
 _VECTOR_KEY_PARTS = ("vector", "embedding")
+_CONTENT_KEYS_TO_OMIT = {"body", "content", "content_ltks", "content_with_weight", "text"}
 _TEXT_KEYS_TO_TRUNCATE = {"question", "query", "keywords", "model_name", "model_provider", "error"}
 _MAX_TEXT_LEN = 512
 _MAX_LIST_ITEMS = 32
@@ -64,9 +65,11 @@ def sanitize_for_trace(value: Any, *, key: str | None = None, depth: int = 0) ->
     """Return a JSON-safe, redacted, bounded representation for traces."""
     if key and _is_sensitive_key(key):
         return "<redacted>"
+    if key and key.lower() in _CONTENT_KEYS_TO_OMIT:
+        return _OMIT
     if key and _is_vector_key(key) and not (value is None or isinstance(value, (bool, int, float, str))):
         return _OMIT
-    if depth > 6:
+    if depth > 8:
         return "<omitted:depth>"
     if value is None or isinstance(value, (bool, int)):
         return value
@@ -121,6 +124,8 @@ def summarize_chunks(chunks: list[dict[str, Any]] | None) -> list[dict[str, Any]
     for chunk in chunks or []:
         raw_agentic = chunk.get("_ragflow_agentic_retrieval")
         agentic: dict[str, Any] = raw_agentic if isinstance(raw_agentic, dict) else {}
+        raw_fusion = chunk.get("_ragflow_fusion")
+        fusion: dict[str, Any] = raw_fusion if isinstance(raw_fusion, dict) else {}
         item = {
             "chunk_id": chunk.get("chunk_id") or chunk.get("id"),
             "doc_id": chunk.get("doc_id"),
@@ -134,6 +139,24 @@ def summarize_chunks(chunks: list[dict[str, Any]] | None) -> list[dict[str, Any]
             "merge_rank": chunk.get("merge_rank") or agentic.get("merge_rank"),
             "selected_for_context": chunk.get("selected_for_context") if chunk.get("selected_for_context") is not None else agentic.get("selected_for_context"),
             "rejection_reason": chunk.get("rejection_reason") or agentic.get("rejection_reason"),
+            "fusion_lineage": {
+                key: fusion.get(key)
+                for key in (
+                    "candidate_id",
+                    "fused_rank",
+                    "fused_score",
+                    "lane_ranks",
+                    "lane_contributions",
+                    "lane_reservations",
+                    "pre_rerank_rank",
+                    "pre_rerank_score",
+                    "rerank_rank",
+                    "rerank_score",
+                    "rerank_query_hash",
+                    "rerank_fallback_reason",
+                )
+                if fusion.get(key) is not None
+            },
         }
         for key in ("iteration_id", "followup_id"):
             value = chunk.get(key) or agentic.get(key)

@@ -171,6 +171,11 @@ class OBConnectionBase(DocStoreConnection):
     def db_type(self) -> str:
         return "oceanbase"
 
+    def supports_match_phrase(self) -> bool:
+        # The native SQL full-text path does not expose stable phrase semantics
+        # across supported OceanBase versions. Its ES-compatible client does.
+        return self.es is not None
+
     def health(self) -> dict:
         return {
             "uri": self.uri,

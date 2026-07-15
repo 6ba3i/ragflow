@@ -152,6 +152,11 @@ class DocStoreConnection(ABC):
         """
         raise NotImplementedError("Not implemented")
 
+    def supports_match_phrase(self) -> bool:
+        """Return whether MatchTextExpr can enforce ordered phrase semantics."""
+
+        return False
+
     @abstractmethod
     def health(self) -> dict:
         """

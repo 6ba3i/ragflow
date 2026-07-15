@@ -48,12 +48,13 @@ from rag.graphrag.general.mind_map_extractor import MindMapExtractor
 from rag.advanced_rag import DeepResearcher
 from rag.app.tag import label_question
 from rag.nlp.search import index_name
-from rag.prompts.generator import chunks_format, citation_prompt, cross_languages, full_question, kb_prompt, keyword_extraction, message_fit_in, PROMPT_JINJA_ENV, ASK_SUMMARY
+from rag.prompts.generator import chunks_format, citation_prompt, cross_languages_result, full_question, kb_prompt, retrieval_keyword_expansion, message_fit_in, PROMPT_JINJA_ENV, ASK_SUMMARY
 from common.token_utils import num_tokens_from_string
 from rag.utils.tavily_conn import Tavily
 from rag.utils.tts_cache import synthesize_with_cache
 from rag.utils.rag_trace import RagTraceCollector, _now_ms
 from rag.utils.context_builder import EvidenceBundleConfig, apply_context_builder_to_kbinfos, mark_chunks_source_type
+from rag.utils.retrieval_query import KeywordExpansionResult, RetrievalQueryBundle
 from common.string_utils import remove_redundant_spaces
 from common import settings
 
@@ -680,13 +681,14 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         if p["key"] not in kwargs:
             prompt_config["system"] = prompt_config["system"].replace("{%s}" % p["key"], " ")
 
+    raw_question = questions[-1]
     if len(questions) > 1 and prompt_config.get("refine_multiturn"):
         questions = [await full_question(dialog.tenant_id, dialog.llm_id, messages)]
     else:
         questions = questions[-1:]
 
-    if prompt_config.get("cross_languages"):
-        questions = [await cross_languages(dialog.tenant_id, dialog.llm_id, questions[0], prompt_config["cross_languages"])]
+    cross_language = await cross_languages_result(dialog.tenant_id, dialog.llm_id, questions[0], prompt_config.get("cross_languages"))
+    questions = [cross_language.query]
 
     if dialog.meta_data_filter:
         attachments = await apply_meta_data_filter(
@@ -699,8 +701,17 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
             metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs(dialog.kb_ids),
         )
 
+    effective_question = " ".join(questions)
+    expansion = KeywordExpansionResult(status="disabled")
     if prompt_config.get("keyword", False):
-        questions[-1] = questions[-1] + "," + await keyword_extraction(chat_mdl, questions[-1])
+        expansion = await retrieval_keyword_expansion(chat_mdl, effective_question)
+    query_bundle = RetrievalQueryBundle.build(
+        raw_question,
+        effective_base=effective_question,
+        cross_language_status=cross_language.status,
+        cross_language_identity=cross_language.identity,
+        expansion=expansion,
+    )
     refine_question_ts = timer()
 
     thought = ""
@@ -735,7 +746,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                 await queue.put(msg + "<br/>")
 
             await callback("<START_DEEP_RESEARCH>")
-            task = asyncio.create_task(reasoner.research(kbinfos, questions[-1], questions[-1], callback=callback))
+            task = asyncio.create_task(reasoner.research(kbinfos, questions[-1], query_bundle, callback=callback))
             while True:
                 msg = await queue.get()
                 if msg.find("<START_DEEP_RESEARCH>") == 0:
@@ -752,7 +763,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
             if embd_mdl:
                 retrieval_started_ms = _now_ms()
                 kbinfos = await retriever.retrieval(
-                    " ".join(questions),
+                    query_bundle,
                     embd_mdl,
                     tenant_ids,
                     dialog.kb_ids,
@@ -764,17 +775,17 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                     top=dialog.top_k,
                     aggs=True,
                     rerank_mdl=rerank_mdl,
-                    rank_feature=label_question(" ".join(questions), kbs),
+                    rank_feature=label_question(query_bundle.effective_base, kbs),
                 )
                 if prompt_config.get("toc_enhance"):
-                    cks = await retriever.retrieval_by_toc(" ".join(questions), kbinfos["chunks"], tenant_ids, chat_mdl, dialog.top_n)
+                    cks = await retriever.retrieval_by_toc(query_bundle.effective_base, kbinfos["chunks"], tenant_ids, chat_mdl, dialog.top_n)
                     if cks:
                         kbinfos["chunks"] = cks
                 kbinfos["chunks"] = retriever.retrieval_by_children(kbinfos["chunks"], tenant_ids)
                 if rag_trace:
                     retrieval_call_id = rag_trace.add_retrieval_call(
                         mode="normal",
-                        query_text=" ".join(questions),
+                        query_text=query_bundle.effective_base,
                         docid_scope=attachments,
                         metadata_filters=dialog.meta_data_filter,
                         chunks=kbinfos.get("chunks", []),
@@ -795,7 +806,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
             if use_web_search:
                 web_started_ms = _now_ms()
                 tav = Tavily(prompt_config["tavily_api_key"])
-                tav_res = tav.retrieve_chunks(" ".join(questions))
+                tav_res = tav.retrieve_chunks(query_bundle.effective_base)
                 if context_builder_config.enabled:
                     mark_chunks_source_type(tav_res.get("chunks", []), "web")
                 kbinfos["chunks"].extend(tav_res["chunks"])
@@ -803,7 +814,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                 if rag_trace:
                     web_retrieval_call_id = rag_trace.add_retrieval_call(
                         mode="web",
-                        query_text=" ".join(questions),
+                        query_text=query_bundle.effective_base,
                         chunks=tav_res.get("chunks", []),
                         doc_aggs=tav_res.get("doc_aggs", []),
                         used_web=True,
@@ -813,7 +824,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
             if prompt_config.get("use_kg"):
                 default_chat_model = get_tenant_default_model_by_type(dialog.tenant_id, LLMType.CHAT)
                 ck = await settings.kg_retriever.retrieval(
-                    " ".join(questions), tenant_ids, dialog.kb_ids, embd_mdl, LLMBundle(dialog.tenant_id, default_chat_model, trace_context=trace_context, langfuse_session_id=session_id)
+                    query_bundle.effective_base, tenant_ids, dialog.kb_ids, embd_mdl, LLMBundle(dialog.tenant_id, default_chat_model, trace_context=trace_context, langfuse_session_id=session_id)
                 )
                 if ck["content_with_weight"]:
                     kbinfos["chunks"].insert(0, ck)
@@ -826,7 +837,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         )
         _enrich_chunks_with_document_metadata(kbinfos.get("chunks", []), metadata_fields)
 
-    context_result = apply_context_builder_to_kbinfos(kbinfos, context_builder_config, query=" ".join(questions))
+    context_result = apply_context_builder_to_kbinfos(kbinfos, context_builder_config, query=query_bundle.effective_base)
     if rag_trace:
         if context_result.bundle:
             rag_trace.add_context_builder_summary(context_result.bundle.summary(), stage="async_chat.prompt")
@@ -835,7 +846,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
     kbinfos = context_result.kbinfos
 
     knowledges = kb_prompt(kbinfos, max_tokens)
-    logging.debug("{}->{}".format(" ".join(questions), "\n->".join(knowledges)))
+    logging.debug("{}->{}".format(query_bundle.effective_base, "\n->".join(knowledges)))
 
     retrieval_ts = timer()
     if not knowledges and prompt_config.get("empty_response"):

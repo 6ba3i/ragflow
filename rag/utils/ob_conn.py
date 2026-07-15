@@ -576,8 +576,15 @@ class OBConnection(OBConnectionBase):
             chunks=[],
         )
 
+        # Phrase queries require the ES-compatible client; the native SQL path
+        # intentionally fails closed below because its semantics vary by version.
+        phrase_search = any(
+            isinstance(expr, MatchTextExpr) and expr.extra_options.get("query_type") == "match_phrase"
+            for expr in match_expressions
+        )
+
         # copied from es_conn.py
-        if len(match_expressions) == 3 and self.es:
+        if self.es and (len(match_expressions) == 3 or phrase_search):
             bqry = Q("bool", must=[])
             condition["kb_id"] = knowledgebase_ids
             for k, v in condition.items():
@@ -610,6 +617,10 @@ class OBConnection(OBConnectionBase):
                     vector_similarity_weight = get_float(weights.split(",")[1])
             for m in match_expressions:
                 if isinstance(m, MatchTextExpr):
+                    if m.extra_options.get("query_type") == "match_phrase":
+                        bqry.must.append(Q("multi_match", fields=m.fields, type="phrase", query=m.matching_text, boost=1))
+                        bqry.boost = 1.0 - vector_similarity_weight
+                        continue
                     minimum_should_match = m.extra_options.get("minimum_should_match", 0.0)
                     if isinstance(minimum_should_match, float):
                         minimum_should_match = str(int(minimum_should_match * 100)) + "%"
@@ -725,6 +736,8 @@ class OBConnection(OBConnectionBase):
 
         for m in match_expressions:
             if isinstance(m, MatchTextExpr):
+                if m.extra_options.get("query_type") == "match_phrase":
+                    raise NotImplementedError("Native OceanBase full-text search does not guarantee match_phrase semantics")
                 if "original_query" not in m.extra_options:
                     raise ValueError("'original_query' is missing in extra_options.")
                 fulltext_query = m.extra_options["original_query"]

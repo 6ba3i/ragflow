@@ -67,6 +67,9 @@ class ESConnectionBase(DocStoreConnection):
     def db_type(self) -> str:
         return "elasticsearch"
 
+    def supports_match_phrase(self) -> bool:
+        return True
+
     def health(self) -> dict:
         health_dict = dict(self.es.cluster.health())
         health_dict["type"] = "elasticsearch"

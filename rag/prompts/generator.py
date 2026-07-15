@@ -19,7 +19,8 @@ import json
 import logging
 import re
 from copy import deepcopy
-from typing import Tuple
+from dataclasses import dataclass
+from typing import Literal, Tuple
 from jinja2.sandbox import SandboxedEnvironment
 import json_repair
 
@@ -193,6 +194,7 @@ CROSS_LANGUAGES_SYS_PROMPT_TEMPLATE = load_prompt("cross_languages_sys_prompt")
 CROSS_LANGUAGES_USER_PROMPT_TEMPLATE = load_prompt("cross_languages_user_prompt")
 FULL_QUESTION_PROMPT_TEMPLATE = load_prompt("full_question_prompt")
 KEYWORD_PROMPT_TEMPLATE = load_prompt("keyword_prompt")
+RETRIEVAL_KEYWORD_PROMPT_TEMPLATE = load_prompt("retrieval_keyword_prompt")
 QUESTION_PROMPT_TEMPLATE = load_prompt("question_prompt")
 VISION_LLM_DESCRIBE_PROMPT = load_prompt("vision_llm_describe_prompt")
 VISION_LLM_FIGURE_DESCRIBE_PROMPT = load_prompt("vision_llm_figure_describe_prompt")
@@ -234,6 +236,29 @@ async def keyword_extraction(chat_mdl, content, topn=3):
     if kwd.find("**ERROR**") >= 0:
         return ""
     return kwd
+
+
+async def retrieval_keyword_expansion(chat_mdl, content, topn=3):
+    from rag.utils.retrieval_query import KeywordExpansionResult, parse_keyword_expansion
+
+    topn = max(0, min(int(topn), 8))
+    template = PROMPT_JINJA_ENV.from_string(RETRIEVAL_KEYWORD_PROMPT_TEMPLATE)
+    rendered_prompt = template.render(content=content, topn=topn)
+    msg = [{"role": "system", "content": rendered_prompt}, {"role": "user", "content": "Output: "}]
+    _, msg = message_fit_in(msg, chat_mdl.max_length)
+    try:
+        raw = await chat_mdl.async_chat(rendered_prompt, msg[1:], {"temperature": 0.0})
+    except Exception as exc:
+        logging.warning("retrieval keyword expansion failed failure_class=%s", _bounded_exception_class(exc))
+        return KeywordExpansionResult(status="failed", reason="provider_error")
+    if isinstance(raw, tuple):
+        raw = raw[0] if raw else None
+    if not isinstance(raw, str):
+        return parse_keyword_expansion(raw, content, max_terms=topn)
+    raw = re.sub(r"^.*</think>", "", raw, flags=re.DOTALL)
+    if "**ERROR**" in raw:
+        return KeywordExpansionResult(status="failed", reason="provider_error")
+    return parse_keyword_expansion(raw, content, max_terms=topn)
 
 
 async def question_proposal(chat_mdl, content, topn=3):
@@ -287,29 +312,61 @@ async def full_question(tenant_id=None, llm_id=None, messages=[], language=None,
     return ans if ans.find("**ERROR**") < 0 else messages[-1]["content"]
 
 
-async def cross_languages(tenant_id, llm_id, query, languages=[]):
+def _bounded_exception_class(exc: Exception) -> str:
+    name = re.sub(r"[^A-Za-z0-9_]", "_", type(exc).__name__)[:64]
+    return name or "Exception"
+
+
+@dataclass(frozen=True)
+class CrossLanguageResult:
+    query: str
+    status: Literal["disabled", "applied", "failed"]
+    identity: str | None = None
+
+
+async def cross_languages_result(tenant_id, llm_id, query, languages=None):
+    original_query = str(query or "")
+    requested_languages = tuple(str(language).strip() for language in (languages or []) if str(language).strip())
+    identity = ",".join(requested_languages) or None
+    if identity is None:
+        return CrossLanguageResult(query=original_query, status="disabled")
+
     from common.constants import LLMType
     from api.db.services.llm_service import LLMBundle
     from api.db.joint_services.tenant_model_service import get_model_config_from_provider_instance, get_tenant_default_model_by_type, get_model_type_by_name
 
-    if llm_id and "image2text" in get_model_type_by_name(tenant_id, llm_id):
-        chat_model_config = get_model_config_from_provider_instance(tenant_id, LLMType.IMAGE2TEXT, llm_id)
-    else:
-        if not llm_id:
-            chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
+    try:
+        if llm_id and "image2text" in get_model_type_by_name(tenant_id, llm_id):
+            chat_model_config = get_model_config_from_provider_instance(tenant_id, LLMType.IMAGE2TEXT, llm_id)
         else:
-            chat_model_config = get_model_config_from_provider_instance(tenant_id, LLMType.CHAT, llm_id)
-    chat_mdl = LLMBundle(tenant_id, chat_model_config)
-    rendered_sys_prompt = PROMPT_JINJA_ENV.from_string(CROSS_LANGUAGES_SYS_PROMPT_TEMPLATE).render()
-    rendered_user_prompt = PROMPT_JINJA_ENV.from_string(CROSS_LANGUAGES_USER_PROMPT_TEMPLATE).render(query=query, languages=languages)
+            if not llm_id:
+                chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
+            else:
+                chat_model_config = get_model_config_from_provider_instance(tenant_id, LLMType.CHAT, llm_id)
+        chat_mdl = LLMBundle(tenant_id, chat_model_config)
+        rendered_sys_prompt = PROMPT_JINJA_ENV.from_string(CROSS_LANGUAGES_SYS_PROMPT_TEMPLATE).render()
+        rendered_user_prompt = PROMPT_JINJA_ENV.from_string(CROSS_LANGUAGES_USER_PROMPT_TEMPLATE).render(query=original_query, languages=requested_languages)
+        ans = await chat_mdl.async_chat(rendered_sys_prompt, [{"role": "user", "content": rendered_user_prompt}], {"temperature": 0.2})
+    except Exception as exc:
+        logging.warning("cross-language translation failed failure_class=%s", _bounded_exception_class(exc))
+        return CrossLanguageResult(query=original_query, status="failed", identity=identity)
 
-    ans = await chat_mdl.async_chat(rendered_sys_prompt, [{"role": "user", "content": rendered_user_prompt}], {"temperature": 0.2})
-    if ans.find("**ERROR**") >= 0:
-        logging.info("[cross_languages] LLM returned error, falling back to original query")
-        return query
+    if isinstance(ans, tuple):
+        ans = ans[0] if ans else None
+    if not isinstance(ans, str) or "**ERROR**" in ans:
+        return CrossLanguageResult(query=original_query, status="failed", identity=identity)
     ans = re.sub(r"^.*\*\*ERROR\*\*", "", ans, flags=re.DOTALL)
     result = "\n".join([a for a in re.sub(r"(^Output:|\n+)", "", ans, flags=re.DOTALL).split("===") if a.strip()])
-    return result
+    result = result.strip()
+    if not result:
+        return CrossLanguageResult(query=original_query, status="failed", identity=identity)
+    return CrossLanguageResult(query=result, status="applied", identity=identity)
+
+
+async def cross_languages(tenant_id, llm_id, query, languages=None):
+    """Return translated text for legacy callers while failing closed to the input."""
+
+    return (await cross_languages_result(tenant_id, llm_id, query, languages)).query
 
 
 async def content_tagging(chat_mdl, content, all_tags, examples, topn=3):
