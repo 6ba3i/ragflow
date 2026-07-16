@@ -13,6 +13,8 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+from __future__ import annotations
+
 import asyncio
 import inspect
 import logging
@@ -451,6 +453,79 @@ class LLMBundle(LLM4Tenant):
             generation.end()
 
         return txt
+
+    async def async_structured_output(
+        self,
+        system: str,
+        history: list,
+        schema: dict,
+        *,
+        mode=None,
+        gen_conf: dict | None = None,
+        tool_name: str = "structured_output",
+    ):
+        from rag.advanced_rag.structured_output import StructuredOutputMode, StructuredOutputResult
+
+        declared_mode = getattr(self.mdl, "structured_output_mode", StructuredOutputMode.TEXT_ONLY)
+        requested_mode = StructuredOutputMode(mode or declared_mode)
+        native_fn = getattr(self.mdl, "async_structured_output", None)
+
+        generation = None
+        if self.langfuse:
+            generation = self._start_langfuse_observation(
+                trace_context=self.trace_context,
+                as_type="generation",
+                name="structured_output",
+                model=self.model_config["llm_name"],
+                input={"system": system, "history": history, "mode": requested_mode.value},
+            )
+
+        self._reset_last_usage()
+        try:
+            if native_fn is not None:
+                result = await native_fn(
+                    system,
+                    history,
+                    schema,
+                    mode=requested_mode,
+                    gen_conf=dict(gen_conf or {}),
+                    tool_name=tool_name,
+                )
+            else:
+                if not hasattr(self.mdl, "async_chat"):
+                    raise RuntimeError(f"Model {self.mdl} does not implement async_structured_output or async_chat")
+                display_text, used_tokens = await self.mdl.async_chat(system, history, dict(gen_conf or {}))
+                result = StructuredOutputResult(
+                    mode=StructuredOutputMode.TEXT_ONLY,
+                    structured_payload=None,
+                    display_text=display_text,
+                    used_tokens=used_tokens,
+                )
+        except asyncio.CancelledError:
+            if generation:
+                generation.update(output={"cancelled": True})
+                generation.end()
+            raise
+        except Exception as exc:
+            if generation:
+                generation.update(output={"error": str(exc)})
+                generation.end()
+            raise
+
+        if result.used_tokens:
+            logging.info("LLMBundle.async_structured_output used_tokens: %d", result.used_tokens)
+        usage_details = self._report_usage(result.used_tokens)
+        if generation:
+            generation.update(
+                output={
+                    "mode": result.mode.value,
+                    "display_text": result.display_text,
+                    "has_structured_payload": result.structured_payload is not None,
+                },
+                usage_details=usage_details,
+            )
+            generation.end()
+        return result
 
     async def async_chat_streamly(self, system: str, history: list, gen_conf: dict = {}, **kwargs):
         total_tokens = 0

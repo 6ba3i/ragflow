@@ -34,6 +34,11 @@ _FALSE_VALUES = {"0", "false", "no", "off"}
 _MAX_TRACE_IDS = 128
 _TRACE_CONTENT_PREVIEW = 120
 _STRONG_RELEVANCE_THRESHOLD = 0.5
+_SCORE_FAMILY_BY_FIELD = {
+    "vector_similarity": "dense_similarity",
+    "term_similarity": "lexical_similarity",
+}
+_COMPARABLE_SCORE_SCALES = {"unit_interval", "cosine_similarity"}
 
 
 @dataclass(frozen=True)
@@ -129,6 +134,10 @@ class EvidenceBundle:
     priority_boost_strength_counts: dict[str, int] = field(default_factory=dict)
     low_relevance_preserved_count: int = 0
     low_relevance_bypass_reason_counts: dict[str, int] = field(default_factory=dict)
+    relevance_decision_counts: dict[str, int] = field(default_factory=dict)
+    per_source_base_limits: dict[str, int] = field(default_factory=dict)
+    per_source_effective_limits: dict[str, int] = field(default_factory=dict)
+    source_cap_expansion_reasons: dict[str, list[str]] = field(default_factory=dict)
 
     def summary(self) -> dict[str, Any]:
         rejection_counts = Counter(r.rejection_reason or "unknown" for r in self.rejected)
@@ -148,6 +157,7 @@ class EvidenceBundle:
         ]
         estimated_tokens = sum(_estimate_tokens(r.content) for r in self.selected)
         agentic_lineage = _agentic_lineage_summary(self.records, self.selected, self.rejected)
+        provenance_counts = _score_provenance_counts(self.records)
         summary = {
             "enabled": self.config.enabled,
             "candidate_evidence_count": len(self.records),
@@ -163,13 +173,26 @@ class EvidenceBundle:
             "max_chunks_per_source": self.config.max_chunks_per_source,
             "max_source_fraction": self.config.max_source_fraction,
             "relevance_filter_enabled": self.config.relevance_filter_enabled,
-            **({
-                "min_vector_similarity": self.config.min_vector_similarity,
-                "min_term_similarity": self.config.min_term_similarity,
-                "low_relevance_rejected_count": rejection_counts.get("low_relevance", 0),
-            } if self.config.relevance_filter_enabled else {"low_relevance_rejected_count": rejection_counts.get("low_relevance", 0)}),
+            **(
+                {
+                    "min_vector_similarity": self.config.min_vector_similarity,
+                    "min_term_similarity": self.config.min_term_similarity,
+                    "low_relevance_rejected_count": rejection_counts.get("low_relevance", 0),
+                }
+                if self.config.relevance_filter_enabled
+                else {"low_relevance_rejected_count": rejection_counts.get("low_relevance", 0)}
+            ),
             "low_relevance_preserved_count": self.low_relevance_preserved_count,
             "low_relevance_bypass_reason_counts": dict(sorted(self.low_relevance_bypass_reason_counts.items())),
+            "selected_evidence_ids": [r.evidence_id for r in self.selected[:_MAX_TRACE_IDS]],
+            "per_source_selected_counts": dict(sorted((str(k), v) for k, v in per_source_selected.items())),
+            "relevance_decision_counts": dict(sorted(self.relevance_decision_counts.items())),
+            "score_provenance_counts": provenance_counts,
+            "source_cap_policy": {
+                "base_limits": dict(sorted(self.per_source_base_limits.items())),
+                "effective_limits": dict(sorted(self.per_source_effective_limits.items())),
+                "expansion_reasons": {key: list(reasons) for key, reasons in sorted(self.source_cap_expansion_reasons.items())},
+            },
             "query_feature_flags": dict(sorted(self.query_feature_flags.items())),
             "priority_boosted_count": len(self.priority_boosted_evidence_ids),
             "priority_boosted_evidence_ids": self.priority_boosted_evidence_ids[:_MAX_TRACE_IDS],
@@ -177,12 +200,15 @@ class EvidenceBundle:
             "primary_document_ids": self.primary_document_ids[:_MAX_TRACE_IDS],
             "per_document_effective_limits": dict(sorted((str(k), v) for k, v in self.per_document_effective_limits.items())),
             "primary_doc_extra_selected_count": self.primary_doc_extra_selected_count,
-            "selected_evidence_ids": [r.evidence_id for r in self.selected[:_MAX_TRACE_IDS]],
             "citation_index_mapping": citation_mapping,
             "source_type_counts": dict(sorted(source_counts.items())),
             "selected_source_type_counts": dict(sorted(selected_source_counts.items())),
             "per_document_selected_counts": dict(sorted((str(k), v) for k, v in per_doc_selected.items())),
-            "per_source_selected_counts": dict(sorted((str(k), v) for k, v in per_source_selected.items())),
+            "per_source_base_limits": dict(sorted(self.per_source_base_limits.items())),
+            "per_source_effective_limits": dict(sorted(self.per_source_effective_limits.items())),
+            "source_cap_expansion_reasons": {key: list(reasons) for key, reasons in sorted(self.source_cap_expansion_reasons.items())},
+            # Compatibility alias for trace consumers that adopted the plan name.
+            "per_source_expansion_reasons": {key: list(reasons) for key, reasons in sorted(self.source_cap_expansion_reasons.items())},
             "estimated_context_tokens": estimated_tokens,
         }
         if agentic_lineage:
@@ -277,6 +303,45 @@ def _position_from_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _score_provenance_from_chunk(chunk: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    raw = chunk.get("_ragflow_score_provenance")
+    if isinstance(raw, dict):
+        return {str(score_name): _normalize_score_provenance(score_name, provenance) for score_name, provenance in raw.items() if isinstance(score_name, str)}
+
+    # Untagged legacy scores have no trustworthy family or scale contract.
+    inferred: dict[str, dict[str, Any]] = {}
+    for score_name in (*_SCORE_FAMILY_BY_FIELD, "similarity", "score", "final_score", "fusion_score", "reranker_score"):
+        if chunk.get(score_name) is None:
+            continue
+        inferred[score_name] = {
+            "family": "unknown",
+            "scale": "unknown",
+            "calibrated": False,
+            "source": "legacy_untyped_score",
+        }
+    return inferred
+
+
+def _normalize_score_provenance(score_name: str, provenance: Any) -> dict[str, Any]:
+    if not isinstance(provenance, dict):
+        return {
+            "family": "unknown",
+            "scale": "unknown",
+            "calibrated": False,
+            "source": "invalid_provenance",
+        }
+    normalized = {
+        "family": str(provenance.get("family") or "unknown"),
+        "scale": str(provenance.get("scale") or "unknown"),
+        "calibrated": provenance.get("calibrated") is True,
+        "source": str(provenance.get("source") or "unknown"),
+    }
+    rank = provenance.get("rank")
+    if isinstance(rank, int) and rank > 0:
+        normalized["rank"] = rank
+    return normalized
+
+
 def _scores_from_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
     final_score = chunk.get("final_score", chunk.get("score", chunk.get("similarity")))
     return {
@@ -286,6 +351,9 @@ def _scores_from_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
         "vector_similarity": chunk.get("vector_similarity"),
         "rank_feature_score": chunk.get("rank_feature_score") or chunk.get("pagerank_fea") or chunk.get("rank_feature"),
         "final_score": final_score,
+        "fusion_score": chunk.get("fusion_score"),
+        "reranker_score": chunk.get("reranker_score"),
+        "score_provenance": _score_provenance_from_chunk(chunk),
     }
 
 
@@ -363,9 +431,11 @@ def build_context_bundle(
 
     low_relevance_preserved_count = 0
     low_relevance_bypass_reason_counts: Counter[str] = Counter()
+    relevance_decision_counts: Counter[str] = Counter()
     relevance_kept: list[EvidenceRecord] = []
     for record in ordered:
-        is_low_relevance = _is_low_relevance(record, config)
+        is_low_relevance, relevance_decision = _relevance_assessment(record, config)
+        relevance_decision_counts[relevance_decision] += 1
         bypass_reasons = _low_relevance_bypass_reasons(record, record.rank, config, query_features) if is_low_relevance else []
         if is_low_relevance and not bypass_reasons:
             _reject(record, "low_relevance", rejected)
@@ -386,10 +456,22 @@ def build_context_bundle(
     primary_source_reasons = _primary_source_candidate_reasons(ordered, config, query_features, primary_doc_reasons)
     effective_doc_limits = _effective_doc_limits(ordered, config, primary_doc_ids)
 
-    if config.diversity_enabled and config.diversity_strategy == "source_round_robin":
-        ordered = _round_robin_by_source(ordered)
-
     source_limit = _source_limit(config)
+    source_base_limits, source_effective_limits, source_expansion_reasons = _effective_source_limits(
+        ordered,
+        config,
+        primary_doc_ids,
+        primary_doc_reasons,
+        primary_source_reasons,
+        source_limit,
+        query_features,
+    )
+
+    if config.diversity_enabled and config.diversity_strategy == "source_round_robin":
+        pre_diversity_order = list(ordered)
+        ordered = _round_robin_by_source(ordered)
+        ordered = _preserve_protected_lineage_prefix(pre_diversity_order, ordered, config.max_chunks)
+
     per_source: defaultdict[str, int] = defaultdict(int)
     primary_doc_extra_selected_count = 0
 
@@ -408,7 +490,7 @@ def build_context_bundle(
             source_limit,
             query_features,
         )
-        if config.diversity_enabled and record_source_limit is not None and record.source_type == "kb" and per_source[source_key] >= record_source_limit:
+        if record_source_limit is not None and record.source_type == "kb" and per_source[source_key] >= record_source_limit:
             _reject(record, "max_chunks_per_source", rejected)
             continue
         if config.max_chunks is not None and len(selected) >= config.max_chunks:
@@ -437,7 +519,7 @@ def build_context_bundle(
             per_doc[record.doc_id] += 1
             if record.doc_id in primary_doc_ids and config.max_chunks_per_doc and per_doc[record.doc_id] > config.max_chunks_per_doc:
                 primary_doc_extra_selected_count += 1
-        if config.diversity_enabled and record.source_type == "kb":
+        if record.source_type == "kb":
             per_source[source_key] += 1
     return EvidenceBundle(
         records=all_ordered,
@@ -452,6 +534,10 @@ def build_context_bundle(
         priority_boost_strength_counts=_priority_boost_strength_counts(priority_boosts_by_object_id.values()),
         low_relevance_preserved_count=low_relevance_preserved_count,
         low_relevance_bypass_reason_counts=dict(low_relevance_bypass_reason_counts),
+        relevance_decision_counts=dict(relevance_decision_counts),
+        per_source_base_limits=source_base_limits,
+        per_source_effective_limits=source_effective_limits,
+        source_cap_expansion_reasons=source_expansion_reasons,
     )
 
 
@@ -486,7 +572,6 @@ def bundle_to_kbinfos(bundle: EvidenceBundle, original_kbinfos: dict[str, Any]) 
     if "total" in original_kbinfos:
         new_kbinfos["total"] = original_kbinfos["total"]
     return new_kbinfos
-
 
 
 _YEAR_RE = re.compile(r"\b(?:1[5-9]\d{2}|20\d{2}|2100)\b")
@@ -546,6 +631,40 @@ def _record_relevance_signals(record: EvidenceRecord) -> dict[str, float | None]
     }
 
 
+def _score_provenance(record: EvidenceRecord, score_name: str) -> dict[str, Any]:
+    provenance = record.scores.get("score_provenance")
+    if not isinstance(provenance, dict):
+        return {}
+    value = provenance.get(score_name)
+    return value if isinstance(value, dict) else {}
+
+
+def _is_compatible_calibrated_score(record: EvidenceRecord, score_name: str) -> bool:
+    provenance = _score_provenance(record, score_name)
+    return bool(provenance.get("calibrated") is True and provenance.get("family") == _SCORE_FAMILY_BY_FIELD.get(score_name) and provenance.get("scale") in _COMPARABLE_SCORE_SCALES)
+
+
+def _relevance_assessment(record: EvidenceRecord, config: EvidenceBundleConfig) -> tuple[bool, str]:
+    if not config.relevance_filter_enabled:
+        return False, "filter_disabled"
+    signals = _record_relevance_signals(record)
+    checks: list[bool] = []
+    configured = (
+        ("vector_similarity", config.min_vector_similarity),
+        ("term_similarity", config.min_term_similarity),
+    )
+    for score_name, threshold in configured:
+        if threshold is None or signals[score_name] is None:
+            continue
+        if _is_compatible_calibrated_score(record, score_name):
+            checks.append(bool(signals[score_name] < threshold))
+    if not checks:
+        return False, "kept_unscored_or_uncalibrated"
+    if all(checks):
+        return True, "rejected_below_calibrated_threshold"
+    return False, "kept_above_calibrated_threshold"
+
+
 def _float_or_none(value: Any) -> float | None:
     try:
         return float(value)
@@ -554,22 +673,14 @@ def _float_or_none(value: Any) -> float | None:
 
 
 def _is_low_relevance(record: EvidenceRecord, config: EvidenceBundleConfig) -> bool:
-    if not config.relevance_filter_enabled:
-        return False
-    signals = _record_relevance_signals(record)
-    checks: list[bool] = []
-    if config.min_vector_similarity is not None and signals["vector_similarity"] is not None:
-        checks.append(signals["vector_similarity"] < config.min_vector_similarity)
-    if config.min_term_similarity is not None and signals["term_similarity"] is not None:
-        checks.append(signals["term_similarity"] < config.min_term_similarity)
-    return any(checks)
+    return _relevance_assessment(record, config)[0]
 
 
 def _missing_configured_relevance_signal(record: EvidenceRecord, config: EvidenceBundleConfig) -> bool:
     signals = _record_relevance_signals(record)
     return bool(
-        (config.min_vector_similarity is not None and signals["vector_similarity"] is None)
-        or (config.min_term_similarity is not None and signals["term_similarity"] is None)
+        (config.min_vector_similarity is not None and (signals["vector_similarity"] is None or not _is_compatible_calibrated_score(record, "vector_similarity")))
+        or (config.min_term_similarity is not None and (signals["term_similarity"] is None or not _is_compatible_calibrated_score(record, "term_similarity")))
     )
 
 
@@ -595,6 +706,8 @@ def _strong_low_relevance_evidence_reasons(record: EvidenceRecord, query_feature
 def _low_relevance_bypass_reasons(record: EvidenceRecord, rank: int, config: EvidenceBundleConfig, query_features: dict[str, Any]) -> list[str]:
     strong_reasons = _strong_low_relevance_evidence_reasons(record, query_features)
     reasons: list[str] = []
+    if _has_protected_retrieval_lineage(record):
+        reasons.append("protected_retrieval_lineage")
     if rank < max(0, config.preserve_top_ranked):
         if _missing_configured_relevance_signal(record, config):
             reasons.append("top_ranked_with_missing_relevance_signal")
@@ -602,6 +715,22 @@ def _low_relevance_bypass_reasons(record: EvidenceRecord, rank: int, config: Evi
             reasons.append("top_ranked_with_strong_evidence")
     reasons.extend(strong_reasons)
     return _unique_reasons(reasons)
+
+
+def _has_protected_retrieval_lineage(record: EvidenceRecord) -> bool:
+    chunk = record.chunk if isinstance(record.chunk, dict) else {}
+    fusion = chunk.get("_ragflow_fusion")
+    if isinstance(fusion, dict):
+        lane_ranks = fusion.get("lane_ranks")
+        if isinstance(lane_ranks, dict) and any(isinstance(rank, int) and rank == 1 for rank in lane_ranks.values()):
+            return True
+        if fusion.get("lane_reservations"):
+            return True
+    lineage_rank = record.metadata.get("lineage_rank")
+    agentic = record.metadata.get("agentic_retrieval")
+    if isinstance(agentic, dict) and agentic.get("lineage_rank") is not None:
+        lineage_rank = agentic.get("lineage_rank")
+    return isinstance(lineage_rank, int) and lineage_rank == 1
 
 
 def _query_token_overlap(record: EvidenceRecord, query_features: dict[str, Any]) -> bool:
@@ -671,13 +800,11 @@ def _numeric_claim_matches(record: EvidenceRecord, query_features: dict[str, Any
 def _record_score_support_reasons(record: EvidenceRecord) -> list[str]:
     signals = _record_relevance_signals(record)
     reasons: list[str] = []
-    if any(
-        signals.get(key) is not None and (signals.get(key) or 0.0) >= _STRONG_RELEVANCE_THRESHOLD
-        for key in ("vector_similarity", "similarity", "final_score")
-    ):
+    vector_similarity = signals.get("vector_similarity")
+    if vector_similarity is not None and _is_compatible_calibrated_score(record, "vector_similarity") and vector_similarity >= _STRONG_RELEVANCE_THRESHOLD:
         reasons.append("strong_dense_score")
     term_similarity = signals.get("term_similarity")
-    if term_similarity is not None and term_similarity >= _STRONG_RELEVANCE_THRESHOLD:
+    if term_similarity is not None and _is_compatible_calibrated_score(record, "term_similarity") and term_similarity >= _STRONG_RELEVANCE_THRESHOLD:
         reasons.append("strong_term_score")
     return reasons
 
@@ -686,7 +813,21 @@ def _record_anchor_support_reasons(record: EvidenceRecord, query_features: dict[
     reasons = _record_score_support_reasons(record)
     if _exact_title_match(record, query_features):
         reasons.append("exact_title_match")
+    if (
+        _exact_year_match(record, query_features)
+        and (_attribute_specific_terms(record, query_features) or _table_or_rank_indicator_terms(record, query_features))
+        and not _has_calibrated_weak_anchor_score(record)
+    ):
+        reasons.append("typed_query_anchor")
     return _unique_reasons(reasons)
+
+
+def _has_calibrated_weak_anchor_score(record: EvidenceRecord) -> bool:
+    signals = _record_relevance_signals(record)
+    return any(
+        signals.get(score_name) is not None and _is_compatible_calibrated_score(record, score_name) and (signals.get(score_name) or 0.0) < _STRONG_RELEVANCE_THRESHOLD
+        for score_name in _SCORE_FAMILY_BY_FIELD
+    )
 
 
 def _exact_year_match(record: EvidenceRecord, query_features: dict[str, Any]) -> bool:
@@ -730,11 +871,7 @@ def _primary_doc_candidate_reasons(records: list[EvidenceRecord], config: Eviden
     required_rank_hit_count = max(2, config.primary_doc_min_rank_hits)
     top_window_size = max(required_rank_hit_count * 3, config.preserve_top_ranked, 6)
     top_window = records[:top_window_size]
-    supported_top_hits = [
-        record
-        for record in top_window
-        if record.source_type == "kb" and record.doc_id and _record_anchor_support_reasons(record, query_features)
-    ]
+    supported_top_hits = [record for record in top_window if record.source_type == "kb" and record.doc_id and _record_anchor_support_reasons(record, query_features)]
     counts = Counter(record.doc_id for record in supported_top_hits)
     for doc_id, count in counts.items():
         if count >= required_rank_hit_count:
@@ -745,12 +882,7 @@ def _primary_doc_candidate_reasons(records: list[EvidenceRecord], config: Eviden
                     "required_rank_hit_count": required_rank_hit_count,
                     "top_window_size": top_window_size,
                     "support_reasons": ",".join(
-                        _unique_reasons([
-                            reason
-                            for record in supported_top_hits
-                            if record.doc_id == doc_id
-                            for reason in _record_anchor_support_reasons(record, query_features)
-                        ])
+                        _unique_reasons([reason for record in supported_top_hits if record.doc_id == doc_id for reason in _record_anchor_support_reasons(record, query_features)])
                     ),
                 }
             )
@@ -774,11 +906,7 @@ def _primary_source_candidate_reasons(
     required_rank_hit_count = max(2, config.primary_doc_min_rank_hits)
     top_window_size = max(required_rank_hit_count * 3, config.preserve_top_ranked, 6)
     top_window = records[:top_window_size]
-    supported_top_hits = [
-        record
-        for record in top_window
-        if record.source_type == "kb" and _record_anchor_support_reasons(record, query_features)
-    ]
+    supported_top_hits = [record for record in top_window if record.source_type == "kb" and _record_anchor_support_reasons(record, query_features)]
     source_counts = Counter(_source_group_key(record) for record in supported_top_hits)
     for source_key, count in source_counts.items():
         if count >= required_rank_hit_count:
@@ -789,12 +917,7 @@ def _primary_source_candidate_reasons(
                     "required_rank_hit_count": required_rank_hit_count,
                     "top_window_size": top_window_size,
                     "support_reasons": ",".join(
-                        _unique_reasons([
-                            reason
-                            for record in supported_top_hits
-                            if _source_group_key(record) == source_key
-                            for reason in _record_anchor_support_reasons(record, query_features)
-                        ])
+                        _unique_reasons([reason for record in supported_top_hits if _source_group_key(record) == source_key for reason in _record_anchor_support_reasons(record, query_features)])
                     ),
                 }
             )
@@ -856,6 +979,54 @@ def _source_limit_for_record(
     if not reasons or config.primary_doc_extra_chunks <= 0:
         return base_source_limit
     return _expanded_primary_cap(base_source_limit, config)
+
+
+def _effective_source_limits(
+    records: list[EvidenceRecord],
+    config: EvidenceBundleConfig,
+    primary_doc_ids: set[str],
+    primary_doc_reasons: dict[str, list[dict[str, Any]]],
+    primary_source_reasons: dict[str, list[dict[str, Any]]],
+    base_source_limit: int | None,
+    query_features: dict[str, Any],
+) -> tuple[dict[str, int], dict[str, int], dict[str, list[str]]]:
+    if base_source_limit is None:
+        return {}, {}, {}
+    base_limits: dict[str, int] = {}
+    effective_limits: dict[str, int] = {}
+    expansion_reasons: defaultdict[str, list[str]] = defaultdict(list)
+    for record in records:
+        if record.source_type != "kb":
+            continue
+        source_key = _source_group_key(record)
+        base_limits[source_key] = base_source_limit
+        effective_limits[source_key] = max(
+            effective_limits.get(source_key, base_source_limit),
+            _source_limit_for_record(
+                record,
+                config,
+                primary_doc_ids,
+                primary_doc_reasons,
+                primary_source_reasons,
+                base_source_limit,
+                query_features,
+            )
+            or base_source_limit,
+        )
+        expansion_reasons[source_key].extend(
+            _source_cap_expansion_reasons(
+                record,
+                primary_doc_ids,
+                primary_doc_reasons,
+                primary_source_reasons,
+                query_features,
+            )
+        )
+    return (
+        base_limits,
+        effective_limits,
+        {source_key: _unique_reasons(reasons) for source_key, reasons in expansion_reasons.items() if effective_limits.get(source_key, base_source_limit) > base_source_limit},
+    )
 
 
 def _source_cap_expansion_reasons(
@@ -1021,6 +1192,32 @@ def _round_robin_by_source(records: list[EvidenceRecord]) -> list[EvidenceRecord
     return ordered
 
 
+def _preserve_protected_lineage_prefix(
+    ranked: list[EvidenceRecord],
+    diversified: list[EvidenceRecord],
+    max_chunks: int | None,
+) -> list[EvidenceRecord]:
+    """Keep protected members of the bounded rank prefix inside that prefix."""
+    if not max_chunks or max_chunks <= 0 or len(diversified) <= max_chunks:
+        return diversified
+    protected = [record for record in ranked[:max_chunks] if _has_protected_retrieval_lineage(record)]
+    if not protected:
+        return diversified
+    ordered = list(diversified)
+    for record in protected:
+        current = ordered.index(record)
+        if current < max_chunks:
+            continue
+        replacement = next(
+            (index for index in range(max_chunks - 1, -1, -1) if not _has_protected_retrieval_lineage(ordered[index])),
+            None,
+        )
+        if replacement is None:
+            break
+        ordered[replacement], ordered[current] = ordered[current], ordered[replacement]
+    return ordered
+
+
 def _source_limit(config: EvidenceBundleConfig) -> int | None:
     limits: list[int] = []
     if config.max_chunks_per_source:
@@ -1028,6 +1225,32 @@ def _source_limit(config: EvidenceBundleConfig) -> int | None:
     if config.max_chunks and config.max_source_fraction:
         limits.append(max(1, int(config.max_chunks * config.max_source_fraction + 0.999999)))
     return min(limits) if limits else None
+
+
+def _score_provenance_counts(records: list[EvidenceRecord]) -> dict[str, Any]:
+    families: Counter[str] = Counter()
+    sources: Counter[str] = Counter()
+    calibrated = 0
+    uncalibrated = 0
+    for record in records:
+        provenance = record.scores.get("score_provenance")
+        if not isinstance(provenance, dict):
+            continue
+        for value in provenance.values():
+            if not isinstance(value, dict):
+                continue
+            families[str(value.get("family") or "unknown")] += 1
+            sources[str(value.get("source") or "unknown")] += 1
+            if value.get("calibrated") is True:
+                calibrated += 1
+            else:
+                uncalibrated += 1
+    return {
+        "families": dict(sorted(families.items())),
+        "sources": dict(sorted(sources.items())),
+        "calibrated": calibrated,
+        "uncalibrated": uncalibrated,
+    }
 
 
 def _dedupe_key(record: EvidenceRecord) -> tuple[str, str]:

@@ -21,7 +21,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import asdict, is_dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from typing import Any, List
 
 import json_repair
@@ -31,12 +31,15 @@ from rag.advanced_rag.agentic_retrieval import (
     AgenticRefinementConfig,
     AgenticRefinementError,
     AgenticRetrievalConfig,
+    build_deterministic_fallback_plan,
     build_planner_input,
     execute_bounded_plan,
     generate_llm_plan,
     run_refinement_loop,
     should_plan,
+    validate_plan,
 )
+from rag.advanced_rag.structured_output import StructuredOutputFailureReason
 from api.db.services.doc_metadata_service import DocMetadataService
 from api.db.services.document_service import DocumentService
 from api.db.services.knowledgebase_service import KnowledgebaseService
@@ -54,6 +57,49 @@ from rag.utils.context_builder import EvidenceBundleConfig, apply_context_builde
 from rag.utils.retrieval_diagnostics import make_retrieval_variant, resolve_variant_knobs
 from rag.utils.retrieval_fusion import FusionConfig
 from rag.utils.retrieval_query import RetrievalQueryBundle, parse_keyword_expansion
+
+
+PLANNER_SCHEMA_VERSION = "planner-content-v2"
+PLANNER_PROMPT_VERSION = "planner-prompt-v2"
+
+
+@dataclass
+class PlannerCacheEntry:
+    entry_type: str
+    created_monotonic: float
+    schema_version: str
+    prompt_version: str
+    configuration_digest: str
+    model_digest: str
+    plan: Any | None = None
+    terminal: dict[str, Any] | None = None
+
+    def __getitem__(self, key: str) -> Any:
+        if hasattr(self, key):
+            return getattr(self, key)
+        if self.terminal is not None and key in self.terminal:
+            return self.terminal[key]
+        raise KeyError(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+@dataclass
+class PlannerInFlightEntry:
+    owner_task: asyncio.Task[Any]
+    created_monotonic: float
+    deadline_monotonic: float
+    compatibility: dict[str, str]
+    compatibility_digest: str
+    generation: int
+    waiter_count: int
+
+
+_PLAN_NOT_PREPARED = object()
 
 
 def _refinement_storage_identity(chunk: dict[str, Any]) -> str:
@@ -158,20 +204,21 @@ def _agentic_fingerprint(payload: dict[str, Any]) -> str:
 
 
 class RAGTools:
-    def __init__(self, 
-                 tenant_ids: list[str],
-                 chat_mdl: LLMBundle, 
-                 embed_mdl: LLMBundle | None = None, 
-                 kb_ids: List[str] | None = None,
-                 kbs: list[Knowledgebase] | None = [], 
-                 tav: Tavily | None = None,
-                 meta_data_filter: dict | None = None,
-                 user_defined_prompts: dict | None = None,
-                 trace: RagTraceCollector | None = None,
-                 context_builder_config: EvidenceBundleConfig | None = None,
-                 agentic_retrieval_config: AgenticRetrievalConfig | None = None,
-                 agentic_refinement_config: AgenticRefinementConfig | None = None,
-                 ):
+    def __init__(
+        self,
+        tenant_ids: list[str],
+        chat_mdl: LLMBundle,
+        embed_mdl: LLMBundle | None = None,
+        kb_ids: List[str] | None = None,
+        kbs: list[Knowledgebase] | None = [],
+        tav: Tavily | None = None,
+        meta_data_filter: dict | None = None,
+        user_defined_prompts: dict | None = None,
+        trace: RagTraceCollector | None = None,
+        context_builder_config: EvidenceBundleConfig | None = None,
+        agentic_retrieval_config: AgenticRetrievalConfig | None = None,
+        agentic_refinement_config: AgenticRefinementConfig | None = None,
+    ):
         self.tenant_ids = tenant_ids
         self.chat_mdl = deepcopy(chat_mdl)
         self.embed_mdl = embed_mdl
@@ -179,6 +226,7 @@ class RAGTools:
         self.sql_kbs = []
         self.kbs = []
         self.kb_ids = []
+
         def _exclude_sql_kb(kb):
             if kb.parser_config and "field_map" in kb.parser_config:
                 self.field_map.update(kb.parser_config["field_map"])
@@ -186,6 +234,7 @@ class RAGTools:
             else:
                 self.kbs.append(kb)
                 self.kb_ids.append(kb.id)
+
         if kb_ids:
             for kb in KnowledgebaseService.get_by_ids(kb_ids):
                 _exclude_sql_kb(kb)
@@ -212,8 +261,12 @@ class RAGTools:
         self._planner_elapsed_ms = 0.0
         self._planner_calls_used = 0
         self._planner_attempts_by_fingerprint: dict[str, int] = {}
-        self._planner_terminal_ledger: dict[str, dict[str, Any]] = {}
-        self._validated_plan_cache: dict[str, Any] = {}
+        self._planner_terminal_ledger: dict[str, PlannerCacheEntry | dict[str, Any]] = {}
+        self._validated_plan_cache: dict[str, PlannerCacheEntry] = {}
+        self._planner_in_flight: dict[str, PlannerInFlightEntry] = {}
+        self._planner_coordination_lock = asyncio.Lock()
+        self._planner_execution_lock = asyncio.Lock()
+        self._planner_in_flight_generation = 0
         self._completed_search_ledger: dict[str, dict[str, Any]] = {}
         self._agentic_search_lock = asyncio.Lock()
         self._rag_agent_tool_timeout_s = 120.0
@@ -287,13 +340,78 @@ class RAGTools:
         }
 
     def _planner_fingerprint(self, planner_input: dict[str, Any]) -> str:
-        return _agentic_fingerprint(
+        stable_input = {key: value for key, value in planner_input.items() if key not in {"plan_id", "config", "output_schema"}}
+        return _agentic_fingerprint({"planner_input": stable_input})
+
+    def _planner_cache_compatibility(self) -> dict[str, str]:
+        return {
+            "schema_version": PLANNER_SCHEMA_VERSION,
+            "prompt_version": PLANNER_PROMPT_VERSION,
+            "configuration_digest": _agentic_fingerprint(self.agentic_retrieval_config),
+            "model_digest": _agentic_fingerprint(self._model_identity()),
+        }
+
+    def _planner_compatibility_digest(self) -> str:
+        return _agentic_fingerprint(self._planner_cache_compatibility())
+
+    @staticmethod
+    def _rebind_plan_id(plan: Any, plan_id: str | None) -> Any:
+        if plan is None or not plan_id or not is_dataclass(plan):
+            return deepcopy(plan)
+        subqueries = tuple(replace(subquery, plan_id=plan_id) for subquery in getattr(plan, "subqueries", ()))
+        return replace(deepcopy(plan), plan_id=plan_id, subqueries=subqueries)
+
+    def _trace_planner_cache(
+        self,
+        fingerprint: str,
+        cache_status: str,
+        *,
+        entry_type: str | None = None,
+        avoided_llm_call: bool = False,
+        entry_age_ms: float | None = None,
+    ) -> None:
+        if not self.trace:
+            return
+        compatibility = self._planner_cache_compatibility()
+        compatibility_digest = self._planner_compatibility_digest()
+        attempt_key = f"{fingerprint}:{compatibility_digest}"
+        self.trace.add_agentic_retrieval_event(
+            "planner_cache",
             {
-                "planner_input": planner_input,
-                "model": self._model_identity(),
-                "planner_config": self.agentic_retrieval_config,
+                "scope_hash": fingerprint[:16],
+                "cache_status": cache_status,
+                "entry_type": entry_type,
+                "entry_age_ms": round(entry_age_ms, 3) if entry_age_ms is not None else None,
+                "schema_version": compatibility["schema_version"],
+                "cache_entry_version": compatibility["schema_version"],
+                "prompt_version": compatibility["prompt_version"],
+                "configuration_digest": compatibility["configuration_digest"][:16],
+                "model_digest": compatibility["model_digest"][:16],
+                "avoided_llm_call": avoided_llm_call,
+                "attempt_count": getattr(self, "_planner_attempts_by_fingerprint", {}).get(attempt_key, 0),
+                "terminal": entry_type == "terminal",
+            },
+        )
+
+    def _planner_cache_mismatch(self, entry: PlannerCacheEntry) -> str | None:
+        return self._planner_compatibility_mismatch(
+            {
+                "schema_version": entry.schema_version,
+                "prompt_version": entry.prompt_version,
+                "configuration_digest": entry.configuration_digest,
+                "model_digest": entry.model_digest,
             }
         )
+
+    def _planner_compatibility_mismatch(self, stored: dict[str, str]) -> str | None:
+        compatibility = self._planner_cache_compatibility()
+        if stored["schema_version"] != compatibility["schema_version"] or stored["prompt_version"] != compatibility["prompt_version"]:
+            return "schema_version_mismatch"
+        if stored["configuration_digest"] != compatibility["configuration_digest"]:
+            return "configuration_mismatch"
+        if stored["model_digest"] != compatibility["model_digest"]:
+            return "model_mismatch"
+        return None
 
     def _search_fingerprint(
         self,
@@ -400,39 +518,224 @@ class RAGTools:
             self._trace_turn_budget_exhausted()
             return None
         fingerprint = self._planner_fingerprint(planner_input)
-        safe_hash = fingerprint[:16]
-        if fingerprint in self._planner_terminal_ledger:
-            terminal = self._planner_terminal_ledger[fingerprint]
-            if self.trace:
-                self.trace.add_agentic_retrieval_event(
-                    "planner_cache",
-                    {"scope_hash": safe_hash, "cache_status": "hit_terminal", "terminal": True, **terminal},
-                )
-            return None
-        if cfg.plan_cache_enabled and fingerprint in self._validated_plan_cache:
-            if self.trace:
-                self.trace.add_agentic_retrieval_event(
-                    "planner_cache",
-                    {"scope_hash": safe_hash, "cache_status": "hit_valid", "terminal": False},
-                )
-            return deepcopy(self._validated_plan_cache[fingerprint])
-        if self.trace:
-            self.trace.add_agentic_retrieval_event(
-                "planner_cache",
-                {"scope_hash": safe_hash, "cache_status": "miss", "terminal": False},
-            )
+        issued_plan_id = str(planner_input.get("plan_id") or "") or None
+        now = time.monotonic()
+        ttl_s = max(0.001, float(getattr(self, "_rag_agent_tool_timeout_s", 120.0)))
+        compatibility = self._planner_cache_compatibility()
+        compatibility_digest = self._planner_compatibility_digest()
+        attempt_key = f"{fingerprint}:{compatibility_digest}"
 
-        max_attempts = max(1, min(int(cfg.planner_max_attempts_per_key), 4))
+        if cfg.plan_cache_enabled and fingerprint in self._validated_plan_cache:
+            entry = self._validated_plan_cache[fingerprint]
+            age_s = max(0.0, now - entry.created_monotonic)
+            mismatch = self._planner_cache_mismatch(entry)
+            if mismatch:
+                self._trace_planner_cache(fingerprint, mismatch, entry_type=entry.entry_type, entry_age_ms=age_s * 1000.0)
+                self._validated_plan_cache.pop(fingerprint, None)
+            elif age_s > ttl_s:
+                self._trace_planner_cache(fingerprint, "expired", entry_type=entry.entry_type, entry_age_ms=age_s * 1000.0)
+                self._validated_plan_cache.pop(fingerprint, None)
+                self._planner_attempts_by_fingerprint.pop(attempt_key, None)
+            else:
+                self._trace_planner_cache(
+                    fingerprint,
+                    "hit_valid",
+                    entry_type="valid",
+                    avoided_llm_call=True,
+                    entry_age_ms=age_s * 1000.0,
+                )
+                return self._rebind_plan_id(entry.plan, issued_plan_id)
+
+        if fingerprint in self._planner_terminal_ledger:
+            terminal_entry = self._planner_terminal_ledger[fingerprint]
+            if isinstance(terminal_entry, PlannerCacheEntry):
+                age_s = max(0.0, now - terminal_entry.created_monotonic)
+                mismatch = self._planner_cache_mismatch(terminal_entry)
+                if mismatch:
+                    self._trace_planner_cache(fingerprint, mismatch, entry_type="terminal", entry_age_ms=age_s * 1000.0)
+                    self._planner_terminal_ledger.pop(fingerprint, None)
+                elif age_s > ttl_s:
+                    self._trace_planner_cache(fingerprint, "expired", entry_type="terminal", entry_age_ms=age_s * 1000.0)
+                    self._planner_terminal_ledger.pop(fingerprint, None)
+                    self._planner_attempts_by_fingerprint.pop(attempt_key, None)
+                else:
+                    self._trace_planner_cache(
+                        fingerprint,
+                        "hit_terminal",
+                        entry_type="terminal",
+                        avoided_llm_call=True,
+                        entry_age_ms=age_s * 1000.0,
+                    )
+                    return None
+
+        in_flight = getattr(self, "_planner_in_flight", None)
+        if in_flight is None:
+            in_flight = self._planner_in_flight = {}
+        coordination_lock = getattr(self, "_planner_coordination_lock", None)
+        if coordination_lock is None:
+            coordination_lock = self._planner_coordination_lock = asyncio.Lock()
+
+        stale_entry = None
+        stale_status = None
+        async with coordination_lock:
+            entry = in_flight.get(fingerprint)
+            if entry is not None and (entry.compatibility_digest != compatibility_digest or entry.deadline_monotonic <= now or entry.owner_task.done() and entry.owner_task.cancelled()):
+                stale_status = self._planner_compatibility_mismatch(entry.compatibility) or "expired"
+                stale_entry = in_flight.pop(fingerprint)
+                self._planner_attempts_by_fingerprint.pop(attempt_key, None)
+                entry = None
+            if entry is None:
+                generation = getattr(self, "_planner_in_flight_generation", 0) + 1
+                self._planner_in_flight_generation = generation
+                terminal_work_key = f"{attempt_key}:generation:{generation}"
+                owner_task = asyncio.create_task(
+                    self._run_plan_owner(
+                        planner_input,
+                        fingerprint=fingerprint,
+                        attempt_key=attempt_key,
+                        terminal_work_key=terminal_work_key,
+                        compatibility=compatibility,
+                        compatibility_digest=compatibility_digest,
+                        generation=generation,
+                        tool_deadline=tool_deadline,
+                    )
+                )
+                entry = PlannerInFlightEntry(
+                    owner_task=owner_task,
+                    created_monotonic=now,
+                    deadline_monotonic=tool_deadline,
+                    compatibility=compatibility,
+                    compatibility_digest=compatibility_digest,
+                    generation=generation,
+                    waiter_count=1,
+                )
+                in_flight[fingerprint] = entry
+                self._trace_planner_cache(fingerprint, "miss", avoided_llm_call=False)
+            else:
+                entry.waiter_count += 1
+                self._trace_planner_cache(fingerprint, "in_flight", entry_type="in_flight", avoided_llm_call=True)
+
+        if stale_entry is not None:
+            stale_entry.owner_task.cancel()
+            await asyncio.gather(stale_entry.owner_task, return_exceptions=True)
+            self._trace_planner_cache(fingerprint, stale_status or "expired", entry_type="in_flight")
+
+        remaining_s = max(0.0, tool_deadline - time.monotonic())
+        abandoned = remaining_s <= 0
+        result = None
+        try:
+            if not abandoned:
+                result = await asyncio.wait_for(asyncio.shield(entry.owner_task), timeout=remaining_s)
+        except TimeoutError:
+            abandoned = True
+            result = None
+        except asyncio.CancelledError:
+            abandoned = True
+            raise
+        finally:
+            owner_to_cancel = None
+            async with coordination_lock:
+                current = in_flight.get(fingerprint)
+                if current is entry:
+                    current.waiter_count = max(0, current.waiter_count - 1)
+                    if abandoned and current.waiter_count == 0:
+                        in_flight.pop(fingerprint, None)
+                        owner_to_cancel = current.owner_task
+            if owner_to_cancel is not None:
+                owner_to_cancel.cancel()
+                await asyncio.gather(owner_to_cancel, return_exceptions=True)
+        return self._rebind_plan_id(result, issued_plan_id)
+
+    async def _run_plan_owner(
+        self,
+        planner_input: dict[str, Any],
+        *,
+        fingerprint: str,
+        attempt_key: str,
+        terminal_work_key: str,
+        compatibility: dict[str, str],
+        compatibility_digest: str,
+        generation: int,
+        tool_deadline: float,
+    ) -> Any | None:
+        try:
+            execution_lock = getattr(self, "_planner_execution_lock", None)
+            if execution_lock is None:
+                execution_lock = self._planner_execution_lock = asyncio.Lock()
+            async with execution_lock:
+                result = await self._coordinate_plan_owner(
+                    planner_input,
+                    tool_deadline=tool_deadline,
+                    attempt_key=attempt_key,
+                    terminal_key=terminal_work_key,
+                )
+            coordination_lock = self._planner_coordination_lock
+            async with coordination_lock:
+                current = self._planner_in_flight.get(fingerprint)
+                owns_generation = current is not None and current.generation == generation and current.compatibility_digest == compatibility_digest and current.owner_task is asyncio.current_task()
+                terminal_payload = self._planner_terminal_ledger.pop(terminal_work_key, None)
+                deadline_expired = current is not None and current.deadline_monotonic <= time.monotonic()
+                if not owns_generation or deadline_expired:
+                    if deadline_expired:
+                        self._trace_planner_cache(fingerprint, "expired", entry_type="in_flight")
+                    return None
+                if result is not None:
+                    self._planner_terminal_ledger.pop(fingerprint, None)
+                    if self.agentic_retrieval_config.plan_cache_enabled:
+                        self._validated_plan_cache[fingerprint] = PlannerCacheEntry(
+                            entry_type="valid",
+                            created_monotonic=time.monotonic(),
+                            plan=deepcopy(result),
+                            **compatibility,
+                        )
+                elif terminal_payload is not None:
+                    terminal = terminal_payload if isinstance(terminal_payload, dict) else getattr(terminal_payload, "terminal", None)
+                    if terminal is not None:
+                        self._planner_terminal_ledger[fingerprint] = PlannerCacheEntry(
+                            entry_type="terminal",
+                            created_monotonic=time.monotonic(),
+                            terminal=deepcopy(terminal),
+                            **compatibility,
+                        )
+                return result
+        except asyncio.CancelledError:
+            self._planner_terminal_ledger.pop(terminal_work_key, None)
+            self._trace_planner_cache(fingerprint, "cancelled", entry_type="cancelled")
+            raise
+        finally:
+            async with self._planner_coordination_lock:
+                current = self._planner_in_flight.get(fingerprint)
+                if current is not None and current.generation == generation and current.owner_task is asyncio.current_task():
+                    self._planner_in_flight.pop(fingerprint, None)
+                self._planner_terminal_ledger.pop(terminal_work_key, None)
+
+    async def _coordinate_plan_owner(
+        self,
+        planner_input: dict[str, Any],
+        *,
+        tool_deadline: float,
+        attempt_key: str | None = None,
+        terminal_key: str | None = None,
+    ) -> Any | None:
+        cfg = self.agentic_retrieval_config
+        if self._remaining_agentic_budget_ms() <= 0:
+            self._trace_turn_budget_exhausted()
+            return None
+        fingerprint = self._planner_fingerprint(planner_input)
+        attempt_key = attempt_key or f"{fingerprint}:{self._planner_compatibility_digest()}"
+        terminal_key = terminal_key or fingerprint
+        safe_hash = fingerprint[:16]
+        max_attempts = max(1, min(int(cfg.planner_max_attempts_per_key), 2))
         max_calls = max(1, min(int(cfg.planner_max_calls_per_turn), 16))
         total_budget_ms = max(1, min(int(cfg.planner_total_budget_ms), 120000))
         repair_errors: tuple[str, ...] = ()
-        while self._planner_attempts_by_fingerprint.get(fingerprint, 0) < max_attempts:
+        while self._planner_attempts_by_fingerprint.get(attempt_key, 0) < max_attempts:
             remaining_planner_ms = total_budget_ms - self._planner_elapsed_ms
             remaining_turn_ms = self._remaining_agentic_budget_ms()
             remaining_tool_ms = max(0.0, (tool_deadline - time.monotonic()) * 1000.0)
             if self._planner_calls_used >= max_calls:
                 terminal = {"failure_class": "call_ceiling", "retryable": False, "fallback_reason": "planner_turn_call_ceiling"}
-                self._planner_terminal_ledger[fingerprint] = terminal
+                self._planner_terminal_ledger[terminal_key] = terminal
                 break
             if remaining_tool_ms <= 0:
                 if self.trace:
@@ -450,13 +753,13 @@ class RAGTools:
             if min(remaining_planner_ms, remaining_turn_ms) <= 0:
                 reason = "agentic_turn_budget_exhausted" if remaining_turn_ms <= 0 else "planner_total_budget_exhausted"
                 terminal = {"failure_class": "budget", "retryable": False, "fallback_reason": reason}
-                self._planner_terminal_ledger[fingerprint] = terminal
+                self._planner_terminal_ledger[terminal_key] = terminal
                 if remaining_turn_ms <= 0:
                     self._trace_turn_budget_exhausted()
                 break
 
-            attempt = self._planner_attempts_by_fingerprint.get(fingerprint, 0) + 1
-            self._planner_attempts_by_fingerprint[fingerprint] = attempt
+            attempt = self._planner_attempts_by_fingerprint.get(attempt_key, 0) + 1
+            self._planner_attempts_by_fingerprint[attempt_key] = attempt
             self._planner_calls_used += 1
             self._planner_operation_counter += 1
             operation_id = f"planner-{self._planner_operation_counter:03d}-{safe_hash[:8]}"
@@ -516,8 +819,25 @@ class RAGTools:
                         },
                     )
                 if not exc.retryable or attempt >= max_attempts or self._planner_calls_used >= max_calls:
-                    self._planner_terminal_ledger[fingerprint] = {
-                        "failure_class": exc.failure_class,
+                    terminal_failure_class = exc.failure_class
+                    if repair_errors:
+                        terminal_failure_class = StructuredOutputFailureReason.REPAIR_FAILED.value
+                        if self.trace:
+                            self.trace.add_agentic_retrieval_event(
+                                "planner_llm_repair_failed",
+                                {
+                                    "operation_id": operation_id,
+                                    "scope_hash": safe_hash,
+                                    "attempt": attempt,
+                                    "failure_class": terminal_failure_class,
+                                    "initial_failure": list(repair_errors),
+                                    "repair_failure": exc.detail or exc.reason,
+                                    "fallback_reason": exc.reason,
+                                    "terminal": True,
+                                },
+                            )
+                    self._planner_terminal_ledger[terminal_key] = {
+                        "failure_class": terminal_failure_class,
                         "retryable": False,
                         "fallback_reason": exc.reason,
                     }
@@ -569,7 +889,7 @@ class RAGTools:
                     return None
                 if min(remaining_planner_ms, remaining_turn_ms) <= 0:
                     reason = "agentic_turn_budget_exhausted" if remaining_turn_ms <= 0 else "planner_total_budget_exhausted"
-                    self._planner_terminal_ledger[fingerprint] = {
+                    self._planner_terminal_ledger[terminal_key] = {
                         "failure_class": "budget",
                         "retryable": False,
                         "fallback_reason": reason,
@@ -577,8 +897,6 @@ class RAGTools:
                     if remaining_turn_ms <= 0:
                         self._trace_turn_budget_exhausted(operation_id)
                     break
-                if cfg.plan_cache_enabled:
-                    self._validated_plan_cache[fingerprint] = deepcopy(plan)
                 if self.trace:
                     self.trace.add_agentic_retrieval_event(
                         "planner_attempt",
@@ -601,33 +919,45 @@ class RAGTools:
                     )
                 return plan
 
-        terminal = self._planner_terminal_ledger.get(fingerprint, {"failure_class": "attempt_ceiling", "retryable": False, "fallback_reason": "planner_attempts_exhausted"})
-        self._planner_terminal_ledger[fingerprint] = terminal
+        terminal = self._planner_terminal_ledger.get(terminal_key, {"failure_class": "attempt_ceiling", "retryable": False, "fallback_reason": "planner_attempts_exhausted"})
+        self._planner_terminal_ledger[terminal_key] = terminal
+        question = str(planner_input.get("original_question") or planner_input.get("question") or "").strip()
+        scope = planner_input.get("scope") if isinstance(planner_input.get("scope"), dict) else {}
+        usable_scope = bool(scope.get("kb_ids") or scope.get("doc_ids") or planner_input.get("kb_ids") or planner_input.get("doc_ids"))
+        fallback_plan = None
+        if question and usable_scope and terminal.get("failure_class") != "budget":
+            try:
+                candidate_fallback = build_deterministic_fallback_plan(planner_input, cfg)
+                fallback_validation = validate_plan(candidate_fallback, cfg, original_question=question)
+                fallback_plan = fallback_validation.plan if fallback_validation.valid else None
+            except (TypeError, ValueError):
+                fallback_plan = None
         if self.trace:
             self.trace.add_agentic_retrieval_event(
                 "planner_terminal",
                 {
                     "scope_hash": safe_hash,
-                    "cache_status": "hit_terminal",
-                    "attempt": self._planner_attempts_by_fingerprint.get(fingerprint, 0),
+                    "cache_status": "stored_terminal",
+                    "attempt": self._planner_attempts_by_fingerprint.get(attempt_key, 0),
                     "max_attempts": max_attempts,
                     "calls_used": self._planner_calls_used,
                     "max_calls": max_calls,
                     "terminal": True,
-                    "fallback": "baseline_retrieval",
+                    "fallback": "deterministic_plan" if fallback_plan is not None else "baseline_retrieval",
                     **terminal,
                 },
             )
             self.trace.add_agentic_retrieval_event(
-                "planner_llm_fallback_to_baseline",
+                "planner_llm_fallback_to_deterministic" if fallback_plan is not None else "planner_llm_fallback_to_baseline",
                 {
                     "scope_hash": safe_hash,
                     "terminal": True,
-                    "fallback": "baseline_retrieval",
+                    "fallback": "deterministic_plan" if fallback_plan is not None else "baseline_retrieval",
+                    "plan_origin": getattr(fallback_plan, "plan_origin", None),
                     **terminal,
                 },
             )
-        return None
+        return fallback_plan
 
     def _trace_tool_start(self, name: str, args: dict[str, Any] | None = None, *, retrieval_mode: str | None = None) -> str | None:
         if not self.trace:
@@ -655,16 +985,9 @@ class RAGTools:
         has_summarize = has_unstructured  # tool gated on kb_ids in __init__
 
         # Step 2 — document-scope narrowing bullets
-        narrow_bullets = [
-            "- Call `select_documents` when the question names or strongly "
-            "implies a particular document or a small subset by title or topic."
-        ]
+        narrow_bullets = ["- Call `select_documents` when the question names or strongly implies a particular document or a small subset by title or topic."]
         if has_meta:
-            narrow_bullets.append(
-                "- Call `filter_docs_by_metadata` when the question references "
-                "structured attributes (year, author, department, product, ...) "
-                "that are carried as document metadata."
-            )
+            narrow_bullets.append("- Call `filter_docs_by_metadata` when the question references structured attributes (year, author, department, product, ...) that are carried as document metadata.")
 
         # Step 3 — retrieval paragraph, depending on which KB shapes are bound
         summarize_special_case = (
@@ -706,9 +1029,7 @@ class RAGTools:
             )
         elif has_sql and not has_unstructured:
             retrieval_para = (
-                "Call `search_structured_data` with the formalized question. The "
-                "knowledge base has a typed schema (`field_map`), so the tool will "
-                "translate your question into SQL and execute it."
+                "Call `search_structured_data` with the formalized question. The knowledge base has a typed schema (`field_map`), so the tool will translate your question into SQL and execute it."
             )
         else:
             retrieval_para = (
@@ -728,9 +1049,7 @@ class RAGTools:
         )
         steps.append(
             "**Narrow the document scope.** Before retrieving, try to limit "
-            "which documents you'll search:\n   "
-            + "\n   ".join(narrow_bullets)
-            + "\n   Collect the doc IDs these tools return VERBATIM and pass "
+            "which documents you'll search:\n   " + "\n   ".join(narrow_bullets) + "\n   Collect the doc IDs these tools return VERBATIM and pass "
             "them to the next step as `docid_scope`. You DO NOT know any doc "
             "IDs on your own — they are 32-character hex strings (e.g. "
             "`41a5271858ca11f1bbb9047c16ec874f`) that only these tools can "
@@ -770,7 +1089,7 @@ class RAGTools:
             "# Hard rules\n\n"
             "- DO NOT make anything up. If the retrieved evidence does not "
             "answer the question, reply with an explicit \"I don't have "
-            "enough information based on the available sources\" (in the "
+            'enough information based on the available sources" (in the '
             "user's language). If you identify an intermediate entity but "
             "the retrieved chunks lack the requested attribute, issue one "
             "focused `search_knowledge_bases` query for that entity plus the "
@@ -798,7 +1117,7 @@ class RAGTools:
             "cite as evidence: those may stay in the source's original "
             "language so the citation remains faithful. Everything OUTSIDE "
             "those quoted snippets — your prose, your headings, your "
-            "summaries, the \"I don't have enough information\" fallback — "
+            'summaries, the "I don\'t have enough information" fallback — '
             "must be in the user's language."
         )
 
@@ -834,16 +1153,13 @@ class RAGTools:
                 "Output ONLY the rewritten question — no preamble, no quotes, no explanation. "
                 "If the last user message is already a complete standalone question, return it unchanged."
             )
-            user = (
-                f"Conversation:\n{transcript}\n\n"
-                "Rewritten standalone question:"
-            )
+            user = f"Conversation:\n{transcript}\n\nRewritten standalone question:"
 
             ans = await self.chat_mdl.async_chat(
-                    system=system,
-                    history=[{"role": "user", "content": user}],
-                    gen_conf={"temperature": 0.1},
-                )
+                system=system,
+                history=[{"role": "user", "content": user}],
+                gen_conf={"temperature": 0.1},
+            )
 
             result = ans.strip().strip('"').strip("'")
             self._trace_tool_end(tool_call_id, result=result)
@@ -863,9 +1179,7 @@ class RAGTools:
         if not self.kb_ids:
             self._metas_cache = {}
             return self._metas_cache
-        self._metas_cache = await thread_pool_exec(
-            DocMetadataService.get_flatted_meta_by_kbs, self.kb_ids
-        )
+        self._metas_cache = await thread_pool_exec(DocMetadataService.get_flatted_meta_by_kbs, self.kb_ids)
         return self._metas_cache or {}
 
     @tool(timeout=60)
@@ -938,7 +1252,7 @@ class RAGTools:
             self._trace_tool_end(tool_call_id, success=False, error=e)
             raise
 
-    def _collect_doc_titles(self, max_docs:int = 512) -> list[tuple[str, str]]:
+    def _collect_doc_titles(self, max_docs: int = 512) -> list[tuple[str, str]]:
         """Return ``[(doc_id, name)]`` for every document in the bound KBs.
 
         Lightweight sync DB read — meant to be wrapped in ``thread_pool_exec``
@@ -1094,14 +1408,7 @@ class RAGTools:
             return output
         self._citations_injected = True
         rules = citation_prompt(self.user_defined_prompts).strip()
-        header = (
-            "# Citation rules\n"
-            "Apply the following rules VERBATIM to your final answer. "
-            "They are stated here in full and apply for the rest of this "
-            "turn.\n\n"
-            f"{rules}\n\n"
-            "----\n\n"
-        )
+        header = f"# Citation rules\nApply the following rules VERBATIM to your final answer. They are stated here in full and apply for the rest of this turn.\n\n{rules}\n\n----\n\n"
         if isinstance(output, list):
             return [header] + output
         return header + str(output)
@@ -1121,29 +1428,17 @@ class RAGTools:
         """
         if not candidate_ids or not self.kb_ids:
             return set()
-        rows = Document.select(Document.id).where(
-            (Document.id.in_(list(candidate_ids)))
-            & (Document.kb_id.in_(self.kb_ids))
-        )
+        rows = Document.select(Document.id).where((Document.id.in_(list(candidate_ids))) & (Document.kb_id.in_(self.kb_ids)))
         return {row.id for row in rows}
 
-    async def _try_agentic_bounded_retrieval(
+    async def _prepare_agentic_plan(
         self,
         *,
         question: str,
         docid_scope: list[str] | None,
         top_n: int,
-        similarity_threshold: float,
         tool_deadline: float,
     ) -> Any | None:
-        """Run Phase 5's LLM helper planner inside the rag_agent retrieval tool.
-
-        This is intentionally a bounded helper around ``search_knowledge_bases``:
-        diagnostic mode records only the trigger, shadow mode runs the plan but
-        leaves the tool output on the baseline retrieval path, and active mode
-        returns bounded retrieval only after LLM planning, validation, and lane
-        execution all succeed.
-        """
         cfg = self.agentic_retrieval_config
         if not cfg.enabled or cfg.mode == "off" or not self.embed_mdl or not self.kb_ids:
             return None
@@ -1184,7 +1479,35 @@ class RAGTools:
             tenant_ids=self.tenant_ids,
             metadata_filters=self.meta_data_filter,
         )
-        plan = await self._coordinated_plan(planner_input, tool_deadline=tool_deadline)
+        return await self._coordinated_plan(planner_input, tool_deadline=tool_deadline)
+
+    async def _try_agentic_bounded_retrieval(
+        self,
+        *,
+        question: str,
+        docid_scope: list[str] | None,
+        top_n: int,
+        similarity_threshold: float,
+        tool_deadline: float,
+        prepared_plan: Any = _PLAN_NOT_PREPARED,
+    ) -> Any | None:
+        """Run Phase 5's LLM helper planner inside the rag_agent retrieval tool.
+
+        This is intentionally a bounded helper around ``search_knowledge_bases``:
+        diagnostic mode records only the trigger, shadow mode runs the plan but
+        leaves the tool output on the baseline retrieval path, and active mode
+        returns bounded retrieval only after LLM planning, validation, and lane
+        execution all succeed.
+        """
+        cfg = self.agentic_retrieval_config
+        plan = prepared_plan
+        if plan is _PLAN_NOT_PREPARED:
+            plan = await self._prepare_agentic_plan(
+                question=question,
+                docid_scope=docid_scope,
+                top_n=top_n,
+                tool_deadline=tool_deadline,
+            )
         if plan is None:
             return None
         remaining_turn_ms = self._remaining_agentic_budget_ms()
@@ -1266,7 +1589,7 @@ class RAGTools:
         return result
 
     @tool(timeout=60)
-    async def select_documents(self, question: str, max_docs:int=512) -> List[str]:
+    async def select_documents(self, question: str, max_docs: int = 512) -> List[str]:
         """Ask an LLM to pick the document IDs whose titles look relevant to the question.
 
         Every document in the bound knowledge bases is listed to the LLM in
@@ -1314,11 +1637,7 @@ class RAGTools:
                 '["abc123", "def456"]. If no document is clearly relevant, output []. '
                 "No explanations, no Markdown, no code fences, no prose around the array."
             )
-            user = (
-                f"Question:\n{question}\n\n"
-                f"Documents:\n{catalogue}\n\n"
-                "Relevant docIDs (JSON array):"
-            )
+            user = f"Question:\n{question}\n\nDocuments:\n{catalogue}\n\nRelevant docIDs (JSON array):"
 
             ans = await self.chat_mdl.async_chat(
                 system=system,
@@ -1356,13 +1675,7 @@ class RAGTools:
 
     @tool(timeout=120)
     async def search_knowledge_bases(
-        self,
-        question: str,
-        keywords: str,
-        top_n: int = 6,
-        similarity_threshold: float = 0.2,
-        docid_scope: List[str] | None = None,
-        using_embedding : bool = False
+        self, question: str, keywords: str, top_n: int = 6, similarity_threshold: float = 0.2, docid_scope: List[str] | None = None, using_embedding: bool = False
     ) -> dict[str, Any]:
         """Search the user's knowledge bases for chunks relevant to a question.
 
@@ -1462,50 +1775,26 @@ class RAGTools:
         watchdog_task = asyncio.create_task(expire_local_work())
         search_fingerprint = None
         lock_acquired = False
-        planner_terminal_keys_before = None
-        validated_plan_keys_before = None
-        completed_search_keys_before = None
+        completed_search_stored = False
         kbinfos_before = None
         last_context_query_before = None
         citations_injected_before = None
+        prepared_agentic_plan = _PLAN_NOT_PREPARED
         try:
-            await self._agentic_search_lock.acquire()
-            lock_acquired = True
-            planner_terminal_keys_before = set(self._planner_terminal_ledger)
-            validated_plan_keys_before = set(self._validated_plan_cache)
-            completed_search_keys_before = set(self._completed_search_ledger)
-            kbinfos_before = deepcopy(self.kbinfos)
-            last_context_query_before = self._last_context_query
-            citations_injected_before = self._citations_injected
-            if not self.kb_ids:
-                result = {"total": 0, "chunks": [], "doc_aggs": {}}
-                self._trace_tool_end(tool_call_id, result=result)
-                return result
-
-            # Validate docid_scope against the actual catalogue — models often
-            # hallucinate 32-char hex strings, and the retriever silently returns
-            # zero chunks for unknown IDs (which then looks like "KB has nothing"
-            # to the calling LLM, when really the filter was bogus).
+            # Plan preparation is read-only with respect to retrieval/context state.
+            # Keep it outside the broad search lock so equivalent concurrent tool
+            # calls can elect and await one bounded planner owner.
             if docid_scope:
                 candidates = [d for d in docid_scope if isinstance(d, str)]
                 known = await thread_pool_exec(self._filter_known_doc_ids, candidates)
                 valid = [d for d in candidates if d in known]
                 if len(valid) != len(docid_scope):
                     dropped = [d for d in docid_scope if d not in known]
-                    logging.warning(
-                        f"search_knowledge_bases: dropping {len(dropped)}/{len(docid_scope)} "
-                        f"unknown doc IDs from docid_scope (samples: {dropped[:3]})"
-                    )
+                    logging.warning(f"search_knowledge_bases: dropping {len(dropped)}/{len(docid_scope)} unknown doc IDs from docid_scope (samples: {dropped[:3]})")
                 if valid:
                     docid_scope = valid
                 else:
-                    # Every supplied ID was bogus. Falling back to unfiltered
-                    # retrieval is safer than returning zero chunks and forcing
-                    # the LLM into a retry loop.
-                    logging.warning(
-                        "search_knowledge_bases: every supplied doc ID was unknown; "
-                        "falling back to unfiltered retrieval"
-                    )
+                    logging.warning("search_knowledge_bases: every supplied doc ID was unknown; falling back to unfiltered retrieval")
                     docid_scope = None
 
             fingerprint_scope = type("RAGAgentPlannerScope", (), {"kb_ids": self.kb_ids})()
@@ -1537,6 +1826,23 @@ class RAGTools:
                 similarity_threshold=similarity_threshold,
                 docid_scope=docid_scope,
             )
+            if search_fingerprint not in self._completed_search_ledger:
+                prepared_agentic_plan = await self._prepare_agentic_plan(
+                    question=question,
+                    docid_scope=docid_scope,
+                    top_n=top_n,
+                    tool_deadline=tool_deadline,
+                )
+            await self._agentic_search_lock.acquire()
+            lock_acquired = True
+            kbinfos_before = deepcopy(self.kbinfos)
+            last_context_query_before = self._last_context_query
+            citations_injected_before = self._citations_injected
+            if not self.kb_ids:
+                result = {"total": 0, "chunks": [], "doc_aggs": {}}
+                self._trace_tool_end(tool_call_id, result=result)
+                return result
+
             completed = self._completed_search_ledger.get(search_fingerprint)
             if completed is not None:
                 raise_if_local_work_deadline_exhausted()
@@ -1575,13 +1881,10 @@ class RAGTools:
                 top_n=top_n,
                 similarity_threshold=similarity_threshold,
                 tool_deadline=tool_deadline,
+                prepared_plan=prepared_agentic_plan,
             )
             raise_if_local_work_deadline_exhausted()
-            use_agentic_result = (
-                agentic_result is not None
-                and self.agentic_retrieval_config.mode == "active"
-                and not agentic_result.fallback_to_baseline
-            )
+            use_agentic_result = agentic_result is not None and self.agentic_retrieval_config.mode == "active" and not agentic_result.fallback_to_baseline
             refinement_result = None
             if self.agentic_refinement_config.enabled and self.agentic_refinement_config.mode != "off":
                 refinement_result = await self._try_agentic_refinement(
@@ -1619,21 +1922,9 @@ class RAGTools:
             embd_mdl = None
             if use_refinement_result:
                 kbinfos = deepcopy(refinement_result.kbinfos)
-                allowed_refinement_keys = {
-                    _refinement_storage_identity(chunk)
-                    for chunk in agentic_result.kbinfos.get("chunks", [])
-                    if isinstance(chunk, dict)
-                }
-                allowed_refinement_keys.update(
-                    _refinement_storage_identity(chunk)
-                    for chunk in refinement_result.accepted_chunks
-                    if isinstance(chunk, dict)
-                )
-                kbinfos["chunks"] = [
-                    chunk
-                    for chunk in kbinfos.get("chunks", [])
-                    if isinstance(chunk, dict) and _refinement_storage_identity(chunk) in allowed_refinement_keys
-                ]
+                allowed_refinement_keys = {_refinement_storage_identity(chunk) for chunk in agentic_result.kbinfos.get("chunks", []) if isinstance(chunk, dict)}
+                allowed_refinement_keys.update(_refinement_storage_identity(chunk) for chunk in refinement_result.accepted_chunks if isinstance(chunk, dict))
+                kbinfos["chunks"] = [chunk for chunk in kbinfos.get("chunks", []) if isinstance(chunk, dict) and _refinement_storage_identity(chunk) in allowed_refinement_keys]
                 selected_doc_ids = {chunk.get("doc_id") for chunk in kbinfos["chunks"] if chunk.get("doc_id")}
                 selected_doc_names = {
                     chunk.get("docnm_kwd") or chunk.get("document_name") or chunk.get("title")
@@ -1645,10 +1936,7 @@ class RAGTools:
                         doc_agg
                         for doc_agg in kbinfos["doc_aggs"]
                         if isinstance(doc_agg, dict)
-                        and (
-                            doc_agg.get("doc_id") in selected_doc_ids
-                            or (doc_agg.get("doc_name") or doc_agg.get("docnm_kwd") or doc_agg.get("document_name")) in selected_doc_names
-                        )
+                        and (doc_agg.get("doc_id") in selected_doc_ids or (doc_agg.get("doc_name") or doc_agg.get("docnm_kwd") or doc_agg.get("document_name")) in selected_doc_names)
                     ]
                 kbinfos["total"] = len(kbinfos["chunks"])
             elif use_agentic_result:
@@ -1719,17 +2007,9 @@ class RAGTools:
                     mark_chunks_source_type(kbinfos.get("chunks", []), "kb")
                 chunks_to_append = list(kbinfos.get("chunks", []))
                 if use_refinement_result:
-                    existing_keys = {
-                        _refinement_storage_identity(chunk)
-                        for chunk in self.kbinfos.get("chunks", [])
-                        if isinstance(chunk, dict)
-                    }
+                    existing_keys = {_refinement_storage_identity(chunk) for chunk in self.kbinfos.get("chunks", []) if isinstance(chunk, dict)}
                     deduped_chunks = []
-                    accepted_keys = {
-                        _refinement_storage_identity(chunk)
-                        for chunk in refinement_result.accepted_chunks
-                        if isinstance(chunk, dict)
-                    }
+                    accepted_keys = {_refinement_storage_identity(chunk) for chunk in refinement_result.accepted_chunks if isinstance(chunk, dict)}
                     for chunk in chunks_to_append:
                         identity = _refinement_storage_identity(chunk)
                         if identity in existing_keys:
@@ -1758,11 +2038,7 @@ class RAGTools:
             self._last_context_query = question
             context_stage = "rag_agent.search_knowledge_bases"
             if use_refinement_result:
-                accepted_iterations = [
-                    index
-                    for index, iteration in enumerate(refinement_result.iterations, start=1)
-                    if iteration.accepted_new_evidence_count > 0
-                ]
+                accepted_iterations = [index for index, iteration in enumerate(refinement_result.iterations, start=1) if iteration.accepted_new_evidence_count > 0]
                 if accepted_iterations:
                     context_stage = f"refinement.iteration.{accepted_iterations[-1]}"
             prompt_kbinfos = self.context_kbinfos(stage=context_stage, start_citation_index=self._prompt_start_idx(start_idx), query=question)
@@ -1864,6 +2140,7 @@ class RAGTools:
                 }
                 raise_if_local_work_deadline_exhausted()
                 self._completed_search_ledger[search_fingerprint] = deepcopy(completed_record)
+                completed_search_stored = True
                 if self.trace:
                     self.trace.add_agentic_retrieval_event(
                         "exact_result_cache",
@@ -1880,15 +2157,8 @@ class RAGTools:
             return result
         except asyncio.CancelledError:
             local_timeout = work_task in self._rag_agent_tool_expired_tasks
-            if planner_terminal_keys_before is not None:
-                for key in set(self._planner_terminal_ledger) - planner_terminal_keys_before:
-                    self._planner_terminal_ledger.pop(key, None)
-            if validated_plan_keys_before is not None:
-                for key in set(self._validated_plan_cache) - validated_plan_keys_before:
-                    self._validated_plan_cache.pop(key, None)
-            if completed_search_keys_before is not None:
-                for key in set(self._completed_search_ledger) - completed_search_keys_before:
-                    self._completed_search_ledger.pop(key, None)
+            if completed_search_stored and search_fingerprint is not None:
+                self._completed_search_ledger.pop(search_fingerprint, None)
             if kbinfos_before is not None:
                 self.kbinfos = kbinfos_before
                 self._last_context_query = last_context_query_before
@@ -1944,7 +2214,6 @@ class RAGTools:
                 except asyncio.CancelledError:
                     pass
             self._rag_agent_tool_expired_tasks.discard(work_task)
-
 
     def _retrieval_diagnostics(
         self,
@@ -2004,11 +2273,7 @@ class RAGTools:
 
         Sync DB call — wrap in ``thread_pool_exec`` at the call site.
         """
-        rows = list(
-            Document.select(Document.kb_id).where(
-                (Document.id == doc_id) & (Document.kb_id.in_(self.kb_ids))
-            )
-        )
+        rows = list(Document.select(Document.kb_id).where((Document.id == doc_id) & (Document.kb_id.in_(self.kb_ids))))
         if not rows:
             return None
         kb_id = rows[0].kb_id
@@ -2057,10 +2322,7 @@ class RAGTools:
 
             resolved = await thread_pool_exec(self._resolve_doc_tenant, doc_id)
             if resolved is None:
-                logging.warning(
-                    f"summarize_document: doc_id {doc_id!r} is not in any bound "
-                    "knowledge base — refusing to fetch (likely an LLM hallucination)"
-                )
+                logging.warning(f"summarize_document: doc_id {doc_id!r} is not in any bound knowledge base — refusing to fetch (likely an LLM hallucination)")
                 self._trace_tool_end(tool_call_id, result=[], result_summary={"chunk_count": 0, "doc_id": doc_id})
                 return []
             kb_id, tenant_id = resolved
@@ -2074,7 +2336,7 @@ class RAGTools:
                     doc_id,
                     tenant_id,
                     [kb_id],
-                    max_count=offset+128,
+                    max_count=offset + 128,
                     offset=offset,
                     fields=["content_with_weight", "docnm_kwd", "doc_id"],
                     sort_by_position=True,
@@ -2129,9 +2391,7 @@ class RAGTools:
                 self.kbinfos["chunks"].extend(kbinfos.get("chunks", []))
                 self.kbinfos["doc_aggs"].extend(kbinfos.get("doc_aggs", []))
             prompt_kbinfos = self.context_kbinfos(stage="rag_agent.summarize_document", start_citation_index=self._prompt_start_idx(start_idx))
-            result = self._with_citation_guidelines(
-                kb_prompt(prompt_kbinfos, self.chat_mdl.max_length, self._prompt_start_idx(start_idx))
-            )
+            result = self._with_citation_guidelines(kb_prompt(prompt_kbinfos, self.chat_mdl.max_length, self._prompt_start_idx(start_idx)))
             self._trace_tool_end(tool_call_id, result=result, result_summary={"retrieval_call_id": retrieval_call_id, "chunk_count": len(cks), "doc_id": doc_id})
             return result
         except Exception as e:
@@ -2282,10 +2542,12 @@ class RAGTools:
             self.kbinfos["chunks"].extend(tav_res["chunks"])
             self.kbinfos["doc_aggs"].extend(tav_res["doc_aggs"])
             prompt_kbinfos = self.context_kbinfos(stage="rag_agent.web_search", start_citation_index=self._prompt_start_idx(start_idx))
-            result = self._with_citation_guidelines(
-                kb_prompt(prompt_kbinfos, self.chat_mdl.max_length, self._prompt_start_idx(start_idx))
+            result = self._with_citation_guidelines(kb_prompt(prompt_kbinfos, self.chat_mdl.max_length, self._prompt_start_idx(start_idx)))
+            self._trace_tool_end(
+                tool_call_id,
+                result=result,
+                result_summary={"retrieval_call_id": retrieval_call_id, "chunk_count": len(tav_res.get("chunks", [])), "doc_agg_count": len(tav_res.get("doc_aggs", [])), "used_web": True},
             )
-            self._trace_tool_end(tool_call_id, result=result, result_summary={"retrieval_call_id": retrieval_call_id, "chunk_count": len(tav_res.get("chunks", [])), "doc_agg_count": len(tav_res.get("doc_aggs", [])), "used_web": True})
             return result
         except Exception as e:
             self._trace_tool_end(tool_call_id, success=False, error=e)

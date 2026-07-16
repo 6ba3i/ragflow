@@ -3,12 +3,7 @@
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #
-"""Phase 5 bounded query-time retrieval planning.
-
-The planner is an LLM helper that emits one bounded retrieval plan. Planner
-failures fall back directly to baseline retrieval; this module does not
-synthesize deterministic retrieval plans.
-"""
+"""Bounded query-time retrieval planning and sufficiency refinement."""
 
 from __future__ import annotations
 
@@ -25,6 +20,18 @@ from copy import copy, deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Literal
 
+from rag.advanced_rag.structured_output import (
+    PlannerContentV2,
+    STRUCTURED_OUTPUT_SCHEMA_VERSION,
+    StructuredOutputError,
+    StructuredOutputFailureReason,
+    StructuredOutputMode,
+    StructuredOutputResult,
+    SufficiencyDecisionV2,
+    canonical_json_schema,
+    canonical_output_instructions,
+    decode_structured_output,
+)
 from rag.utils.retrieval_diagnostics import make_retrieval_variant, resolve_variant_knobs
 
 AgenticRetrievalMode = Literal["off", "diagnostic", "shadow", "active"]
@@ -92,16 +99,6 @@ _TEMPORAL_TERMS = {"after", "before", "during", "when", "date", "year", "current
 _ALLOWED_COMPLEXITIES = {"simple", "multi_facet", "multi_hop", "comparison", "temporal", "list", "unknown"}
 _ALLOWED_EVIDENCE_TYPES = {"definition", "numeric", "date", "comparison", "quote", "list_item"}
 _ALLOWED_RETRIEVAL_VARIANTS = {"hybrid_default", "keyword_first", "embedding_retry"}
-_REQUIRED_PLANNER_KEYS = {
-    "plan_id",
-    "original_question",
-    "complexity",
-    "trigger_reasons",
-    "required_facets",
-    "subqueries",
-    "merge_policy",
-    "drift_controls",
-}
 _REQUIRED_JUDGE_KEYS = {
     "sufficient",
     "confidence",
@@ -112,6 +109,7 @@ _REQUIRED_JUDGE_KEYS = {
     "refusal_justified",
     "recommended_followups",
 }
+_REQUIRED_JUDGE_V2_KEYS = (_REQUIRED_JUDGE_KEYS - {"sufficient"}) | {"action"}
 _SUPPORTED_FACET_SUPPORT = {"strong", "weak"}
 _SUPPORTED_EXACT_FACT_TYPES = {"date", "number", "name"}
 _MAX_REFINEMENT_FOLLOWUP_TOP_N = 20
@@ -297,6 +295,7 @@ class BoundedRetrievalPlan:
     subqueries: tuple[SubquerySpec, ...]
     merge_policy: dict[str, Any] = field(default_factory=dict)
     drift_controls: dict[str, Any] = field(default_factory=dict)
+    plan_origin: Literal["llm_native", "llm_text", "deterministic_fallback"] = "llm_text"
 
     def to_trace_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -486,7 +485,7 @@ def build_planner_input(
             "metadata_filters": metadata_filters if isinstance(metadata_filters, dict) else {},
             "metadata_filters_enabled": bool(metadata_filters),
         },
-        "output_schema": _planner_output_schema(),
+        "output_schema": canonical_json_schema(PlannerContentV2),
         # Backward-compatible introspection fields. These are not used to synthesize plans.
         "kb_ids": kb_ids,
         "tenant_ids": list(tenant_ids or []),
@@ -499,13 +498,66 @@ def build_planner_input(
     }
 
 
+def build_deterministic_fallback_plan(
+    planner_input: dict[str, Any],
+    cfg: AgenticRetrievalConfig,
+) -> BoundedRetrievalPlan:
+    """Build one validated, bounded plan from application-owned request data."""
+    question = str(planner_input.get("original_question") or planner_input.get("question") or "").strip()
+    if not question:
+        raise ValueError("empty_original_question")
+
+    plan_id = str(planner_input.get("plan_id") or f"plan-{uuid.uuid4().hex[:12]}")
+    anchors = tuple(_anchors_for_text(question)[:6]) or tuple(token for token in _TOKEN_RE.findall(question) if len(token) > 2)[:6]
+    if not anchors:
+        raise ValueError("original_question_has_no_retrieval_terms")
+
+    features = _question_features(question)
+    if features.get("comparison"):
+        complexity = "comparison"
+    elif features.get("temporal"):
+        complexity = "temporal"
+    elif features.get("list_or_ranking"):
+        complexity = "list"
+    else:
+        complexity = "unknown"
+    facet = RequiredFacet(
+        facet_id="primary",
+        description=question[:240],
+        anchors=anchors,
+        evidence_type="quote",
+    )
+    subquery = SubquerySpec(
+        plan_id=plan_id,
+        subquery_id="original_query",
+        facet_id=facet.facet_id,
+        query=question,
+        keywords=question,
+        top_n=max(1, min(cfg.subquery_top_n, 30)),
+        retrieval_variant="hybrid_default",
+        must_have_terms=anchors[:8],
+        rationale="Use the original request without model-generated expansion.",
+    )
+    return BoundedRetrievalPlan(
+        plan_id=plan_id,
+        original_question=question,
+        complexity=complexity,
+        trigger_reasons=("planner_fallback",),
+        required_facets=(facet,),
+        subqueries=(subquery,),
+        merge_policy={"strategy": "subquery_rrf_then_context_builder", "max_chunks_per_facet": min(4, cfg.subquery_top_n)},
+        drift_controls={"anchor_entities": list(anchors), "min_anchor_overlap": cfg.min_anchor_overlap, "allow_new_entities": False},
+        plan_origin="deterministic_fallback",
+    )
+
+
 def build_llm_planner_prompt(
     planner_input: dict[str, Any],
     cfg: AgenticRetrievalConfig,
     *,
     repair_errors: tuple[str, ...] = (),
 ) -> tuple[str, list[dict[str, str]]]:
-    """Build the strict JSON-only prompt for the LLM retrieval planner."""
+    """Build a server-owned planner envelope plus canonical fillable output."""
     plan_id = str(planner_input.get("plan_id") or f"plan-{uuid.uuid4().hex[:12]}")
     prompt_input = {
         "plan_id": plan_id,
@@ -526,33 +578,29 @@ def build_llm_planner_prompt(
             "doc_ids": planner_input.get("doc_ids") or [],
             "metadata_filters": {},
         },
-        "output_schema": planner_input.get("output_schema") or _planner_output_schema(),
+        "output_schema": canonical_json_schema(PlannerContentV2),
     }
     system_prompt = (
         "You are a retrieval planning helper for RAGFlow.\n"
         "You do not answer the user.\n"
         "You create one bounded retrieval plan for the existing retriever.\n"
-        "Return strict JSON only.\n"
         "The plan must help retrieval find evidence chunks for the original question.\n"
-        "Do not include markdown fences, prose, explanations, citations, or tool calls."
+        "Do not call tools or choose execution policy.\n" + canonical_output_instructions(PlannerContentV2)
     )
     user_prompt = (
-        "Create exactly one bounded retrieval plan as a JSON object.\n"
-        f"Use plan_id exactly: {plan_id}.\n"
-        f"Create 2 to {max(2, cfg.max_subqueries)} subqueries when planning is triggered, but never exceed max_subqueries.\n"
+        "Fill the canonical planner object using the server-owned envelope below.\n"
+        "The envelope fields, including plan_id, question, scope, limits, and execution policy, must not be copied into the returned object.\n"
+        f"Create at most {cfg.max_subqueries} subqueries.\n"
         "Preserve original and facet anchors, do not invent unrelated new entities, and keep subqueries bounded.\n"
         "Use only allowed retrieval_variant and evidence_type values.\n"
         "Set docid_scope to null unless the provided document scope is explicitly required.\n"
-        "Set top_n at or below subquery_top_n.\n"
-        "Return only JSON matching the output_schema.\n\n"
-        + json.dumps(prompt_input, ensure_ascii=False, sort_keys=True)
+        "Set top_n at or below the envelope subquery_top_n.\n\n" + json.dumps(prompt_input, ensure_ascii=False, sort_keys=True)
     )
     if repair_errors:
         user_prompt += (
             "\n\nThe previous response failed strict parsing or validation. "
-            "Return one complete replacement JSON object from scratch; do not return a patch.\n"
-            "Sanitized machine errors: "
-            + json.dumps(list(repair_errors), ensure_ascii=True, sort_keys=True)
+            "Return one complete replacement JSON object from scratch using the canonical schema; do not return a patch.\n"
+            "Application failure codes: " + json.dumps(list(repair_errors), ensure_ascii=True, sort_keys=True)
         )
     return system_prompt, [{"role": "user", "content": user_prompt}]
 
@@ -625,13 +673,18 @@ def classify_planner_exception(exc: BaseException) -> dict[str, Any]:
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         class_name = type(current).__name__.lower()
-        timeout = timeout or isinstance(current, (asyncio.TimeoutError, TimeoutError)) or class_name in {
-            "apitimeouterror",
-            "connecttimeout",
-            "pooltimeout",
-            "readtimeout",
-            "writetimeout",
-        }
+        timeout = (
+            timeout
+            or isinstance(current, (asyncio.TimeoutError, TimeoutError))
+            or class_name
+            in {
+                "apitimeouterror",
+                "connecttimeout",
+                "pooltimeout",
+                "readtimeout",
+                "writetimeout",
+            }
+        )
         if class_name in {"ratelimiterror", "toomanyrequestserror"}:
             safe_class_category = safe_class_category or "rate_limit"
         elif class_name in {"authenticationerror", "permissiondeniederror", "unauthorizederror", "forbiddenerror"}:
@@ -753,30 +806,104 @@ def _safe_planner_validation_errors(errors: list[str]) -> list[str]:
 
 
 def parse_llm_planner_json(raw: Any) -> dict[str, Any]:
-    if not isinstance(raw, str):
-        raise AgenticPlannerError("planner_invalid_json", f"non_string_response:{type(raw).__name__}")
-    text = raw.strip()
-    if not text:
-        raise AgenticPlannerError("planner_invalid_json", "empty_response")
-    if "```" in text:
-        raise AgenticPlannerError("planner_invalid_json", "markdown_fence")
-    if not text.startswith("{"):
-        raise AgenticPlannerError("planner_invalid_json", "response_not_json_object")
-    if not text.endswith("}"):
-        raise AgenticPlannerError("planner_invalid_json", "trailing_or_incomplete_json")
-    decoder = json.JSONDecoder()
+    """Read historical planner JSON; live provider output uses the strict decoder."""
     try:
-        parsed, end = decoder.raw_decode(text)
-    except json.JSONDecodeError as exc:
-        raise AgenticPlannerError("planner_invalid_json", str(exc)) from exc
-    if text[end:].strip():
-        raise AgenticPlannerError("planner_invalid_json", "multiple_json_or_trailing_text")
-    if not isinstance(parsed, dict) or not parsed:
-        raise AgenticPlannerError("planner_invalid_json", "json_not_nonempty_object")
-    missing = sorted(_REQUIRED_PLANNER_KEYS.difference(parsed))
-    if missing:
-        raise AgenticPlannerError("planner_invalid_json", "missing_keys:" + ",".join(missing))
-    return parsed
+        response = StructuredOutputResult(StructuredOutputMode.TEXT_ONLY, None, raw, 0)
+        try:
+            return _decode_planner_response(response).model_dump(mode="python")
+        except StructuredOutputError as exc:
+            if exc.reason is not StructuredOutputFailureReason.UNKNOWN_FIELD:
+                raise
+            legacy = _plain_json_object(raw)
+            if legacy is None:
+                raise
+            extras = set(legacy).difference(PlannerContentV2.model_fields)
+            if not extras or not extras.issubset({"plan_id", "original_question"}):
+                raise
+            for field_name in extras:
+                legacy.pop(field_name, None)
+            return decode_structured_output(PlannerContentV2, structured_payload=legacy).model_dump(mode="python")
+    except StructuredOutputError as exc:
+        raise AgenticPlannerError("planner_invalid_json", exc.reason.value) from exc
+
+
+def _plain_json_object(text: Any) -> dict[str, Any] | None:
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if stripped.startswith("```json") and stripped.endswith("```"):
+        stripped = stripped[7:-3].strip()
+    elif stripped.startswith("```") and stripped.endswith("```"):
+        stripped = stripped[3:-3].strip()
+    try:
+        value = json.loads(stripped)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _decode_planner_response(response: StructuredOutputResult) -> PlannerContentV2:
+    return decode_structured_output(
+        PlannerContentV2,
+        structured_payload=response.structured_payload,
+        display_text=response.display_text,
+        require_structured_payload=response.mode is not StructuredOutputMode.TEXT_ONLY,
+    )
+
+
+def _decode_judge_response(response: StructuredOutputResult) -> SufficiencyDecisionV2:
+    return decode_structured_output(
+        SufficiencyDecisionV2,
+        structured_payload=response.structured_payload,
+        display_text=response.display_text,
+        require_structured_payload=response.mode is not StructuredOutputMode.TEXT_ONLY,
+    )
+
+
+def _planner_envelope_semantic_errors(content: PlannerContentV2, planner_input: dict[str, Any], cfg: AgenticRetrievalConfig) -> list[str]:
+    errors: list[str] = []
+    if len(content.subqueries) > cfg.max_subqueries:
+        errors.append("subquery_limit_exceeded")
+    allowed_doc_ids = {str(doc_id) for doc_id in ((planner_input.get("scope") or {}).get("doc_ids") or planner_input.get("doc_ids") or []) if str(doc_id)}
+    for subquery in content.subqueries:
+        if subquery.top_n > cfg.subquery_top_n:
+            errors.append(f"{subquery.subquery_id}:top_n_out_of_bounds")
+        if subquery.docid_scope is not None and (not allowed_doc_ids or any(doc_id not in allowed_doc_ids for doc_id in subquery.docid_scope)):
+            errors.append(f"{subquery.subquery_id}:invalid_scope")
+    return errors
+
+
+async def _request_structured_output(
+    chat_mdl: Any,
+    system_prompt: str,
+    messages: list[dict[str, str]],
+    model: type[PlannerContentV2] | type[SufficiencyDecisionV2],
+    *,
+    gen_conf: dict[str, Any],
+    tool_name: str,
+    force_text: bool = False,
+) -> StructuredOutputResult:
+    native = getattr(chat_mdl, "async_structured_output", None)
+    if callable(native):
+        return await native(
+            system_prompt,
+            messages,
+            canonical_json_schema(model),
+            mode=StructuredOutputMode.TEXT_ONLY if force_text else None,
+            gen_conf=gen_conf,
+            tool_name=tool_name,
+        )
+    raw = await chat_mdl.async_chat(system_prompt, messages, gen_conf)
+    if isinstance(raw, tuple):
+        display_text, used_tokens = raw
+    else:
+        display_text, used_tokens = raw, 0
+    return StructuredOutputResult(
+        mode=StructuredOutputMode.TEXT_ONLY,
+        structured_payload=None,
+        display_text=display_text,
+        used_tokens=int(used_tokens or 0),
+    )
 
 
 async def generate_llm_plan(
@@ -790,7 +917,7 @@ async def generate_llm_plan(
     operation_id: str | None = None,
     cleanup_callback: Any = None,
 ) -> BoundedRetrievalPlan:
-    if chat_mdl is None or not callable(getattr(chat_mdl, "async_chat", None)):
+    if chat_mdl is None or not any(callable(getattr(chat_mdl, name, None)) for name in ("async_structured_output", "async_chat")):
         _trace_planner_event(rag_trace, "planner_missing_chat_model", {"plan_id": planner_input.get("plan_id"), "mode": cfg.mode})
         raise AgenticPlannerError(
             "planner_missing_chat_model",
@@ -815,7 +942,17 @@ async def generate_llm_plan(
         "attempt_timeout_ms": effective_timeout_ms,
     }
     _trace_planner_event(rag_trace, "planner_llm_start", base_trace)
-    chat_task = asyncio.create_task(chat_mdl.async_chat(system_prompt, messages, gen_conf))
+    chat_task = asyncio.create_task(
+        _request_structured_output(
+            chat_mdl,
+            system_prompt,
+            messages,
+            PlannerContentV2,
+            gen_conf=gen_conf,
+            tool_name="ragflow_retrieval_plan",
+            force_text=bool(repair_errors),
+        )
+    )
     try:
         done, _ = await asyncio.wait({chat_task}, timeout=timeout_s)
     except asyncio.CancelledError:
@@ -846,15 +983,23 @@ async def generate_llm_plan(
         )
         raise AgenticPlannerError("planner_timeout", "attempt_deadline_exceeded", **failure)
     try:
-        raw = await chat_task
+        response = await chat_task
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         latency_ms = round((time.monotonic() - started) * 1000.0, 3)
         failure = classify_planner_exception(exc)
         _trace_planner_event(rag_trace, "planner_llm_error", {**base_trace, "latency_ms": latency_ms, **failure})
-        raise AgenticPlannerError("planner_provider_error", failure_class=failure["failure_class"], retryable=failure["retryable"], status_code=failure["status_code"], bounded_retry_after_ms=failure["bounded_retry_after_ms"], safe_category=failure["safe_category"]) from exc
+        raise AgenticPlannerError(
+            "planner_provider_error",
+            failure_class=failure["failure_class"],
+            retryable=failure["retryable"],
+            status_code=failure["status_code"],
+            bounded_retry_after_ms=failure["bounded_retry_after_ms"],
+            safe_category=failure["safe_category"],
+        ) from exc
 
+    raw = response.display_text
     returned_failure = _native_provider_error_sentinel(raw)
     returned_error_shape = "native_sentinel"
     if returned_failure is None:
@@ -877,18 +1022,72 @@ async def generate_llm_plan(
         )
 
     try:
-        raw_plan = parse_llm_planner_json(raw)
-    except AgenticPlannerError as exc:
+        decoded = _decode_planner_response(response)
+        raw_plan = decoded.model_dump(mode="python")
+    except StructuredOutputError as exc:
+        latency_ms = round((time.monotonic() - started) * 1000.0, 3)
+        schema_reasons = {
+            StructuredOutputFailureReason.UNKNOWN_FIELD,
+            StructuredOutputFailureReason.MISSING_REQUIRED_FIELD,
+            StructuredOutputFailureReason.WRONG_TYPE,
+            StructuredOutputFailureReason.INVALID_ENUM,
+            StructuredOutputFailureReason.VALUE_OUT_OF_BOUNDS,
+            StructuredOutputFailureReason.ARRAY_TOO_LONG,
+            StructuredOutputFailureReason.DUPLICATE_ITEM,
+            StructuredOutputFailureReason.SEMANTIC_VALIDATION_FAILED,
+            StructuredOutputFailureReason.UNSUPPORTED_ACTION,
+        }
+        failure_class = "validation" if exc.reason in schema_reasons else "invalid_json"
+        event_name = "planner_llm_validation_failed" if failure_class == "validation" else "planner_llm_invalid_json"
+        _trace_planner_event(
+            rag_trace,
+            event_name,
+            {
+                **base_trace,
+                "latency_ms": latency_ms,
+                "raw_response_chars": len(str(raw or "")),
+                "fallback_reason": exc.reason.value,
+                "validation_errors": [exc.reason.value] if failure_class == "validation" else [],
+                "structured_output_mode": response.mode.value,
+                "failure_class": failure_class,
+                "retryable": True,
+            },
+        )
+        raise AgenticPlannerError(
+            "planner_invalid_json" if failure_class == "invalid_json" else "planner_validation_failed",
+            exc.reason.value,
+            failure_class=failure_class,
+            retryable=True,
+            safe_category=f"planner_{exc.reason.value}",
+        ) from exc
+
+    envelope_errors = _planner_envelope_semantic_errors(decoded, planner_input, cfg)
+    if envelope_errors:
         latency_ms = round((time.monotonic() - started) * 1000.0, 3)
         _trace_planner_event(
             rag_trace,
-            "planner_llm_invalid_json",
-            {**base_trace, "latency_ms": latency_ms, "raw_response_chars": len(str(raw or "")), "fallback_reason": exc.reason, "detail": exc.detail, "failure_class": "invalid_json", "retryable": True},
+            "planner_llm_validation_failed",
+            {
+                **base_trace,
+                "latency_ms": latency_ms,
+                "validation_errors": envelope_errors,
+                "fallback_reason": ";".join(envelope_errors),
+                "structured_output_mode": response.mode.value,
+                "failure_class": "validation",
+                "retryable": True,
+            },
         )
-        raise AgenticPlannerError(exc.reason, exc.detail, failure_class="invalid_json", retryable=True, safe_category="planner_invalid_json") from exc
+        raise AgenticPlannerError(
+            "planner_validation_failed",
+            ";".join(envelope_errors),
+            failure_class="validation",
+            retryable=True,
+            safe_category="planner_semantic_validation",
+        )
 
     raw_plan["plan_id"] = plan_id
     raw_plan["original_question"] = str(planner_input.get("original_question") or planner_input.get("question") or raw_plan.get("original_question") or "")
+    raw_plan["plan_origin"] = "llm_text" if response.mode is StructuredOutputMode.TEXT_ONLY else "llm_native"
     for subquery in raw_plan.get("subqueries") or []:
         if isinstance(subquery, dict):
             subquery["plan_id"] = plan_id
@@ -927,6 +1126,10 @@ async def generate_llm_plan(
             "latency_ms": latency_ms,
             "model": model_name,
             "raw_response_chars": len(str(raw or "")),
+            "structured_output_mode": response.mode.value,
+            "structured_payload_present": response.structured_payload is not None,
+            "schema_version": STRUCTURED_OUTPUT_SCHEMA_VERSION,
+            "plan_origin": validation.plan.plan_origin,
             "subquery_count": len(validation.plan.subqueries),
             "facet_count": len(validation.plan.required_facets),
             "complexity": validation.plan.complexity,
@@ -950,6 +1153,7 @@ def validate_plan(plan: BoundedRetrievalPlan | dict[str, Any], cfg: AgenticRetri
             subqueries=(),
             merge_policy={},
             drift_controls={"anchor_entities": [], "min_anchor_overlap": cfg.min_anchor_overlap, "allow_new_entities": False},
+            plan_origin="deterministic_fallback",
         )
         return PlanValidationResult(False, [fallback], empty, fallback_reason=fallback)
     if not plan.original_question.strip():
@@ -982,11 +1186,7 @@ def validate_plan(plan: BoundedRetrievalPlan | dict[str, Any], cfg: AgenticRetri
         if overlap < cfg.min_anchor_overlap:
             errors.append(f"{subquery.subquery_id}:anchor_drift")
             continue
-        new_entities = {
-            entity
-            for entity in set(_proper_entities(subquery.query)).difference(original_entities)
-            if entity.lower() not in original_anchor_keys
-        }
+        new_entities = {entity for entity in set(_proper_entities(subquery.query)).difference(original_entities) if entity.lower() not in original_anchor_keys}
         if new_entities:
             errors.append(f"{subquery.subquery_id}:new_entities:{','.join(sorted(new_entities))}")
             continue
@@ -1004,6 +1204,7 @@ def validate_plan(plan: BoundedRetrievalPlan | dict[str, Any], cfg: AgenticRetri
         subqueries=tuple(kept_subqueries),
         merge_policy=plan.merge_policy,
         drift_controls=plan.drift_controls,
+        plan_origin=plan.plan_origin,
     )
     fallback_reason = ";".join(errors) if errors else None
     return PlanValidationResult(fallback_reason is None and bool(kept_subqueries), errors, normalized, fallback_reason=fallback_reason)
@@ -1044,11 +1245,7 @@ def detect_missing_facets(question: str, plan: BoundedRetrievalPlan, kbinfos: di
         gap = _exact_fact_gap(question, facet, combined)
         if gap:
             exact_fact_gaps.append(gap)
-            missing = [
-                item
-                for item in missing
-                if item["facet_id"] != facet.facet_id or item["reason"] not in {"weak_source_diversity", "redundant_selected_evidence"}
-            ]
+            missing = [item for item in missing if item["facet_id"] != facet.facet_id or item["reason"] not in {"weak_source_diversity", "redundant_selected_evidence"}]
             if not any(item["facet_id"] == facet.facet_id and item["reason"] == "exact_fact_absent" for item in missing):
                 missing.append({"facet_id": facet.facet_id, "reason": "exact_fact_absent", "required_anchors": list(facet.anchors)})
 
@@ -1073,6 +1270,7 @@ def detect_missing_facets(question: str, plan: BoundedRetrievalPlan, kbinfos: di
 
 
 def parse_sufficiency_judge_json(raw: Any) -> dict[str, Any]:
+    """Read historical judge JSON; live provider output uses the strict decoder."""
     if not isinstance(raw, str):
         raise AgenticRefinementError("refinement_judge_invalid_json", f"non_string_response:{type(raw).__name__}")
     text = raw.strip()
@@ -1090,7 +1288,10 @@ def parse_sufficiency_judge_json(raw: Any) -> dict[str, Any]:
         raise AgenticRefinementError("refinement_judge_invalid_json", "multiple_json_or_trailing_text")
     if not isinstance(parsed, dict) or not parsed:
         raise AgenticRefinementError("refinement_judge_invalid_json", "json_not_nonempty_object")
-    missing = sorted(_REQUIRED_JUDGE_KEYS.difference(parsed))
+    if "action" in parsed:
+        missing = sorted(_REQUIRED_JUDGE_V2_KEYS.difference(parsed))
+    else:
+        missing = sorted(_REQUIRED_JUDGE_KEYS.difference(parsed))
     if missing:
         raise AgenticRefinementError("refinement_judge_validation_failed", "missing_keys:" + ",".join(missing))
     return parsed
@@ -1105,6 +1306,14 @@ def validate_sufficiency_judge(
 ) -> SufficiencyJudge:
     if not isinstance(raw, dict) or not raw:
         raise AgenticRefinementError("refinement_judge_validation_failed", "judge_not_nonempty_object")
+    raw = dict(raw)
+    if "action" in raw:
+        if "sufficient" in raw:
+            raise AgenticRefinementError("refinement_judge_validation_failed", "action_and_sufficient_are_mutually_exclusive")
+        action = raw.pop("action")
+        if action not in {"sufficient", "refine"}:
+            raise AgenticRefinementError("refinement_judge_unsupported_action", str(action))
+        raw["sufficient"] = action == "sufficient"
     missing_keys = sorted(_REQUIRED_JUDGE_KEYS.difference(raw))
     if missing_keys:
         raise AgenticRefinementError("refinement_judge_validation_failed", "missing_keys:" + ",".join(missing_keys))
@@ -1244,6 +1453,8 @@ def build_sufficiency_judge_prompt(
     plan: BoundedRetrievalPlan,
     kbinfos: dict[str, Any],
     cfg: AgenticRefinementConfig,
+    *,
+    repair_errors: tuple[str, ...] = (),
 ) -> tuple[str, list[dict[str, str]]]:
     facets = [asdict(facet) for facet in plan.required_facets]
     evidence = [
@@ -1259,8 +1470,7 @@ def build_sufficiency_judge_prompt(
     system_prompt = (
         "You are a sufficiency judge for RAGFlow retrieval evidence.\n"
         "Evaluate evidence only; do not answer the user, retrieve documents, or call tools.\n"
-        "Return exactly one strict JSON object without markdown or prose.\n"
-        "Recommended followups may target only missing facet IDs from the supplied Phase 5 plan."
+        "Recommended followups may target only missing facet IDs from the supplied Phase 5 plan.\n" + canonical_output_instructions(SufficiencyDecisionV2)
     )
     payload = {
         "original_question": question,
@@ -1268,18 +1478,14 @@ def build_sufficiency_judge_prompt(
         "required_facets": facets,
         "selected_evidence": evidence,
         "limits": {"max_followup_queries": cfg.normalized().max_followup_queries, "max_top_n": _MAX_REFINEMENT_FOLLOWUP_TOP_N},
-        "output_schema": {
-            "sufficient": False,
-            "confidence": 0.0,
-            "covered_facets": [{"facet_id": "f1", "evidence_ids": ["e1"], "support": "strong|weak"}],
-            "missing_facets": [{"facet_id": "f2", "reason": "string", "required_anchors": ["string"]}],
-            "contradictions": [{"facet_id": "f3", "evidence_ids": ["e2", "e7"], "description": "string"}],
-            "exact_fact_gaps": [{"type": "date|number|name", "description": "string"}],
-            "refusal_justified": False,
-            "recommended_followups": [{"facet_id": "f2", "query": "string", "keywords": None, "top_n": 5}],
-        },
+        "output_schema": canonical_json_schema(SufficiencyDecisionV2),
     }
-    return system_prompt, [{"role": "user", "content": json.dumps(payload, ensure_ascii=False, sort_keys=True)}]
+    user_content = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if repair_errors:
+        user_content += "\nThe previous response failed. Return one complete replacement canonical object, not a patch.\nApplication failure codes: " + json.dumps(
+            list(repair_errors), ensure_ascii=True, sort_keys=True
+        )
+    return system_prompt, [{"role": "user", "content": user_content}]
 
 
 async def generate_sufficiency_judge(
@@ -1294,18 +1500,36 @@ async def generate_sufficiency_judge(
     timeout_ms: int | None = None,
     remaining_budget_ms: float | None = None,
     cleanup_callback: Any = None,
+    _repair_errors: tuple[str, ...] = (),
 ) -> SufficiencyJudge:
-    if chat_mdl is None or not callable(getattr(chat_mdl, "async_chat", None)):
+    if chat_mdl is None or not any(callable(getattr(chat_mdl, name, None)) for name in ("async_structured_output", "async_chat")):
         raise AgenticRefinementError("refinement_judge_missing_chat_model")
-    system_prompt, messages = build_sufficiency_judge_prompt(question, plan, kbinfos, cfg)
+    system_prompt, messages = build_sufficiency_judge_prompt(question, plan, kbinfos, cfg, repair_errors=_repair_errors)
     started = time.monotonic()
     effective_timeout_ms = max(1, min(int(timeout_ms or cfg.normalized().judge_timeout_ms), cfg.normalized().judge_timeout_ms))
     _trace_refinement_event(
         rag_trace,
         "refinement_judge_start",
-        {"plan_id": plan.plan_id, "iteration_id": iteration_id, "mode": cfg.mode, "judge_timeout_ms": effective_timeout_ms, "remaining_refinement_budget_ms": remaining_budget_ms},
+        {
+            "plan_id": plan.plan_id,
+            "iteration_id": iteration_id,
+            "mode": cfg.mode,
+            "judge_timeout_ms": effective_timeout_ms,
+            "remaining_refinement_budget_ms": remaining_budget_ms,
+            "repair": bool(_repair_errors),
+        },
     )
-    judge_task = asyncio.create_task(chat_mdl.async_chat(system_prompt, messages, {"temperature": 0.0, "top_p": 0.1}))
+    judge_task = asyncio.create_task(
+        _request_structured_output(
+            chat_mdl,
+            system_prompt,
+            messages,
+            SufficiencyDecisionV2,
+            gen_conf={"temperature": 0.0, "top_p": 0.1},
+            tool_name="ragflow_sufficiency_decision",
+            force_text=bool(_repair_errors),
+        )
+    )
     try:
         done, _ = await asyncio.wait(
             {judge_task},
@@ -1348,23 +1572,30 @@ async def generate_sufficiency_judge(
         _trace_refinement_event(
             rag_trace,
             "refinement_judge_timeout",
-            {"plan_id": plan.plan_id, "iteration_id": iteration_id, "mode": cfg.mode, "latency_ms": latency_ms, "cleanup_latency_ms": cleanup_ms, "judge_timeout_ms": effective_timeout_ms, "judge_outcome": "timeout", "remaining_refinement_budget_ms": remaining_budget_ms, "timeout_owner": "phase6_judge"},
+            {
+                "plan_id": plan.plan_id,
+                "iteration_id": iteration_id,
+                "mode": cfg.mode,
+                "latency_ms": latency_ms,
+                "cleanup_latency_ms": cleanup_ms,
+                "judge_timeout_ms": effective_timeout_ms,
+                "judge_outcome": "timeout",
+                "remaining_refinement_budget_ms": remaining_budget_ms,
+                "timeout_owner": "phase6_judge",
+            },
         )
         raise AgenticRefinementError("refinement_judge_timeout")
     try:
-        raw = await judge_task
+        response = await judge_task
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         _trace_refinement_event(rag_trace, "refinement_judge_validation_failed", {"plan_id": plan.plan_id, "iteration_id": iteration_id, "mode": cfg.mode, "fallback_reason": "judge_error"})
-        raise AgenticRefinementError("refinement_judge_error", str(exc)) from exc
+        raise AgenticRefinementError("refinement_judge_error", "provider_error") from exc
     try:
-        parsed = parse_sufficiency_judge_json(raw)
-        selected_evidence_ids = {
-            _evidence_id(chunk)
-            for chunk in ((kbinfos or {}).get("chunks") or [])
-            if isinstance(chunk, dict)
-        }
+        decoded = _decode_judge_response(response)
+        parsed = decoded.model_dump(mode="python")
+        selected_evidence_ids = {_evidence_id(chunk) for chunk in ((kbinfos or {}).get("chunks") or []) if isinstance(chunk, dict)}
         judge = validate_sufficiency_judge(
             parsed,
             plan,
@@ -1372,9 +1603,23 @@ async def generate_sufficiency_judge(
             iteration_id=iteration_id,
             selected_evidence_ids=selected_evidence_ids,
         )
-    except AgenticRefinementError as exc:
+    except (AgenticRefinementError, StructuredOutputError) as exc:
         latency_ms = round((time.monotonic() - started) * 1000.0, 3)
-        event = "refinement_judge_invalid_json" if exc.reason == "refinement_judge_invalid_json" else "refinement_judge_validation_failed"
+        if isinstance(exc, StructuredOutputError):
+            detail = exc.reason.value
+            syntax_reasons = {
+                StructuredOutputFailureReason.EMPTY_RESPONSE,
+                StructuredOutputFailureReason.PROVIDER_STRUCTURED_PAYLOAD_MISSING,
+                StructuredOutputFailureReason.UNEXPECTED_TEXT,
+                StructuredOutputFailureReason.JSON_OBJECT_NOT_FOUND,
+                StructuredOutputFailureReason.JSON_DECODE_ERROR,
+                StructuredOutputFailureReason.TRUNCATED_OUTPUT,
+            }
+            reason = "refinement_judge_invalid_json" if exc.reason in syntax_reasons else "refinement_judge_validation_failed"
+        else:
+            detail = exc.detail or exc.reason
+            reason = exc.reason
+        event = "refinement_judge_invalid_json" if reason == "refinement_judge_invalid_json" else "refinement_judge_validation_failed"
         _trace_refinement_event(
             rag_trace,
             event,
@@ -1383,11 +1628,48 @@ async def generate_sufficiency_judge(
                 "iteration_id": iteration_id,
                 "mode": cfg.mode,
                 "latency_ms": latency_ms,
-                "fallback_reason": exc.reason,
-                "failure_class": exc.reason,
+                "fallback_reason": reason,
+                "failure_class": detail,
+                "structured_output_mode": response.mode.value,
+                "repair": bool(_repair_errors),
             },
         )
-        raise
+        if not _repair_errors:
+            remaining_ms = max(1, effective_timeout_ms - int(latency_ms))
+            try:
+                return await generate_sufficiency_judge(
+                    question=question,
+                    plan=plan,
+                    kbinfos=kbinfos,
+                    cfg=cfg,
+                    chat_mdl=chat_mdl,
+                    rag_trace=rag_trace,
+                    iteration_id=iteration_id,
+                    timeout_ms=remaining_ms,
+                    remaining_budget_ms=remaining_budget_ms,
+                    cleanup_callback=cleanup_callback,
+                    _repair_errors=(detail,),
+                )
+            except AgenticRefinementError as repair_exc:
+                _trace_refinement_event(
+                    rag_trace,
+                    "refinement_judge_repair_failed",
+                    {
+                        "plan_id": plan.plan_id,
+                        "iteration_id": iteration_id,
+                        "mode": cfg.mode,
+                        "fallback_reason": "repair_failed",
+                        "failure_class": StructuredOutputFailureReason.REPAIR_FAILED.value,
+                        "initial_failure": detail,
+                        "repair_failure": repair_exc.detail or repair_exc.reason,
+                        "structured_output_mode": response.mode.value,
+                        "repair": True,
+                    },
+                )
+                raise AgenticRefinementError(reason, f"repair_failed:{repair_exc.detail or repair_exc.reason}") from repair_exc
+        if isinstance(exc, AgenticRefinementError):
+            raise
+        raise AgenticRefinementError(reason, detail) from exc
     latency_ms = round((time.monotonic() - started) * 1000.0, 3)
     _trace_refinement_event(
         rag_trace,
@@ -1405,6 +1687,10 @@ async def generate_sufficiency_judge(
             "missing_facet_count": len(judge.missing_facets),
             "contradiction_count": len(judge.contradictions),
             "followup_count": len(judge.recommended_followups),
+            "structured_output_mode": response.mode.value,
+            "structured_payload_present": response.structured_payload is not None,
+            "schema_version": STRUCTURED_OUTPUT_SCHEMA_VERSION,
+            "repair": bool(_repair_errors),
         },
     )
     return judge
@@ -1418,10 +1704,7 @@ def validate_followup_queries(
 ) -> tuple[tuple[FollowupQuerySpec, ...], tuple[dict[str, Any], ...]]:
     config = cfg.normalized()
     missing_ids = {item["facet_id"] for item in judge.missing_facets}
-    missing_required_anchors = {
-        item["facet_id"]: tuple(item.get("required_anchors") or ())
-        for item in judge.missing_facets
-    }
+    missing_required_anchors = {item["facet_id"]: tuple(item.get("required_anchors") or ()) for item in judge.missing_facets}
     facets = {facet.facet_id: facet for facet in plan.required_facets}
     accepted: list[FollowupQuerySpec] = []
     rejected: list[dict[str, Any]] = []
@@ -1485,7 +1768,9 @@ def accept_followup_evidence(
         if not isinstance(followup, FollowupQuerySpec):
             spec = lane.get("subquery")
             if isinstance(spec, SubquerySpec):
-                followup = FollowupQuerySpec(plan_id=plan.plan_id, facet_id=spec.facet_id, query=spec.query, followup_id=spec.subquery_id, keywords=spec.keywords, top_n=spec.top_n, retrieval_variant=spec.retrieval_variant)
+                followup = FollowupQuerySpec(
+                    plan_id=plan.plan_id, facet_id=spec.facet_id, query=spec.query, followup_id=spec.subquery_id, keywords=spec.keywords, top_n=spec.top_n, retrieval_variant=spec.retrieval_variant
+                )
         chunks = [chunk for chunk in ((lane.get("kbinfos") or {}).get("chunks") or []) if isinstance(chunk, dict)]
         if not lane.get("accepted") or not isinstance(followup, FollowupQuerySpec):
             for chunk in chunks:
@@ -1512,10 +1797,7 @@ def accept_followup_evidence(
             default=None,
         )
         group_text = "\n".join(_chunk_text(chunk) for chunk in chunks[: min(3, len(chunks))])
-        if (
-            followup.facet_id not in missing_facet_ids
-            or not _text_satisfies_required_anchors(group_text, allowed_anchors)
-        ):
+        if followup.facet_id not in missing_facet_ids or not _text_satisfies_required_anchors(group_text, allowed_anchors):
             for chunk in chunks:
                 rejected.append(_mark_refinement_chunk(chunk, followup, selected=False, reason="result_facet_or_title_drift"))
             continue
@@ -1557,11 +1839,7 @@ def accept_followup_evidence(
     if not accepted:
         return EvidenceAcceptanceResult(kbinfos=current, accepted_chunks=(), rejected_chunks=tuple(rejected), candidate_kbinfos=candidates)
     accepted_by_key = {_refinement_chunk_identity(chunk): chunk for chunk in accepted}
-    selected["chunks"] = [
-        accepted_by_key.get(_refinement_chunk_identity(chunk), chunk)
-        for chunk in selected.get("chunks", [])
-        if isinstance(chunk, dict)
-    ]
+    selected["chunks"] = [accepted_by_key.get(_refinement_chunk_identity(chunk), chunk) for chunk in selected.get("chunks", []) if isinstance(chunk, dict)]
     selected["total"] = len(selected["chunks"])
     selected["doc_aggs"] = _merge_doc_aggs([], selected["chunks"])
     committed_candidate = deepcopy(candidates)
@@ -1635,7 +1913,9 @@ async def run_refinement_loop(
         return RefinementResult(kbinfos=previous, candidate_kbinfos=previous_candidates, iterations=(), stop_reason="disabled")
     if not isinstance(plan, BoundedRetrievalPlan) or not plan.required_facets or not question.strip():
         _trace_refinement_event(rag_trace, "refinement_skip", {"mode": config.mode, "plan_id": getattr(plan, "plan_id", None), "stop_reason": "phase5_plan_unavailable"})
-        return RefinementResult(kbinfos=previous, candidate_kbinfos=previous_candidates, iterations=(), fallback_to_previous_context=True, fallback_reason="phase5_plan_unavailable", stop_reason="phase5_plan_unavailable")
+        return RefinementResult(
+            kbinfos=previous, candidate_kbinfos=previous_candidates, iterations=(), fallback_to_previous_context=True, fallback_reason="phase5_plan_unavailable", stop_reason="phase5_plan_unavailable"
+        )
 
     initial_diagnostics = detect_missing_facets(question, plan, previous)
     _trace_refinement_event(
@@ -1661,7 +1941,9 @@ async def run_refinement_loop(
             "rejected_followup_count": 0,
         }
         _trace_refinement_event(rag_trace, "refinement_stop", diagnostic_payload)
-        return RefinementResult(kbinfos=previous, candidate_kbinfos=previous_candidates, iterations=(), stop_reason="diagnostic_only", diagnostics={"heuristic": initial_diagnostics, **diagnostic_payload})
+        return RefinementResult(
+            kbinfos=previous, candidate_kbinfos=previous_candidates, iterations=(), stop_reason="diagnostic_only", diagnostics={"heuristic": initial_diagnostics, **diagnostic_payload}
+        )
 
     current = previous
     current_candidates = previous_candidates
@@ -1844,7 +2126,11 @@ async def run_refinement_loop(
         calls_used += len(followups)
         followup_count_total += len(followups)
         for followup in followups:
-            _trace_refinement_event(rag_trace, "refinement_followup_built", {"mode": config.mode, "plan_id": plan.plan_id, "iteration_id": iteration_id, "followup_id": followup.followup_id, "facet_id": followup.facet_id, "top_n": followup.top_n})
+            _trace_refinement_event(
+                rag_trace,
+                "refinement_followup_built",
+                {"mode": config.mode, "plan_id": plan.plan_id, "iteration_id": iteration_id, "followup_id": followup.followup_id, "facet_id": followup.facet_id, "top_n": followup.top_n},
+            )
         _trace_refinement_event(rag_trace, "refinement_followup_execute_start", {"mode": config.mode, "plan_id": plan.plan_id, "iteration_id": iteration_id, "followup_count": len(followups)})
         tasks = []
         for followup in followups:
@@ -1931,10 +2217,7 @@ async def run_refinement_loop(
             lane_results=normalized_lanes,
             plan=plan,
             missing_facet_ids={item["facet_id"] for item in judge.missing_facets},
-            missing_required_anchors={
-                item["facet_id"]: tuple(item.get("required_anchors") or ())
-                for item in judge.missing_facets
-            },
+            missing_required_anchors={item["facet_id"]: tuple(item.get("required_anchors") or ()) for item in judge.missing_facets},
             question=question,
             context_builder_config=context_builder_config,
         )
@@ -1942,14 +2225,33 @@ async def run_refinement_loop(
         if elapsed_ms >= config.latency_budget_ms:
             return stop_result("latency_budget_exceeded", elapsed_ms, fallback=True, timeout_owner="phase6_total")
         for chunk in acceptance.rejected_chunks:
-            _trace_refinement_event(rag_trace, "refinement_evidence_rejected", {"mode": config.mode, "plan_id": plan.plan_id, "iteration_id": iteration_id, "evidence_id": _evidence_id(chunk), "facet_id": chunk.get("facet_id"), "rejection_reason": chunk.get("rejection_reason")})
+            _trace_refinement_event(
+                rag_trace,
+                "refinement_evidence_rejected",
+                {
+                    "mode": config.mode,
+                    "plan_id": plan.plan_id,
+                    "iteration_id": iteration_id,
+                    "evidence_id": _evidence_id(chunk),
+                    "facet_id": chunk.get("facet_id"),
+                    "rejection_reason": chunk.get("rejection_reason"),
+                },
+            )
         if acceptance.selected_new_evidence_count < config.min_new_evidence:
-            threshold_rejected = [
-                _mark_refinement_chunk(chunk, _followup_from_chunk(chunk), selected=False, reason="min_new_evidence_not_met")
-                for chunk in acceptance.accepted_chunks
-            ]
+            threshold_rejected = [_mark_refinement_chunk(chunk, _followup_from_chunk(chunk), selected=False, reason="min_new_evidence_not_met") for chunk in acceptance.accepted_chunks]
             for chunk in threshold_rejected:
-                _trace_refinement_event(rag_trace, "refinement_evidence_rejected", {"mode": config.mode, "plan_id": plan.plan_id, "iteration_id": iteration_id, "evidence_id": _evidence_id(chunk), "facet_id": chunk.get("facet_id"), "rejection_reason": "min_new_evidence_not_met"})
+                _trace_refinement_event(
+                    rag_trace,
+                    "refinement_evidence_rejected",
+                    {
+                        "mode": config.mode,
+                        "plan_id": plan.plan_id,
+                        "iteration_id": iteration_id,
+                        "evidence_id": _evidence_id(chunk),
+                        "facet_id": chunk.get("facet_id"),
+                        "rejection_reason": "min_new_evidence_not_met",
+                    },
+                )
             rejected_all.extend(acceptance.rejected_chunks)
             rejected_all.extend(threshold_rejected)
             iterations.append(
@@ -1969,7 +2271,11 @@ async def run_refinement_loop(
             return stop_result("no_selected_new_evidence", (time.monotonic() - loop_started) * 1000.0)
 
         for chunk in acceptance.accepted_chunks:
-            _trace_refinement_event(rag_trace, "refinement_evidence_accepted", {"mode": config.mode, "plan_id": plan.plan_id, "iteration_id": iteration_id, "evidence_id": _evidence_id(chunk), "facet_id": chunk.get("facet_id")})
+            _trace_refinement_event(
+                rag_trace,
+                "refinement_evidence_accepted",
+                {"mode": config.mode, "plan_id": plan.plan_id, "iteration_id": iteration_id, "evidence_id": _evidence_id(chunk), "facet_id": chunk.get("facet_id")},
+            )
         current = acceptance.kbinfos
         current_candidates = acceptance.candidate_kbinfos or current_candidates
         accepted_all.extend(acceptance.accepted_chunks)
@@ -2039,27 +2345,29 @@ async def execute_bounded_plan(
 ) -> BoundedRetrievalResult:
     started = time.monotonic()
     tasks = [
-        asyncio.create_task(_execute_subquery(
-            spec,
-            plan,
-            retriever=retriever,
-            embd_mdl=embd_mdl,
-            tenant_ids=tenant_ids,
-            kb_ids=kb_ids,
-            doc_ids=doc_ids,
-            similarity_threshold=similarity_threshold,
-            vector_similarity_weight=vector_similarity_weight,
-            top_k=top_k,
-            rank_feature=rank_feature,
-            rerank_mdl=rerank_mdl,
-            cfg=cfg,
-            rag_trace=rag_trace,
-            metadata_filters=metadata_filters,
-            apply_children=apply_children,
-            apply_toc=apply_toc,
-            chat_mdl=chat_mdl,
-            enforce_result_anchor_drift=enforce_result_anchor_drift,
-        ))
+        asyncio.create_task(
+            _execute_subquery(
+                spec,
+                plan,
+                retriever=retriever,
+                embd_mdl=embd_mdl,
+                tenant_ids=tenant_ids,
+                kb_ids=kb_ids,
+                doc_ids=doc_ids,
+                similarity_threshold=similarity_threshold,
+                vector_similarity_weight=vector_similarity_weight,
+                top_k=top_k,
+                rank_feature=rank_feature,
+                rerank_mdl=rerank_mdl,
+                cfg=cfg,
+                rag_trace=rag_trace,
+                metadata_filters=metadata_filters,
+                apply_children=apply_children,
+                apply_toc=apply_toc,
+                chat_mdl=chat_mdl,
+                enforce_result_anchor_drift=enforce_result_anchor_drift,
+            )
+        )
         for spec in plan.subqueries[: min(cfg.max_subqueries, cfg.max_extra_retrieval_calls)]
     ]
     overall_timeout = max(0.001, cfg.latency_budget_ms / 1000.0)
@@ -2775,36 +3083,8 @@ def _coerce_plan(plan: BoundedRetrievalPlan | dict[str, Any], cfg: AgenticRetrie
         subqueries=tuple(subqueries[: cfg.max_subqueries]),
         merge_policy=dict(plan.get("merge_policy") or {}),
         drift_controls=dict(plan.get("drift_controls") or {"anchor_entities": _anchors_for_text(question), "min_anchor_overlap": cfg.min_anchor_overlap, "allow_new_entities": False}),
+        plan_origin=str(plan.get("plan_origin") or "llm_text"),  # type: ignore[arg-type]
     )
-
-
-
-def _planner_output_schema() -> dict[str, Any]:
-    return {
-        "plan_id": "string; copy the provided plan_id exactly",
-        "original_question": "string",
-        "complexity": "simple|multi_facet|multi_hop|comparison|temporal|list|unknown",
-        "trigger_reasons": ["string"],
-        "required_facets": [
-            {"facet_id": "f1", "description": "string", "anchors": ["term"], "evidence_type": "definition|numeric|date|comparison|quote|list_item"}
-        ],
-        "subqueries": [
-            {
-                "subquery_id": "sq1",
-                "facet_id": "f1",
-                "query": "string",
-                "keywords": "string|null",
-                "docid_scope": None,
-                "top_n": "integer <= subquery_top_n",
-                "retrieval_variant": "hybrid_default|keyword_first|embedding_retry",
-                "must_have_terms": ["string"],
-                "forbidden_new_entities": ["string"],
-                "rationale": "short string",
-            }
-        ],
-        "merge_policy": {"strategy": "subquery_rrf_then_context_builder", "max_chunks_per_facet": 4},
-        "drift_controls": {"anchor_entities": ["string"], "min_anchor_overlap": 0.5, "allow_new_entities": False},
-    }
 
 
 def _summarize_history(history: list[dict[str, Any]]) -> str:
@@ -3057,13 +3337,7 @@ def _chunk_facet_ids(chunk: dict[str, Any]) -> list[str]:
 
 def _chunk_has_contradiction_signal(chunk: dict[str, Any]) -> bool:
     metadata = chunk.get("_ragflow_agentic_retrieval") or chunk.get("document_metadata") or chunk.get("metadata") or {}
-    return bool(
-        chunk.get("contradiction")
-        or chunk.get("conflicting")
-        or metadata.get("contradiction")
-        or metadata.get("conflicting")
-        or metadata.get("contradiction_with")
-    )
+    return bool(chunk.get("contradiction") or chunk.get("conflicting") or metadata.get("contradiction") or metadata.get("conflicting") or metadata.get("contradiction_with"))
 
 
 def _exact_fact_gap(question: str, facet: RequiredFacet, evidence_text: str) -> dict[str, str] | None:
@@ -3216,11 +3490,7 @@ def _merge_doc_aggs(lane_results: list[dict[str, Any]], chunks: list[dict[str, A
         for chunk in chunks:
             key = (str(chunk.get("doc_id") or ""), str(chunk.get("docnm_kwd") or chunk.get("document_name") or ""))
             counts[key] += 1
-    return [
-        {"doc_id": doc_id, "doc_name": doc_name, "count": count}
-        for (doc_id, doc_name), count in sorted(counts.items(), key=lambda item: (-item[1], item[0][1], item[0][0]))
-        if doc_id or doc_name
-    ]
+    return [{"doc_id": doc_id, "doc_name": doc_name, "count": count} for (doc_id, doc_name), count in sorted(counts.items(), key=lambda item: (-item[1], item[0][1], item[0][0])) if doc_id or doc_name]
 
 
 def _dedupe_preserve_order(values: list[str]) -> list[str]:
@@ -3249,6 +3519,7 @@ def _trace_planner_event(trace: Any, event_name: str, payload: dict[str, Any]) -
     add_retrieval_event = getattr(trace, "add_agentic_retrieval_event", None)
     if callable(add_retrieval_event):
         add_retrieval_event(event_name, payload)
+
 
 def _trace_agentic_event(trace: Any, stage: str, payload: dict[str, Any]) -> None:
     if not trace:

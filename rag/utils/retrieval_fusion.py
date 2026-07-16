@@ -317,16 +317,10 @@ def resolve_request_lane_weights(
     bounded_vector_weight = max(0.0, min(1.0, _finite_or_zero(vector_weight)))
     enabled = {normalize_lane_name(lane) for lane in enabled_lanes}
     sparse_lanes = [lane for lane in _CANONICAL_LANES if lane in _SPARSE_LANES and lane in enabled]
-    sparse_modifiers = {
-        lane: max(0.0, _finite_or_zero(config.lane_weight(lane)))
-        for lane in sparse_lanes
-    }
+    sparse_modifiers = {lane: max(0.0, _finite_or_zero(config.lane_weight(lane))) for lane in sparse_lanes}
     modifier_total = sum(sparse_modifiers.values())
     sparse_budget = 1.0 - bounded_vector_weight
-    sparse_weights = {
-        lane: (sparse_budget * modifier / modifier_total if modifier_total > 0.0 else 0.0)
-        for lane, modifier in sparse_modifiers.items()
-    }
+    sparse_weights = {lane: (sparse_budget * modifier / modifier_total if modifier_total > 0.0 else 0.0) for lane, modifier in sparse_modifiers.items()}
     dense_enabled = "original_dense" in enabled and max(0.0, _finite_or_zero(config.dense_weight)) > 0.0
     return replace(
         config,
@@ -415,21 +409,13 @@ def dedupe_lane_candidates(candidates: list[RetrievalLaneCandidate]) -> list[Ret
 
 def linear_fusion(candidates: list[RetrievalLaneCandidate], config: FusionConfig) -> list[FusedCandidate]:
     grouped = _group_candidates(candidates)
-    fused = [
-        _make_fused_candidate(group, sum(contributions.values()), contributions)
-        for group in grouped.values()
-        if (contributions := _linear_contributions(group, config))
-    ]
+    fused = [_make_fused_candidate(group, sum(contributions.values()), contributions) for group in grouped.values() if (contributions := _linear_contributions(group, config))]
     return _rank_fused(fused)
 
 
 def rrf_fusion(candidates: list[RetrievalLaneCandidate], config: FusionConfig) -> list[FusedCandidate]:
     grouped = _group_candidates(candidates)
-    fused = [
-        _make_fused_candidate(group, sum(contributions.values()), contributions)
-        for group in grouped.values()
-        if (contributions := _rrf_contributions(group, config))
-    ]
+    fused = [_make_fused_candidate(group, sum(contributions.values()), contributions) for group in grouped.values() if (contributions := _rrf_contributions(group, config))]
     return _rank_fused(fused)
 
 
@@ -437,10 +423,7 @@ def current_weighted_fusion(candidates: list[RetrievalLaneCandidate], config: Fu
     grouped = _group_candidates(candidates)
     fused = []
     for group in grouped.values():
-        contributions = {
-            candidate.lane: config.lane_weight(candidate.lane) * _finite_or_zero(candidate.raw_score)
-            for candidate in group
-        }
+        contributions = {candidate.lane: config.lane_weight(candidate.lane) * _finite_or_zero(candidate.raw_score) for candidate in group}
         fused.append(_make_fused_candidate(group, max(contributions.values()), contributions))
     return _rank_fused(fused)
 
@@ -491,7 +474,7 @@ def fuse_retrieval_lanes(
         fused, fusion_level, notes = apply_post_rerank_controls(fused, config, fallback_notes=notes)
         rejected.extend(_candidate_rejections(before_controls, fused, reason="post_fusion_control"))
     for candidate in fused:
-        attach_fusion_metadata(candidate, fallback_notes=notes)
+        attach_fusion_metadata(candidate, fallback_notes=notes, strategy=config.strategy)
     metrics = compute_fusion_metrics(candidates, fused)
     diagnostics = make_fusion_trace_summary(
         config=config,
@@ -665,11 +648,7 @@ def make_fusion_trace_summary(
             "preservation": {
                 "max_candidates": capacity,
                 "reserved_lanes": sorted({lane for candidate in fused for lane in candidate.reserved_lanes}, key=_CANONICAL_LANES.index),
-                "oversubscribed_lanes": [
-                    lane
-                    for lane in _CANONICAL_LANES
-                    if lane_counts.get(lane, 0) and not any(lane in candidate.reserved_lanes for candidate in fused)
-                ],
+                "oversubscribed_lanes": [lane for lane in _CANONICAL_LANES if lane_counts.get(lane, 0) and not any(lane in candidate.reserved_lanes for candidate in fused)],
             },
             "reservation_config": {
                 "reserve_per_lane": config.reserve_per_lane,
@@ -683,7 +662,12 @@ def make_fusion_trace_summary(
     return summary
 
 
-def attach_fusion_metadata(candidate: FusedCandidate, *, fallback_notes: list[str] | None = None) -> None:
+def attach_fusion_metadata(
+    candidate: FusedCandidate,
+    *,
+    fallback_notes: list[str] | None = None,
+    strategy: FusionStrategy = "rrf",
+) -> None:
     metadata = {
         "candidate_id": candidate.candidate_id,
         "fused_rank": candidate.fused_rank,
@@ -699,6 +683,18 @@ def attach_fusion_metadata(candidate: FusedCandidate, *, fallback_notes: list[st
         "fallback_notes": list(dict.fromkeys(fallback_notes or []))[:_MAX_TRACE_LIST],
     }
     candidate.chunk["_ragflow_fusion"] = _sanitize_trace(metadata)
+    candidate.chunk["fusion_score"] = metadata["fused_score"]
+    provenance = candidate.chunk.setdefault("_ragflow_score_provenance", {})
+    if not isinstance(provenance, dict):
+        provenance = {}
+        candidate.chunk["_ragflow_score_provenance"] = provenance
+    provenance["fusion_score"] = {
+        "family": "rrf_rank" if strategy == "rrf" else "fused_score",
+        "scale": "reciprocal_rank" if strategy == "rrf" else "rank_relative",
+        "calibrated": False,
+        "source": "weighted_rrf" if strategy == "rrf" else f"{strategy}_fusion",
+        "rank": candidate.fused_rank,
+    }
 
 
 def merge_child_fusion_metadata(children: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -715,6 +711,7 @@ def merge_child_fusion_metadata(children: list[dict[str, Any]]) -> dict[str, Any
     def rank_of(meta: dict[str, Any]) -> int:
         rank = meta.get("fused_rank")
         return rank if isinstance(rank, int) else 10**9
+
     best = min(metas, key=rank_of)
     child_ids = [str(m.get("candidate_id")) for m in metas if m.get("candidate_id")]
     child_ranks: list[int] = [rank for m in metas if isinstance((rank := m.get("fused_rank")), int)]
@@ -748,9 +745,7 @@ def _group_candidates(candidates: list[RetrievalLaneCandidate]) -> dict[str, lis
     return grouped
 
 
-def _make_fused_candidate(
-    group: list[RetrievalLaneCandidate], fused_score: float, lane_contributions: dict[str, float] | None = None
-) -> FusedCandidate:
+def _make_fused_candidate(group: list[RetrievalLaneCandidate], fused_score: float, lane_contributions: dict[str, float] | None = None) -> FusedCandidate:
     ordered = sorted(group, key=lambda c: (c.rank, c.original_index, c.lane, c.candidate_id))
     representative = _representative_candidate(ordered)
     lane_ranks = {c.lane: c.rank for c in ordered}
@@ -807,17 +802,11 @@ def _representative_candidate(group: list[RetrievalLaneCandidate]) -> RetrievalL
 
 
 def _linear_contributions(group: list[RetrievalLaneCandidate], config: FusionConfig) -> dict[str, float]:
-    return {
-        candidate.lane: config.lane_weight(candidate.lane) * _finite_or_zero(candidate.normalized_score)
-        for candidate in group
-    }
+    return {candidate.lane: config.lane_weight(candidate.lane) * _finite_or_zero(candidate.normalized_score) for candidate in group}
 
 
 def _rrf_contributions(group: list[RetrievalLaneCandidate], config: FusionConfig) -> dict[str, float]:
-    return {
-        candidate.lane: config.lane_weight(candidate.lane) / (config.rrf_k + max(1, int(candidate.rank)))
-        for candidate in group
-    }
+    return {candidate.lane: config.lane_weight(candidate.lane) / (config.rrf_k + max(1, int(candidate.rank))) for candidate in group}
 
 
 def _rank_fused(fused: list[FusedCandidate]) -> list[FusedCandidate]:
@@ -990,6 +979,19 @@ def _attach_rerank_metadata(candidate: FusedCandidate, *, query_hash: str, fallb
         }
     )
     candidate.chunk["_ragflow_fusion"] = _sanitize_trace(metadata)
+    if candidate.rerank_score is not None:
+        candidate.chunk["reranker_score"] = candidate.rerank_score
+        provenance = candidate.chunk.setdefault("_ragflow_score_provenance", {})
+        if not isinstance(provenance, dict):
+            provenance = {}
+            candidate.chunk["_ragflow_score_provenance"] = provenance
+        provenance["reranker_score"] = {
+            "family": "reranker",
+            "scale": "provider_specific",
+            "calibrated": False,
+            "source": "external_reranker",
+            "rank": candidate.rerank_rank,
+        }
 
 
 def _finite_or_none(value: Any) -> float | None:

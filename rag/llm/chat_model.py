@@ -13,6 +13,8 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -21,6 +23,7 @@ import random
 import re
 import time
 from abc import ABC
+from collections.abc import Mapping
 from copy import deepcopy
 from urllib.parse import urljoin
 
@@ -116,6 +119,7 @@ def _apply_model_family_policies(
     request_kwargs: dict | None = None,
 ):
     model_name_lower = (model_name or "").lower()
+    provider_name = str(provider) if provider is not None else ""
     sanitized_gen_conf = deepcopy(gen_conf) if gen_conf else {}
     sanitized_kwargs = dict(request_kwargs) if request_kwargs else {}
 
@@ -149,10 +153,7 @@ def _apply_model_family_policies(
     if "qwen3" in model_name_lower:
         _pop_thinking_controls()
         enable_thinking = thinking_type == "enabled" if thinking_type else False
-        if backend == "litellm" and provider in {
-            SupportedLiteLLMProvider.Tongyi_Qianwen,
-            SupportedLiteLLMProvider.Dashscope,
-        }:
+        if backend == "litellm" and provider_name in {"Tongyi-Qianwen", "Dashscope"}:
             sanitized_gen_conf["enable_thinking"] = enable_thinking
         else:
             _merge_extra_body(sanitized_kwargs, {"enable_thinking": enable_thinking})
@@ -161,19 +162,19 @@ def _apply_model_family_policies(
         return sanitized_gen_conf, sanitized_kwargs
 
     if backend == "litellm":
-        if provider in {SupportedLiteLLMProvider.OpenAI, SupportedLiteLLMProvider.Azure_OpenAI} and "gpt-5" in model_name_lower:
+        if provider_name in {"OpenAI", "Azure-OpenAI"} and "gpt-5" in model_name_lower:
             for key in ("temperature", "top_p", "logprobs", "top_logprobs"):
                 sanitized_gen_conf.pop(key, None)
                 sanitized_kwargs.pop(key, None)
-        elif provider == SupportedLiteLLMProvider.Anthropic and model_name_lower in {"claude-opus-4-7", "claude-opus-4-8"}:
+        elif provider_name == "Anthropic" and model_name_lower in {"claude-opus-4-7", "claude-opus-4-8"}:
             for key in ("temperature", "top_p", "top_k"):
                 sanitized_gen_conf.pop(key, None)
                 sanitized_kwargs.pop(key, None)
 
-        if provider == SupportedLiteLLMProvider.HunYuan:
+        if provider_name == "Tencent Hunyuan":
             for key in ("presence_penalty", "frequency_penalty"):
                 sanitized_gen_conf.pop(key, None)
-        elif provider == SupportedLiteLLMProvider.Moonshot:
+        elif provider_name == "Moonshot":
             if thinking_type:
                 _pop_thinking_controls()
                 sanitized_gen_conf["thinking"] = {"type": thinking_type}
@@ -184,7 +185,7 @@ def _apply_model_family_policies(
                 sanitized_gen_conf["n"] = 1
                 sanitized_gen_conf["presence_penalty"] = 0.0
                 sanitized_gen_conf["frequency_penalty"] = 0.0
-        elif provider == SupportedLiteLLMProvider.ZHIPU_AI and "glm" in model_name_lower and thinking_type:
+        elif provider_name == "ZHIPU-AI" and "glm" in model_name_lower and thinking_type:
             _pop_thinking_controls()
             sanitized_gen_conf["thinking"] = {"type": thinking_type}
 
@@ -214,6 +215,75 @@ def _move_litellm_provider_body_fields(provider: SupportedLiteLLMProvider | str 
     return completion_args
 
 
+def _message_value(message, name, default=None):
+    if isinstance(message, Mapping):
+        return message.get(name, default)
+    return getattr(message, name, default)
+
+
+def _native_structured_payload(message, mode, tool_name: str):
+    if mode.value == "json_schema":
+        parsed = _message_value(message, "parsed")
+        if isinstance(parsed, BaseException):
+            return None
+        if hasattr(parsed, "model_dump"):
+            parsed = parsed.model_dump(mode="json")
+        if isinstance(parsed, Mapping):
+            return dict(parsed)
+
+        content = _message_value(message, "content")
+        if not isinstance(content, str):
+            return None
+        try:
+            parsed_content = json.loads(content)
+        except json.JSONDecodeError:
+            return None
+        return parsed_content if isinstance(parsed_content, dict) else None
+
+    if mode.value == "tool_arguments":
+        for tool_call in _message_value(message, "tool_calls", []) or []:
+            function = _message_value(tool_call, "function")
+            if _message_value(function, "name") != tool_name:
+                continue
+            arguments = _message_value(function, "arguments")
+            if isinstance(arguments, Mapping):
+                return dict(arguments)
+            if not isinstance(arguments, str):
+                return None
+            try:
+                parsed = json.loads(arguments)
+            except json.JSONDecodeError:
+                return None
+            return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _structured_request_fields(mode, schema: dict, tool_name: str) -> dict:
+    if mode.value == "json_schema":
+        return {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": tool_name, "strict": True, "schema": schema},
+            }
+        }
+    if mode.value == "tool_arguments":
+        return {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": "Return the canonical structured output.",
+                        "strict": True,
+                        "parameters": schema,
+                    },
+                }
+            ],
+            "tool_choice": {"type": "function", "function": {"name": tool_name}},
+        }
+    return {}
+
+
 class Base(ABC):
     def __init__(self, key, model_name, base_url, **kwargs):
         timeout = int(os.environ.get("LLM_TIMEOUT_SECONDS", 600))
@@ -230,6 +300,12 @@ class Base(ABC):
         # Token usage split (prompt/completion/total) of the most recent chat call.
         # Consumed by LLMBundle for accurate Langfuse reporting and run aggregation.
         self.last_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    @property
+    def structured_output_mode(self):
+        from rag.advanced_rag.structured_output import StructuredOutputMode
+
+        return StructuredOutputMode.TEXT_ONLY
 
     def _get_delay(self):
         return self.base_delay * random.uniform(10, 150)
@@ -774,6 +850,59 @@ class Base(ABC):
                 if e:
                     return e, 0
         assert False, "Shouldn't be here."
+
+    async def async_structured_output(
+        self,
+        system: str,
+        history: list,
+        schema: dict,
+        *,
+        mode=None,
+        gen_conf: dict | None = None,
+        tool_name: str = "structured_output",
+    ):
+        from rag.advanced_rag.structured_output import StructuredOutputMode, StructuredOutputResult
+
+        requested_mode = StructuredOutputMode(mode or self.structured_output_mode)
+        hist = list(history) if history else []
+        if system and (not hist or hist[0].get("role") != "system"):
+            hist.insert(0, {"role": "system", "content": system})
+
+        cleaned_conf = self._clean_conf(dict(gen_conf or {}))
+        for reserved in ("stream", "response_format", "tools", "tool_choice"):
+            cleaned_conf.pop(reserved, None)
+        cleaned_conf, request_kwargs = _apply_model_family_policies(
+            self.model_name,
+            backend="base",
+            gen_conf=cleaned_conf,
+            request_kwargs=_structured_request_fields(requested_mode, schema, tool_name),
+        )
+        request_kwargs.update(
+            {
+                "model": self.model_name,
+                "messages": hist,
+                "stream": False,
+                **cleaned_conf,
+            }
+        )
+        self.last_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        client = self.async_client
+        with_options = getattr(client, "with_options", None)
+        if callable(with_options):
+            client = with_options(max_retries=0)
+        response = await client.chat.completions.create(**request_kwargs)
+        self.last_usage = usage_from_response(response)
+        used_tokens = total_token_count_from_response(response)
+        message = response.choices[0].message if response.choices else None
+        display_text = _message_value(message, "content")
+        payload = _native_structured_payload(message, requested_mode, tool_name)
+        return StructuredOutputResult(
+            mode=requested_mode,
+            structured_payload=payload,
+            display_text=display_text,
+            used_tokens=used_tokens,
+        )
 
 
 class XinferenceChat(Base):
@@ -1620,6 +1749,15 @@ class LiteLLMBase(ABC):
         else:
             self.group_id = ""
 
+    @property
+    def structured_output_mode(self):
+        from rag.advanced_rag.structured_output import StructuredOutputMode
+
+        provider = str(self.provider)
+        if provider in {"OpenAI", "Azure-OpenAI"}:
+            return StructuredOutputMode.JSON_SCHEMA
+        return StructuredOutputMode.TEXT_ONLY
+
     def _get_delay(self):
         return self.base_delay * random.uniform(10, 150)
 
@@ -1700,6 +1838,61 @@ class LiteLLMBase(ABC):
                     return e, 0
 
         assert False, "Shouldn't be here."
+
+    async def async_structured_output(
+        self,
+        system: str,
+        history: list,
+        schema: dict,
+        *,
+        mode=None,
+        gen_conf: dict | None = None,
+        tool_name: str = "structured_output",
+    ):
+        from rag.advanced_rag.structured_output import StructuredOutputMode, StructuredOutputResult
+
+        requested_mode = StructuredOutputMode(mode or self.structured_output_mode)
+        hist = list(history) if history else []
+        if system and (not hist or hist[0].get("role") != "system"):
+            hist.insert(0, {"role": "system", "content": system})
+
+        cleaned_conf = self._clean_conf(dict(gen_conf or {}))
+        for reserved in ("stream", "response_format", "tools", "tool_choice"):
+            cleaned_conf.pop(reserved, None)
+        _, request_kwargs = _apply_model_family_policies(
+            self.model_name,
+            backend="litellm",
+            provider=self.provider,
+            request_kwargs=_structured_request_fields(requested_mode, schema, tool_name),
+        )
+        completion_args = self._construct_completion_args(
+            history=hist,
+            stream=False,
+            tools=False,
+            **{**cleaned_conf, **request_kwargs},
+        )
+        completion_args["stream"] = False
+        completion_args["num_retries"] = 0
+        # This path owns the exact strict response contract. LiteLLM must not
+        # silently discard its response_format/tool schema parameters.
+        self.last_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        response = await litellm.acompletion(
+            **completion_args,
+            drop_params=False,
+            timeout=self.timeout,
+        )
+        self.last_usage = usage_from_response(response)
+        used_tokens = total_token_count_from_response(response)
+        message = response.choices[0].message if response.choices else None
+        display_text = _message_value(message, "content")
+        payload = _native_structured_payload(message, requested_mode, tool_name)
+        return StructuredOutputResult(
+            mode=requested_mode,
+            structured_payload=payload,
+            display_text=display_text,
+            used_tokens=used_tokens,
+        )
 
     async def async_chat_streamly(self, system, history, gen_conf, **kwargs):
         if system and history and history[0].get("role") != "system":
@@ -2174,6 +2367,7 @@ class LiteLLMBase(ABC):
         assert False, "Shouldn't be here."
 
     def _construct_completion_args(self, history, stream: bool, tools: bool, **kwargs):
+        provider_name = str(self.provider)
         completion_args = {
             "model": self.model_name,
             "messages": history,
@@ -2196,7 +2390,7 @@ class LiteLLMBase(ABC):
             )
         if self.provider in FACTORY_DEFAULT_BASE_URL:
             completion_args.update({"api_base": self.base_url})
-        elif self.provider == SupportedLiteLLMProvider.Bedrock:
+        elif provider_name == "Bedrock":
             import boto3
 
             completion_args.pop("api_key", None)
@@ -2226,7 +2420,7 @@ class LiteLLMBase(ABC):
             else:  # assume_role - use default credential chain (IRSA, instance profile, etc.)
                 completion_args.update({"aws_region_name": bedrock_region})
 
-        elif self.provider == SupportedLiteLLMProvider.OpenRouter:
+        elif provider_name == "OpenRouter":
             if self.provider_order:
 
                 def _to_order_list(x):
@@ -2245,13 +2439,13 @@ class LiteLLMBase(ABC):
                 provider_cfg["allow_fallbacks"] = False
                 extra_body["provider"] = provider_cfg
                 completion_args.update({"extra_body": extra_body})
-        elif self.provider == SupportedLiteLLMProvider.GPUStack:
+        elif provider_name == "GPUStack":
             completion_args.update(
                 {
                     "api_base": urljoin(self.base_url, "v1"),
                 }
             )
-        elif self.provider == SupportedLiteLLMProvider.Azure_OpenAI:
+        elif provider_name == "Azure-OpenAI":
             completion_args.pop("api_key", None)
             completion_args.pop("api_base", None)
             completion_args.update(
@@ -2266,10 +2460,10 @@ class LiteLLMBase(ABC):
         # Bearer auth. Ensure the Authorization header is set when an API key
         # is provided, while respecting any user-supplied headers. #11350
         extra_headers = deepcopy(completion_args.get("extra_headers") or {})
-        if self.provider == SupportedLiteLLMProvider.Ollama and self.api_key and "Authorization" not in extra_headers:
+        if provider_name == "Ollama" and self.api_key and "Authorization" not in extra_headers:
             extra_headers["Authorization"] = f"Bearer {self.api_key}"
         # MiniMax requires GroupId as a query parameter for API authentication
-        if self.provider == SupportedLiteLLMProvider.MiniMax and hasattr(self, "group_id") and self.group_id:
+        if provider_name == "MiniMax" and hasattr(self, "group_id") and self.group_id:
             api_base = completion_args.get("api_base", self.base_url)
             separator = "&" if "?" in api_base else "?"
             completion_args["api_base"] = f"{api_base}{separator}GroupId={self.group_id}"
