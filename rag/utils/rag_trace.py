@@ -83,13 +83,15 @@ def sanitize_for_trace(value: Any, *, key: str | None = None, depth: int = 0) ->
         return value[:_MAX_TEXT_LEN] + "...<truncated>" if len(value) > _MAX_TEXT_LEN else value
     if isinstance(value, dict):
         sanitized: dict[str, Any] = {}
-        for k, v in list(value.items())[:_MAX_LIST_ITEMS]:
+        items = value.items() if "policy_version" in value else list(value.items())[:_MAX_LIST_ITEMS]
+        for k, v in items:
             item = sanitize_for_trace(v, key=str(k), depth=depth + 1)
             if item is not _OMIT:
                 sanitized[str(k)] = item
         return sanitized
     if isinstance(value, (list, tuple, set)):
-        sanitized_list = [sanitize_for_trace(v, depth=depth + 1) for v in list(value)[:_MAX_LIST_ITEMS]]
+        limit = 48 if key == "candidate_observations" else _MAX_LIST_ITEMS
+        sanitized_list = [sanitize_for_trace(v, depth=depth + 1) for v in list(value)[:limit]]
         return [v for v in sanitized_list if v is not _OMIT]
     try:
         json.dumps(value)

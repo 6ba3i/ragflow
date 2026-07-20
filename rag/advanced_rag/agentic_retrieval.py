@@ -35,7 +35,8 @@ from rag.advanced_rag.structured_output import (
 from rag.utils.retrieval_diagnostics import make_retrieval_variant, resolve_variant_knobs
 
 AgenticRetrievalMode = Literal["off", "diagnostic", "shadow", "active"]
-AgenticRefinementJudgeMode = Literal["heuristic", "llm", "hybrid"]
+AgenticRetrievalPlannerMode = Literal["llm", "deterministic"]
+AgenticRefinementJudgeMode = Literal["heuristic", "llm", "hybrid", "deterministic"]
 RetrievalVariant = Literal["hybrid_default", "keyword_first", "embedding_retry"]
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -152,6 +153,7 @@ class AgenticRefinementError(Exception):
 class AgenticRetrievalConfig:
     enabled: bool = False
     mode: AgenticRetrievalMode = "off"
+    planner_mode: AgenticRetrievalPlannerMode = "llm"
     max_subqueries: int = 3
     subquery_top_n: int = 6
     planner_timeout_ms: int = 25000
@@ -175,9 +177,13 @@ class AgenticRetrievalConfig:
             mode = "off"
         if not enabled:
             mode = "off"
+        planner_mode = str(overrides.get("agentic_retrieval_planner_mode") or os.getenv("AGENTIC_RETRIEVAL_PLANNER_MODE") or "llm").strip().lower()
+        if planner_mode not in {"llm", "deterministic"}:
+            raise ValueError("AGENTIC_RETRIEVAL_PLANNER_MODE must be one of: llm, deterministic")
         return cls(
             enabled=enabled,
             mode=mode,  # type: ignore[arg-type]
+            planner_mode=planner_mode,  # type: ignore[arg-type]
             max_subqueries=_int_setting(overrides.get("agentic_retrieval_max_subqueries"), "AGENTIC_RETRIEVAL_MAX_SUBQUERIES", 3) or 3,
             subquery_top_n=_int_setting(overrides.get("agentic_retrieval_subquery_top_n"), "AGENTIC_RETRIEVAL_SUBQUERY_TOP_N", 6) or 6,
             planner_timeout_ms=_bounded_int_setting(overrides.get("agentic_retrieval_planner_timeout_ms"), "AGENTIC_RETRIEVAL_PLANNER_TIMEOUT_MS", 25000, 1, 60000),
@@ -215,7 +221,7 @@ class AgenticRefinementConfig:
         if mode not in {"off", "diagnostic", "shadow", "active"} or not enabled:
             mode = "off"
         judge = str(overrides.get("agentic_refinement_judge") or os.getenv("AGENTIC_REFINEMENT_JUDGE") or "hybrid").strip().lower()
-        if judge not in {"heuristic", "llm", "hybrid"}:
+        if judge not in {"heuristic", "llm", "hybrid", "deterministic"}:
             judge = "hybrid"
         return cls(
             enabled=enabled,
@@ -232,7 +238,7 @@ class AgenticRefinementConfig:
 
     def normalized(self) -> "AgenticRefinementConfig":
         mode = self.mode if self.enabled and self.mode in {"off", "diagnostic", "shadow", "active"} else "off"
-        judge = self.judge if self.judge in {"heuristic", "llm", "hybrid"} else "hybrid"
+        judge = self.judge if self.judge in {"heuristic", "llm", "hybrid", "deterministic"} else "hybrid"
         return replace(
             self,
             mode=mode,
@@ -295,7 +301,7 @@ class BoundedRetrievalPlan:
     subqueries: tuple[SubquerySpec, ...]
     merge_policy: dict[str, Any] = field(default_factory=dict)
     drift_controls: dict[str, Any] = field(default_factory=dict)
-    plan_origin: Literal["llm_native", "llm_text", "deterministic_fallback"] = "llm_text"
+    plan_origin: Literal["llm_native", "llm_text", "deterministic_fallback", "deterministic_primary"] = "llm_text"
 
     def to_trace_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -498,9 +504,11 @@ def build_planner_input(
     }
 
 
-def build_deterministic_fallback_plan(
+def build_deterministic_plan(
     planner_input: dict[str, Any],
     cfg: AgenticRetrievalConfig,
+    *,
+    plan_origin: Literal["deterministic_fallback", "deterministic_primary"],
 ) -> BoundedRetrievalPlan:
     """Build one validated, bounded plan from application-owned request data."""
     question = str(planner_input.get("original_question") or planner_input.get("question") or "").strip()
@@ -542,13 +550,71 @@ def build_deterministic_fallback_plan(
         plan_id=plan_id,
         original_question=question,
         complexity=complexity,
-        trigger_reasons=("planner_fallback",),
+        trigger_reasons=("planner_fallback" if plan_origin == "deterministic_fallback" else "deterministic_primary",),
         required_facets=(facet,),
         subqueries=(subquery,),
         merge_policy={"strategy": "subquery_rrf_then_context_builder", "max_chunks_per_facet": min(4, cfg.subquery_top_n)},
         drift_controls={"anchor_entities": list(anchors), "min_anchor_overlap": cfg.min_anchor_overlap, "allow_new_entities": False},
-        plan_origin="deterministic_fallback",
+        plan_origin=plan_origin,
     )
+
+
+def build_deterministic_fallback_plan(
+    planner_input: dict[str, Any],
+    cfg: AgenticRetrievalConfig,
+) -> BoundedRetrievalPlan:
+    """Build the deterministic fallback plan with failure-path provenance."""
+    return build_deterministic_plan(planner_input, cfg, plan_origin="deterministic_fallback")
+
+
+def resolve_deterministic_primary_plan(
+    planner_input: dict[str, Any],
+    cfg: AgenticRetrievalConfig,
+    *,
+    rag_trace: Any = None,
+) -> PlanValidationResult:
+    """Build and validate an opt-in deterministic Phase 5 plan without LLM work."""
+    plan_id = str(planner_input.get("plan_id") or "")
+    lifecycle_id = f"planner.deterministic.{plan_id or uuid.uuid4().hex[:12]}"
+    try:
+        candidate = build_deterministic_plan(planner_input, cfg, plan_origin="deterministic_primary")
+        validation = validate_plan(candidate, cfg, original_question=candidate.original_question)
+    except (TypeError, ValueError) as exc:
+        _trace_planner_event(
+            rag_trace,
+            "planner_deterministic_primary",
+            {
+                "lifecycle_id": lifecycle_id,
+                "planner_mode": cfg.planner_mode,
+                "plan_origin": "deterministic_primary",
+                "planner_llm_skipped": True,
+                "skip_reason": "deterministic_primary",
+                "provider_call_count": 0,
+                "repair_call_count": 0,
+                "cache_status": "skipped",
+                "validation_status": "failed",
+                "validation_errors": [str(exc)],
+            },
+        )
+        raise
+    _trace_planner_event(
+        rag_trace,
+        "planner_deterministic_primary",
+        {
+            "lifecycle_id": lifecycle_id,
+            "planner_mode": cfg.planner_mode,
+            "plan_origin": "deterministic_primary",
+            "planner_llm_skipped": True,
+            "skip_reason": "deterministic_primary",
+            "provider_call_count": 0,
+            "repair_call_count": 0,
+            "cache_status": "skipped",
+            "plan_id": validation.plan.plan_id,
+            "validation_status": "valid" if validation.valid else "failed",
+            "validation_errors": _safe_planner_validation_errors(validation.errors),
+        },
+    )
+    return validation
 
 
 def build_llm_planner_prompt(
@@ -915,6 +981,7 @@ async def generate_llm_plan(
     repair_errors: tuple[str, ...] = (),
     attempt_timeout_ms: int | None = None,
     operation_id: str | None = None,
+    lifecycle_id: str | None = None,
     cleanup_callback: Any = None,
 ) -> BoundedRetrievalPlan:
     if chat_mdl is None or not any(callable(getattr(chat_mdl, name, None)) for name in ("async_structured_output", "async_chat")):
@@ -926,6 +993,7 @@ async def generate_llm_plan(
             safe_category="missing_chat_model",
         )
     plan_id = str(planner_input.get("plan_id") or f"plan-{uuid.uuid4().hex[:12]}")
+    lifecycle_id = str(lifecycle_id or operation_id or f"planner.lifecycle.{uuid.uuid4().hex[:12]}")
     planner_input = {**planner_input, "plan_id": plan_id}
     system_prompt, messages = build_llm_planner_prompt(planner_input, cfg, repair_errors=repair_errors)
     gen_conf = {"temperature": 0.0, "top_p": 0.1}
@@ -938,6 +1006,7 @@ async def generate_llm_plan(
         "mode": cfg.mode,
         "model": model_name,
         "operation_id": operation_id,
+        "lifecycle_id": lifecycle_id,
         "repair": bool(repair_errors),
         "attempt_timeout_ms": effective_timeout_ms,
     }
@@ -1497,6 +1566,7 @@ async def generate_sufficiency_judge(
     chat_mdl: Any,
     rag_trace: Any = None,
     iteration_id: str = "",
+    lifecycle_id: str | None = None,
     timeout_ms: int | None = None,
     remaining_budget_ms: float | None = None,
     cleanup_callback: Any = None,
@@ -1505,6 +1575,7 @@ async def generate_sufficiency_judge(
     if chat_mdl is None or not any(callable(getattr(chat_mdl, name, None)) for name in ("async_structured_output", "async_chat")):
         raise AgenticRefinementError("refinement_judge_missing_chat_model")
     system_prompt, messages = build_sufficiency_judge_prompt(question, plan, kbinfos, cfg, repair_errors=_repair_errors)
+    lifecycle_id = str(lifecycle_id or f"{plan.plan_id}:refinement")
     started = time.monotonic()
     effective_timeout_ms = max(1, min(int(timeout_ms or cfg.normalized().judge_timeout_ms), cfg.normalized().judge_timeout_ms))
     _trace_refinement_event(
@@ -1513,6 +1584,7 @@ async def generate_sufficiency_judge(
         {
             "plan_id": plan.plan_id,
             "iteration_id": iteration_id,
+            "lifecycle_id": lifecycle_id,
             "mode": cfg.mode,
             "judge_timeout_ms": effective_timeout_ms,
             "remaining_refinement_budget_ms": remaining_budget_ms,
@@ -1545,6 +1617,7 @@ async def generate_sufficiency_judge(
             {
                 "plan_id": plan.plan_id,
                 "iteration_id": iteration_id,
+                "lifecycle_id": lifecycle_id,
                 "mode": cfg.mode,
                 "cleanup_latency_ms": cleanup_ms,
                 "timeout_owner": "upstream_cancellation",
@@ -1563,6 +1636,7 @@ async def generate_sufficiency_judge(
             {
                 "plan_id": plan.plan_id,
                 "iteration_id": iteration_id,
+                "lifecycle_id": lifecycle_id,
                 "mode": cfg.mode,
                 "cleanup_latency_ms": cleanup_ms,
                 "timeout_owner": "phase6_judge",
@@ -1575,6 +1649,7 @@ async def generate_sufficiency_judge(
             {
                 "plan_id": plan.plan_id,
                 "iteration_id": iteration_id,
+                "lifecycle_id": lifecycle_id,
                 "mode": cfg.mode,
                 "latency_ms": latency_ms,
                 "cleanup_latency_ms": cleanup_ms,
@@ -1590,7 +1665,9 @@ async def generate_sufficiency_judge(
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        _trace_refinement_event(rag_trace, "refinement_judge_validation_failed", {"plan_id": plan.plan_id, "iteration_id": iteration_id, "mode": cfg.mode, "fallback_reason": "judge_error"})
+        _trace_refinement_event(
+            rag_trace, "refinement_judge_validation_failed", {"plan_id": plan.plan_id, "iteration_id": iteration_id, "lifecycle_id": lifecycle_id, "mode": cfg.mode, "fallback_reason": "judge_error"}
+        )
         raise AgenticRefinementError("refinement_judge_error", "provider_error") from exc
     try:
         decoded = _decode_judge_response(response)
@@ -1626,6 +1703,7 @@ async def generate_sufficiency_judge(
             {
                 "plan_id": plan.plan_id,
                 "iteration_id": iteration_id,
+                "lifecycle_id": lifecycle_id,
                 "mode": cfg.mode,
                 "latency_ms": latency_ms,
                 "fallback_reason": reason,
@@ -1645,6 +1723,7 @@ async def generate_sufficiency_judge(
                     chat_mdl=chat_mdl,
                     rag_trace=rag_trace,
                     iteration_id=iteration_id,
+                    lifecycle_id=lifecycle_id,
                     timeout_ms=remaining_ms,
                     remaining_budget_ms=remaining_budget_ms,
                     cleanup_callback=cleanup_callback,
@@ -1657,6 +1736,7 @@ async def generate_sufficiency_judge(
                     {
                         "plan_id": plan.plan_id,
                         "iteration_id": iteration_id,
+                        "lifecycle_id": lifecycle_id,
                         "mode": cfg.mode,
                         "fallback_reason": "repair_failed",
                         "failure_class": StructuredOutputFailureReason.REPAIR_FAILED.value,
@@ -1677,6 +1757,7 @@ async def generate_sufficiency_judge(
         {
             "plan_id": plan.plan_id,
             "iteration_id": iteration_id,
+            "lifecycle_id": lifecycle_id,
             "mode": cfg.mode,
             "latency_ms": latency_ms,
             "judge_timeout_ms": effective_timeout_ms,
@@ -1754,6 +1835,7 @@ def accept_followup_evidence(
     missing_required_anchors: dict[str, tuple[str, ...]] | None = None,
     question: str,
     context_builder_config: Any = None,
+    rag_trace: Any = None,
 ) -> EvidenceAcceptanceResult:
     current = deepcopy(current_kbinfos or {"total": 0, "chunks": [], "doc_aggs": []})
     candidates = deepcopy(candidate_kbinfos if candidate_kbinfos is not None else current)
@@ -1828,7 +1910,14 @@ def accept_followup_evidence(
     if context_builder_config is not None and getattr(context_builder_config, "enabled", False):
         from rag.utils.context_builder import apply_context_builder_to_kbinfos
 
-        selected = apply_context_builder_to_kbinfos(staged_candidate, context_builder_config, query=question).kbinfos
+        bundle = apply_context_builder_to_kbinfos(staged_candidate, context_builder_config, query=question)
+        selected = bundle.kbinfos
+        if getattr(bundle, "bundle", None) is not None:
+            _trace_refinement_event(
+                rag_trace,
+                "refinement_context_builder_summary",
+                {"plan_id": plan.plan_id, "context_summary": bundle.bundle.summary()},
+            )
     selected_keys = {_refinement_chunk_identity(chunk) for chunk in selected.get("chunks", []) if isinstance(chunk, dict)}
     accepted: list[dict[str, Any]] = []
     for chunk in eligible:
@@ -1917,6 +2006,7 @@ async def run_refinement_loop(
             kbinfos=previous, candidate_kbinfos=previous_candidates, iterations=(), fallback_to_previous_context=True, fallback_reason="phase5_plan_unavailable", stop_reason="phase5_plan_unavailable"
         )
 
+    refinement_lifecycle_id = f"{plan.plan_id}:refinement"
     initial_diagnostics = detect_missing_facets(question, plan, previous)
     _trace_refinement_event(
         rag_trace,
@@ -2008,7 +2098,29 @@ async def run_refinement_loop(
             return stop_result("latency_budget_exceeded", elapsed_ms, fallback=True)
         diagnostics_before = detect_missing_facets(question, plan, current)
         coverage_before = float(diagnostics_before["coverage"])
-        if config.judge == "heuristic" or (config.judge == "hybrid" and diagnostics_before["obviously_sufficient"]):
+        if config.judge == "deterministic":
+            judge = build_deterministic_sufficiency_judge(diagnostics_before, plan, config, iteration_id=iteration_id)
+            _trace_refinement_event(
+                rag_trace,
+                "refinement_judge_success",
+                {
+                    "mode": config.mode,
+                    "plan_id": plan.plan_id,
+                    "iteration_id": iteration_id,
+                    "judge_mode": "deterministic",
+                    "llm_skipped": True,
+                    "repair_call_count": 0,
+                    "required_facets": [facet.facet_id for facet in plan.required_facets],
+                    "covered_facets": [item.get("facet_id") for item in judge.covered_facets],
+                    "missing_facets": [item.get("facet_id") for item in judge.missing_facets],
+                    "confidence": judge.confidence,
+                    "sufficient": judge.sufficient,
+                    "followup_count": len(judge.recommended_followups),
+                    "remaining_refinement_budget_ms": round(remaining_refinement_ms, 3),
+                    "judge_outcome": "deterministic",
+                },
+            )
+        elif config.judge == "heuristic" or (config.judge == "hybrid" and diagnostics_before["obviously_sufficient"]):
             judge = _heuristic_judge(diagnostics_before, plan, sufficient=bool(diagnostics_before["obviously_sufficient"]))
             _trace_refinement_event(
                 rag_trace,
@@ -2044,6 +2156,7 @@ async def run_refinement_loop(
                     chat_mdl=chat_mdl,
                     rag_trace=rag_trace,
                     iteration_id=iteration_id,
+                    lifecycle_id=refinement_lifecycle_id,
                     timeout_ms=judge_timeout_ms,
                     remaining_budget_ms=remaining_refinement_ms,
                     cleanup_callback=account_judge_cleanup,
@@ -2220,6 +2333,7 @@ async def run_refinement_loop(
             missing_required_anchors={item["facet_id"]: tuple(item.get("required_anchors") or ()) for item in judge.missing_facets},
             question=question,
             context_builder_config=context_builder_config,
+            rag_trace=rag_trace,
         )
         elapsed_ms = (time.monotonic() - loop_started) * 1000.0
         if elapsed_ms >= config.latency_budget_ms:
@@ -2344,6 +2458,7 @@ async def execute_bounded_plan(
     cleanup_callback: Any = None,
 ) -> BoundedRetrievalResult:
     started = time.monotonic()
+    plan_trace = {"plan_origin": plan.plan_origin, "planner_mode": cfg.planner_mode}
     tasks = [
         asyncio.create_task(
             _execute_subquery(
@@ -2395,7 +2510,7 @@ async def execute_bounded_plan(
             "rejections": [{"rejection_reason": "overall_timeout_or_exception", "failure_class": type(exc).__name__}],
             "cleanup_latency_ms": cleanup_ms,
         }
-        _trace_agentic_event(rag_trace, "fallback", {"plan_id": plan.plan_id, "reason": "overall_timeout_or_exception", **diagnostics})
+        _trace_agentic_event(rag_trace, "fallback", {"plan_id": plan.plan_id, **plan_trace, "reason": "overall_timeout_or_exception", **diagnostics})
         return BoundedRetrievalResult(
             kbinfos={"total": 0, "chunks": [], "doc_aggs": []},
             plan=plan,
@@ -2435,7 +2550,7 @@ async def execute_bounded_plan(
             "missing_required_subqueries": missing_subquery_ids,
         }
         reason = "required_subquery_rejected" if rejected or missing_subquery_ids else "required_facet_coverage_incomplete"
-        _trace_agentic_event(rag_trace, "fallback", {"plan_id": plan.plan_id, "reason": reason, **diagnostics})
+        _trace_agentic_event(rag_trace, "fallback", {"plan_id": plan.plan_id, **plan_trace, "reason": reason, **diagnostics})
         return BoundedRetrievalResult(
             kbinfos={"total": 0, "chunks": [], "doc_aggs": []},
             plan=plan,
@@ -2448,7 +2563,7 @@ async def execute_bounded_plan(
 
     if not accepted:
         diagnostics = {"accepted_subqueries": 0, "rejected_subqueries": len(rejected), "rejections": rejected}
-        _trace_agentic_event(rag_trace, "fallback", {"plan_id": plan.plan_id, "reason": "all_subqueries_rejected", **diagnostics})
+        _trace_agentic_event(rag_trace, "fallback", {"plan_id": plan.plan_id, **plan_trace, "reason": "all_subqueries_rejected", **diagnostics})
         return BoundedRetrievalResult(
             kbinfos={"total": 0, "chunks": [], "doc_aggs": []},
             plan=plan,
@@ -2468,7 +2583,7 @@ async def execute_bounded_plan(
         "merged_chunk_count": len(merged.get("chunks", [])),
     }
     if latency_ms > cfg.latency_budget_ms:
-        _trace_agentic_event(rag_trace, "fallback", {"plan_id": plan.plan_id, "reason": "latency_budget_exceeded", **diagnostics})
+        _trace_agentic_event(rag_trace, "fallback", {"plan_id": plan.plan_id, **plan_trace, "reason": "latency_budget_exceeded", **diagnostics})
         return BoundedRetrievalResult(
             kbinfos={"total": 0, "chunks": [], "doc_aggs": []},
             plan=plan,
@@ -2478,6 +2593,7 @@ async def execute_bounded_plan(
             fallback_reason="latency_budget_exceeded",
             diagnostics=diagnostics,
         )
+    diagnostics.update(plan_trace)
     _trace_agentic_event(rag_trace, "execute_bounded_plan", {"plan_id": plan.plan_id, **diagnostics})
     _trace_agentic_event(rag_trace, "planner_execute_bounded_plan", {"plan_id": plan.plan_id, **diagnostics})
     _trace_planner_event(rag_trace, "planner_execute_bounded_plan", {"plan_id": plan.plan_id, **diagnostics})
@@ -2778,11 +2894,6 @@ async def run_agentic_retrieval(
         return {"kbinfos": baseline, **baseline, "fallback_to_baseline": True, "fallback_reason": trigger.bypass_reason or "planning_not_triggered"}
     if cfg.mode == "diagnostic":
         return {"kbinfos": baseline, **baseline, "mode": cfg.mode, "fallback_to_baseline": True, "fallback_reason": "diagnostic_trigger_only"}
-    if chat_mdl is None:
-        _trace_agentic_event(rag_trace, "planner_llm_fallback_to_baseline", {"reason": "planner_missing_chat_model", "mode": cfg.mode})
-        _trace_planner_event(rag_trace, "planner_llm_fallback_to_baseline", {"fallback_reason": "planner_missing_chat_model", "mode": cfg.mode})
-        return {"kbinfos": baseline, **baseline, "fallback_reason": "planner_missing_chat_model", "fallback_to_baseline": True}
-
     planner_input = build_planner_input(
         question=question,
         history=[],
@@ -2793,8 +2904,21 @@ async def run_agentic_retrieval(
         tenant_ids=tenant_ids,
         metadata_filters=metadata_filters,
     )
+    if cfg.planner_mode == "deterministic":
+        try:
+            validation = resolve_deterministic_primary_plan(planner_input, cfg, rag_trace=rag_trace)
+            if not validation.valid:
+                return {"kbinfos": baseline, **baseline, "fallback_reason": validation.fallback_reason, "fallback_to_baseline": True}
+            plan = validation.plan
+        except (TypeError, ValueError) as exc:
+            return {"kbinfos": baseline, **baseline, "fallback_reason": f"deterministic_plan_invalid:{exc}", "fallback_to_baseline": True}
+    elif chat_mdl is None:
+        _trace_agentic_event(rag_trace, "planner_llm_fallback_to_baseline", {"reason": "planner_missing_chat_model", "mode": cfg.mode})
+        _trace_planner_event(rag_trace, "planner_llm_fallback_to_baseline", {"fallback_reason": "planner_missing_chat_model", "mode": cfg.mode})
+        return {"kbinfos": baseline, **baseline, "fallback_reason": "planner_missing_chat_model", "fallback_to_baseline": True}
     try:
-        plan = await generate_llm_plan(planner_input, cfg, chat_mdl=chat_mdl, rag_trace=rag_trace)
+        if cfg.planner_mode == "llm":
+            plan = await generate_llm_plan(planner_input, cfg, chat_mdl=chat_mdl, rag_trace=rag_trace)
         agentic_result = await execute_plan(
             plan,
             retriever=retriever,
@@ -2875,14 +2999,18 @@ async def _execute_subquery(
     plan: BoundedRetrievalPlan,
     **kwargs: Any,
 ) -> dict[str, Any]:
+    rag_trace = kwargs.get("rag_trace")
+    trace_fields = {"plan_id": plan.plan_id, "subquery_id": spec.subquery_id, "plan_origin": plan.plan_origin, "planner_mode": kwargs["cfg"].planner_mode}
+    _trace_agentic_event(rag_trace, "subquery_start", trace_fields)
     try:
-        return await asyncio.wait_for(_execute_subquery_work(spec, plan, **kwargs), timeout=max(0.001, kwargs["cfg"].retrieval_timeout_ms / 1000.0))
+        result = await asyncio.wait_for(_execute_subquery_work(spec, plan, **kwargs), timeout=max(0.001, kwargs["cfg"].retrieval_timeout_ms / 1000.0))
+        _trace_agentic_event(rag_trace, "subquery_result", {**trace_fields, "accepted": bool(result.get("accepted")), "rejection_reason": result.get("rejection_reason")})
+        return result
     except BaseException as exc:
         if isinstance(exc, asyncio.CancelledError):
             raise
-        rag_trace = kwargs.get("rag_trace")
         failure_class = type(exc).__name__
-        _trace_agentic_event(rag_trace, "subquery_rejected", {"plan_id": plan.plan_id, "subquery_id": spec.subquery_id, "reason": "lane_timeout_or_exception", "failure_class": failure_class})
+        _trace_agentic_event(rag_trace, "subquery_rejected", {**trace_fields, "reason": "lane_timeout_or_exception", "failure_class": failure_class})
         return {"subquery": spec, "accepted": False, "rejection_reason": "lane_timeout_or_exception", "failure_class": failure_class}
 
 
@@ -3420,6 +3548,60 @@ def _heuristic_judge(diagnostics: dict[str, Any], plan: BoundedRetrievalPlan, *,
     )
 
 
+def build_deterministic_sufficiency_judge(
+    diagnostics: dict[str, Any],
+    plan: BoundedRetrievalPlan,
+    cfg: AgenticRefinementConfig,
+    *,
+    iteration_id: str,
+) -> SufficiencyJudge:
+    """Build a conservative, application-owned Phase 6 decision.
+
+    Existing heuristic mode remains diagnostic-only. This opt-in mode creates
+    focused follow-ups only for explicit missing facets whose focused query is
+    not a replay of a Phase 5 subquery.
+    """
+    if diagnostics.get("obviously_sufficient"):
+        return _heuristic_judge(diagnostics, plan, sufficient=True)
+
+    facets = {facet.facet_id: facet for facet in plan.required_facets}
+    planned_queries = {_normalize_query_key(spec.query) for spec in plan.subqueries}
+    followups: list[FollowupQuerySpec] = []
+    for index, missing in enumerate(diagnostics.get("missing_facets") or [], start=1):
+        facet_id = str(missing.get("facet_id") or "")
+        facet = facets.get(facet_id)
+        required_anchors = tuple(str(anchor) for anchor in missing.get("required_anchors") or () if str(anchor).strip())
+        if facet is None or not required_anchors:
+            continue
+        query = " ".join(dict.fromkeys((facet.description, *required_anchors))).strip()
+        if not query or _normalize_query_key(query) in planned_queries:
+            continue
+        planned_queries.add(_normalize_query_key(query))
+        followups.append(
+            FollowupQuerySpec(
+                plan_id=plan.plan_id,
+                facet_id=facet_id,
+                query=query,
+                keywords=" ".join(required_anchors),
+                top_n=5,
+                iteration_id=iteration_id,
+                followup_id=f"{iteration_id}.deterministic.{index}",
+            )
+        )
+        if len(followups) >= cfg.normalized().max_followup_queries:
+            break
+    return SufficiencyJudge(
+        sufficient=False,
+        confidence=1.0,
+        covered_facets=tuple(diagnostics.get("covered_facets") or ()),
+        missing_facets=tuple(diagnostics.get("missing_facets") or ()),
+        contradictions=tuple(diagnostics.get("contradictions") or ()),
+        exact_fact_gaps=tuple(diagnostics.get("exact_fact_gaps") or ()),
+        refusal_justified=False,
+        recommended_followups=tuple(followups),
+    )
+
+
 def _refinement_stop_result(
     current: dict[str, Any],
     candidate_current: dict[str, Any],
@@ -3445,6 +3627,7 @@ def _refinement_stop_result(
     payload = {
         "mode": cfg.mode,
         "plan_id": plan.plan_id,
+        "lifecycle_id": f"{plan.plan_id}:refinement",
         "stop_reason": stop_reason,
         "fallback_reason": fallback_reason or (stop_reason if fallback else None),
         "accepted_new_evidence_count": len(accepted),
@@ -3506,6 +3689,10 @@ def _dedupe_preserve_order(values: list[str]) -> list[str]:
     return deduped
 
 
+def _normalize_query_key(query: str) -> str:
+    return re.sub(r"\s+", " ", str(query or "").strip()).lower()
+
+
 def _trace_planner_event(trace: Any, event_name: str, payload: dict[str, Any]) -> None:
     if not trace:
         return
@@ -3533,6 +3720,8 @@ def _trace_refinement_event(trace: Any, event_name: str, payload: dict[str, Any]
     if not trace:
         return
     payload = dict(payload or {})
+    if payload.get("plan_id") and not payload.get("lifecycle_id"):
+        payload["lifecycle_id"] = f"{payload['plan_id']}:refinement"
     add_event = getattr(trace, "add_agentic_refinement_event", None)
     if callable(add_event):
         try:

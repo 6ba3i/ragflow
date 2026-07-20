@@ -33,6 +33,8 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
 _MAX_TRACE_IDS = 128
 _TRACE_CONTENT_PREVIEW = 120
+_MAX_TRACE_CANDIDATE_OBSERVATIONS = 48
+CONTEXT_TRACE_POLICY_VERSION = "2"
 _STRONG_RELEVANCE_THRESHOLD = 0.5
 _SCORE_FAMILY_BY_FIELD = {
     "vector_similarity": "dense_similarity",
@@ -105,6 +107,8 @@ class EvidenceRecord:
     selected_for_context: bool = False
     rejection_reason: str | None = None
     citation_index: int | None = None
+    protection_reason: str | None = None
+    selection_reason: str | None = None
     chunk: dict[str, Any] | None = field(default=None, repr=False, compare=False)
 
     def to_dict(self, *, include_content: bool = True) -> dict[str, Any]:
@@ -158,12 +162,25 @@ class EvidenceBundle:
         estimated_tokens = sum(_estimate_tokens(r.content) for r in self.selected)
         agentic_lineage = _agentic_lineage_summary(self.records, self.selected, self.rejected)
         provenance_counts = _score_provenance_counts(self.records)
+        candidate_observations = _candidate_trace_observations(self.records, self.selected, self.rejected)
+        candidate_observation_overflow_count = max(0, len(self.records) - len(candidate_observations))
+        protected_records = [record for record in self.records if record.protection_reason]
+        selected_by_reason = Counter(record.selection_reason or "rank" for record in self.selected)
         summary = {
+            "policy_version": CONTEXT_TRACE_POLICY_VERSION,
             "enabled": self.config.enabled,
             "candidate_evidence_count": len(self.records),
+            "input_candidate_count": len(self.records),
+            "unique_candidate_count": len({_dedupe_key(record) for record in self.records}),
             "selected_evidence_count": len(self.selected),
             "rejected_evidence_count": len(self.rejected),
+            "protected_count": len(protected_records),
+            "selected_protected_count": sum(record in self.selected for record in protected_records),
+            "selected_by_reason": dict(sorted(selected_by_reason.items())),
             "rejection_reason_counts": dict(sorted(rejection_counts.items())),
+            "source_cap_rejection_count": rejection_counts.get("source_cap", 0),
+            "document_cap_rejection_count": rejection_counts.get("document_cap", 0),
+            "context_limit_rejection_count": rejection_counts.get("context_limit", 0),
             "duplicate_count": rejection_counts.get("duplicate", 0),
             "max_chunks": self.config.max_chunks,
             "max_chunks_per_doc": self.config.max_chunks_per_doc,
@@ -210,6 +227,12 @@ class EvidenceBundle:
             # Compatibility alias for trace consumers that adopted the plan name.
             "per_source_expansion_reasons": {key: list(reasons) for key, reasons in sorted(self.source_cap_expansion_reasons.items())},
             "estimated_context_tokens": estimated_tokens,
+            "represented_source_count": len(per_source_selected),
+            "represented_document_count": len(per_doc_selected),
+            "max_chunks_from_one_source": max(per_source_selected.values(), default=0),
+            "max_chunks_from_one_document": max(per_doc_selected.values(), default=0),
+            "candidate_observations": candidate_observations,
+            "candidate_observation_overflow_count": candidate_observation_overflow_count,
         }
         if agentic_lineage:
             summary["agentic_lineage"] = agentic_lineage
@@ -443,6 +466,7 @@ def build_context_bundle(
             if is_low_relevance:
                 low_relevance_preserved_count += 1
                 low_relevance_bypass_reason_counts.update(bypass_reasons)
+                record.protection_reason = ";".join(bypass_reasons) or None
             relevance_kept.append(record)
     ordered = relevance_kept
 
@@ -450,6 +474,9 @@ def build_context_bundle(
     priority_boosted_ids = [r.evidence_id for r in ordered if _priority_boost_score(priority_boosts_by_object_id.get(id(r))) > 0]
     if priority_boosted_ids:
         ordered = sorted(ordered, key=lambda record: (-_priority_boost_score(priority_boosts_by_object_id.get(id(record))), record.rank, record.evidence_id))
+        for record in ordered:
+            if _priority_boost_score(priority_boosts_by_object_id.get(id(record))) > 0:
+                record.protection_reason = record.protection_reason or "priority_evidence"
 
     primary_doc_reasons = _primary_doc_candidate_reasons(ordered, config, query_features)
     primary_doc_ids = _primary_doc_ids(primary_doc_reasons)
@@ -470,6 +497,9 @@ def build_context_bundle(
     if config.diversity_enabled and config.diversity_strategy == "source_round_robin":
         pre_diversity_order = list(ordered)
         ordered = _round_robin_by_source(ordered)
+        for record in pre_diversity_order[: config.max_chunks or len(pre_diversity_order)]:
+            if _has_protected_retrieval_lineage(record):
+                record.protection_reason = record.protection_reason or "protected_retrieval_lineage"
         ordered = _preserve_protected_lineage_prefix(pre_diversity_order, ordered, config.max_chunks)
 
     per_source: defaultdict[str, int] = defaultdict(int)
@@ -510,6 +540,9 @@ def build_context_bundle(
             continue
         record.selected_for_context = True
         record.rejection_reason = None
+        record.selection_reason = "protection" if record.protection_reason else "rank"
+        if config.diversity_enabled and config.diversity_strategy == "source_round_robin":
+            record.selection_reason = "diversity" if not record.protection_reason else "protection"
         record.citation_index = start_citation_index + len(selected)
         _sync_record_chunk_context_metadata(record)
         selected.append(record)
@@ -1117,6 +1150,56 @@ def _reject(record: EvidenceRecord, reason: str, rejected: list[EvidenceRecord])
     record.citation_index = None
     _sync_record_chunk_context_metadata(record)
     rejected.append(record)
+
+
+def _candidate_trace_observations(
+    records: list[EvidenceRecord],
+    selected: list[EvidenceRecord],
+    rejected: list[EvidenceRecord],
+) -> list[dict[str, Any]]:
+    """Return a bounded decision projection without serializing chunk text."""
+    selected_ids = {id(record) for record in selected}
+    selected_records = list(selected)[:_MAX_TRACE_CANDIDATE_OBSERVATIONS]
+    remaining = _MAX_TRACE_CANDIDATE_OBSERVATIONS - len(selected_records)
+    protected_rejected = [record for record in rejected if record.protection_reason][:remaining]
+    remaining -= len(protected_rejected)
+    rejected_records = sorted(
+        (record for record in rejected if record not in protected_rejected),
+        key=lambda record: (record.rank, record.evidence_id),
+    )[: max(0, remaining)]
+    included: list[EvidenceRecord] = []
+    for record in [*selected_records, *protected_rejected, *rejected_records]:
+        if record not in included:
+            included.append(record)
+
+    def score_provenance(record: EvidenceRecord) -> dict[str, Any]:
+        value = record.scores.get("score_provenance", {})
+        return value if isinstance(value, dict) else {}
+
+    observations = []
+    for record in included:
+        observations.append(
+            {
+                "evidence_id": record.evidence_id,
+                "source_id": hashlib.sha256(str(record.source_uri or record.doc_title or record.source_type).encode()).hexdigest()[:16],
+                "document_id": record.doc_id,
+                "retrieval_call_id": record.retrieval_call_id,
+                "rank": record.rank,
+                "scores": {key: value for key, value in record.scores.items() if key != "score_provenance"},
+                "score_provenance": score_provenance(record),
+                "lineage": {
+                    key: record.metadata.get(key)
+                    for key in ("plan_id", "facet_id", "subquery_id", "iteration_id", "followup_id", "lineage_rank", "merge_rank", "retrieval_variant")
+                    if record.metadata.get(key) is not None
+                },
+                "protected": bool(record.protection_reason),
+                "protection_reason": record.protection_reason,
+                "selected": id(record) in selected_ids,
+                "selection_reason": record.selection_reason,
+                "rejection_reason": record.rejection_reason,
+            }
+        )
+    return observations
 
 
 def _sync_record_chunk_context_metadata(record: EvidenceRecord) -> None:

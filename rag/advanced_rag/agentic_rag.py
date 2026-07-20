@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from typing import Any, List
 
@@ -32,6 +33,7 @@ from rag.advanced_rag.agentic_retrieval import (
     AgenticRefinementError,
     AgenticRetrievalConfig,
     build_deterministic_fallback_plan,
+    resolve_deterministic_primary_plan,
     build_planner_input,
     execute_bounded_plan,
     generate_llm_plan,
@@ -368,6 +370,7 @@ class RAGTools:
         *,
         entry_type: str | None = None,
         avoided_llm_call: bool = False,
+        valid_plan_reused: bool = False,
         entry_age_ms: float | None = None,
     ) -> None:
         if not self.trace:
@@ -375,9 +378,11 @@ class RAGTools:
         compatibility = self._planner_cache_compatibility()
         compatibility_digest = self._planner_compatibility_digest()
         attempt_key = f"{fingerprint}:{compatibility_digest}"
+        lifecycle_id = f"planner.cache.{fingerprint[:16]}"
         self.trace.add_agentic_retrieval_event(
             "planner_cache",
             {
+                "lifecycle_id": lifecycle_id,
                 "scope_hash": fingerprint[:16],
                 "cache_status": cache_status,
                 "entry_type": entry_type,
@@ -387,7 +392,11 @@ class RAGTools:
                 "prompt_version": compatibility["prompt_version"],
                 "configuration_digest": compatibility["configuration_digest"][:16],
                 "model_digest": compatibility["model_digest"][:16],
+                "provider": str(self._model_identity().get("provider") or type(self.chat_mdl).__name__),
+                "model": str(self._model_identity().get("llm_name") or self._model_identity().get("model_name") or ""),
                 "avoided_llm_call": avoided_llm_call,
+                "valid_plan_reused": valid_plan_reused,
+                "estimated_latency_saved_ms": round(entry_age_ms or 0.0, 3) if valid_plan_reused else 0.0,
                 "attempt_count": getattr(self, "_planner_attempts_by_fingerprint", {}).get(attempt_key, 0),
                 "terminal": entry_type == "terminal",
             },
@@ -514,6 +523,12 @@ class RAGTools:
         tool_deadline: float,
     ) -> Any | None:
         cfg = self.agentic_retrieval_config
+        if cfg.planner_mode == "deterministic":
+            try:
+                validation = resolve_deterministic_primary_plan(planner_input, cfg, rag_trace=self.trace)
+            except (TypeError, ValueError):
+                return None
+            return validation.plan if validation.valid else None
         if self._remaining_agentic_budget_ms() <= 0:
             self._trace_turn_budget_exhausted()
             return None
@@ -542,6 +557,7 @@ class RAGTools:
                     "hit_valid",
                     entry_type="valid",
                     avoided_llm_call=True,
+                    valid_plan_reused=True,
                     entry_age_ms=age_s * 1000.0,
                 )
                 return self._rebind_plan_id(entry.plan, issued_plan_id)
@@ -729,6 +745,7 @@ class RAGTools:
         max_calls = max(1, min(int(cfg.planner_max_calls_per_turn), 16))
         total_budget_ms = max(1, min(int(cfg.planner_total_budget_ms), 120000))
         repair_errors: tuple[str, ...] = ()
+        lifecycle_id = f"planner.lifecycle.{uuid.uuid4().hex[:12]}"
         while self._planner_attempts_by_fingerprint.get(attempt_key, 0) < max_attempts:
             remaining_planner_ms = total_budget_ms - self._planner_elapsed_ms
             remaining_turn_ms = self._remaining_agentic_budget_ms()
@@ -782,6 +799,7 @@ class RAGTools:
                     repair_errors=repair_errors,
                     attempt_timeout_ms=attempt_timeout_ms,
                     operation_id=operation_id,
+                    lifecycle_id=lifecycle_id,
                     cleanup_callback=account_planner_cleanup,
                 )
             except asyncio.CancelledError:
@@ -801,6 +819,7 @@ class RAGTools:
                         "planner_attempt",
                         {
                             "operation_id": operation_id,
+                            "lifecycle_id": lifecycle_id,
                             "scope_hash": safe_hash,
                             "attempt": attempt,
                             "max_attempts": max_attempts,
@@ -827,6 +846,7 @@ class RAGTools:
                                 "planner_llm_repair_failed",
                                 {
                                     "operation_id": operation_id,
+                                    "lifecycle_id": lifecycle_id,
                                     "scope_hash": safe_hash,
                                     "attempt": attempt,
                                     "failure_class": terminal_failure_class,
@@ -902,6 +922,7 @@ class RAGTools:
                         "planner_attempt",
                         {
                             "operation_id": operation_id,
+                            "lifecycle_id": lifecycle_id,
                             "scope_hash": safe_hash,
                             "attempt": attempt,
                             "max_attempts": max_attempts,
@@ -937,6 +958,7 @@ class RAGTools:
                 "planner_terminal",
                 {
                     "scope_hash": safe_hash,
+                    "lifecycle_id": lifecycle_id,
                     "cache_status": "stored_terminal",
                     "attempt": self._planner_attempts_by_fingerprint.get(attempt_key, 0),
                     "max_attempts": max_attempts,
@@ -951,6 +973,7 @@ class RAGTools:
                 "planner_llm_fallback_to_deterministic" if fallback_plan is not None else "planner_llm_fallback_to_baseline",
                 {
                     "scope_hash": safe_hash,
+                    "lifecycle_id": lifecycle_id,
                     "terminal": True,
                     "fallback": "deterministic_plan" if fallback_plan is not None else "baseline_retrieval",
                     "plan_origin": getattr(fallback_plan, "plan_origin", None),
