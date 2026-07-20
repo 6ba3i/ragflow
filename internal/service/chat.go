@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"ragflow/internal/common"
 	"ragflow/internal/entity"
+	"ragflow/internal/utility"
 	"strings"
 	"unicode/utf8"
 
@@ -76,40 +77,17 @@ type ListChatsResponse struct {
 
 // ListChats list chats for a user
 func (s *ChatService) ListChats(userID, status, keywords string, page, pageSize int, orderby string, desc bool) (*ListChatsResponse, error) {
-	// Get tenant IDs by user ID
-	tenantIDs, err := s.userTenantDAO.GetTenantIDsByUserID(userID)
+	chats, total, err := s.chatDAO.ListByTenantIDs(
+		nil,
+		userID,
+		page,
+		pageSize,
+		orderby,
+		desc,
+		keywords,
+	)
 	if err != nil {
 		return nil, err
-	}
-
-	// For now, use the first tenant ID (primary tenant)
-	// This matches the Python implementation behavior
-	var tenantID string
-	if len(tenantIDs) > 0 {
-		tenantID = tenantIDs[0]
-	} else {
-		tenantID = userID
-	}
-
-	// Query chats by tenant ID
-	chats, err := s.chatDAO.ListByTenantID(tenantID, status)
-	if err != nil {
-		return nil, err
-	}
-
-	total := int64(len(chats))
-
-	if page > 0 && pageSize > 0 {
-		start := (page - 1) * pageSize
-		end := start + pageSize
-		if start < int(total) {
-			if end > int(total) {
-				end = int(total)
-			}
-			chats = chats[start:end]
-		} else {
-			chats = []*entity.Chat{}
-		}
 	}
 
 	// Enrich with knowledge base names
@@ -438,7 +416,7 @@ func buildCreateChatEntity(req map[string]interface{}, tenantID string) *entity.
 	}
 
 	chat := &entity.Chat{
-		ID:                     common.GenerateUUID(),
+		ID:                     utility.GenerateUUID(),
 		TenantID:               tenantID,
 		Name:                   &name,
 		Description:            &description,

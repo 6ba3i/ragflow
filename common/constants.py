@@ -72,6 +72,12 @@ class ActiveStatusEnum(Enum):
     UNSUPPORTED = "unsupported"
 
 
+class ModelVerifyStatusEnum(Enum):
+    SUCCESS = "success"
+    FAIL = "fail"
+    UNKNOWN = "unknown"
+
+
 class ActiveEnum(Enum):
     ACTIVE = "1"
     INACTIVE = "0"
@@ -85,6 +91,16 @@ class LLMType(StrEnum):
     RERANK = "rerank"
     TTS = "tts"
     OCR = "ocr"
+
+
+class ModelTypeBinary(Enum):
+    CHAT = 0b0000001      # 1 << 0 = 1
+    EMBEDDING = 0b0000010  # 1 << 1 = 2
+    SPEECH2TEXT = 0b0000100  # 1 << 2 = 4
+    IMAGE2TEXT = 0b0001000  # 1 << 3 = 8
+    RERANK = 0b0010000  # 1 << 4 = 16
+    TTS = 0b0100000  # 1 << 5 = 32
+    OCR = 0b1000000  # 1 << 6 = 64
 
 
 class TaskStatus(StrEnum):
@@ -169,9 +185,19 @@ class PipelineTaskType(StrEnum):
     GRAPH_RAG = "GraphRAG"
     MINDMAP = "Mindmap"
     MEMORY = "Memory"
+    ARTIFACT = "Artifact"
+    SKILL = "Skill"
 
 
-VALID_PIPELINE_TASK_TYPES = {PipelineTaskType.PARSE, PipelineTaskType.DOWNLOAD, PipelineTaskType.RAPTOR, PipelineTaskType.GRAPH_RAG, PipelineTaskType.MINDMAP}
+VALID_PIPELINE_TASK_TYPES = {
+    PipelineTaskType.PARSE,
+    PipelineTaskType.DOWNLOAD,
+    PipelineTaskType.RAPTOR,
+    PipelineTaskType.GRAPH_RAG,
+    PipelineTaskType.MINDMAP,
+    PipelineTaskType.ARTIFACT,
+    PipelineTaskType.SKILL,
+}
 
 
 class MCPServerType(StrEnum):

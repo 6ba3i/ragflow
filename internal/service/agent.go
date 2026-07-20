@@ -21,12 +21,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"ragflow/internal/utility"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/cloudwego/eino/compose"
-	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
@@ -37,17 +38,10 @@ import (
 	"ragflow/internal/common"
 	"ragflow/internal/dao"
 	"ragflow/internal/entity"
+	"ragflow/internal/tokenizer"
 
 	dslpkg "ragflow/internal/agent/dsl"
 )
-
-// genID32 returns a 32-char UUID-derived primary key suitable for the
-// user_canvas and user_canvas_version tables. The format matches Python
-// uuid.uuid4().hex used by the original DAO and keeps existing rows
-// joinable across Python and Go writers.
-func genID32() string {
-	return strings.ReplaceAll(uuid.New().String(), "-", "")[:32]
-}
 
 // webhookPayloadKey is the unexported context key RunAgent reads to
 // inject root["webhook_payload"]. Only the AgentService.RunAgentWithWebhook
@@ -124,6 +118,7 @@ var ErrAgentStorageError = errors.New("agent storage error")
 type AgentService struct {
 	canvasDAO           *dao.UserCanvasDAO
 	canvasTemplateDAO   *dao.CanvasTemplateDAO
+	userDAO             *dao.UserDAO
 	userTenantDAO       *dao.UserTenantDAO
 	versionDAO          *dao.UserCanvasVersionDAO
 	api4ConversationDAO *dao.API4ConversationDAO
@@ -180,6 +175,7 @@ func NewAgentServiceWithOptions(
 	return &AgentService{
 		canvasDAO:           dao.NewUserCanvasDAO(),
 		canvasTemplateDAO:   dao.NewCanvasTemplateDAO(),
+		userDAO:             dao.NewUserDAO(),
 		userTenantDAO:       dao.NewUserTenantDAO(),
 		versionDAO:          dao.NewUserCanvasVersionDAO(),
 		api4ConversationDAO: dao.NewAPI4ConversationDAO(),
@@ -354,7 +350,7 @@ func (s *AgentService) CreateAgent(ctx context.Context, req *CreateAgentRequest)
 	// no-op when graph.nodes is already non-empty.
 	req.DSL = dslpkg.NormalizeForCanvas(req.DSL)
 	row := &entity.UserCanvas{
-		ID:             genID32(),
+		ID:             utility.GenerateUUID(),
 		UserID:         req.UserID,
 		Title:          req.Title,
 		Description:    req.Description,
@@ -421,7 +417,8 @@ func (s *AgentService) GetAgent(ctx context.Context, userID, canvasID string) (*
 // UpdateAgent applies a draft patch to user_canvas. Settings updates may omit
 // dsl; in that case the existing draft DSL must be preserved.
 func (s *AgentService) UpdateAgent(ctx context.Context, userID, canvasID string, patch map[string]interface{}) error {
-	if _, err := s.loadCanvasForUser(ctx, userID, canvasID); err != nil {
+	canvasInstance, err := s.loadCanvasForUser(ctx, userID, canvasID)
+	if err != nil {
 		return err
 	}
 
@@ -450,9 +447,24 @@ func (s *AgentService) UpdateAgent(ctx context.Context, userID, canvasID string,
 		updates["dsl"] = entity.JSONMap(dslpkg.NormalizeForCanvas(entity.JSONMap(dslMap)))
 	}
 
-	_, err := s.canvasDAO.UpdateFields(canvasID, updates)
+	_, err = s.canvasDAO.UpdateFields(canvasID, updates)
 	if err != nil {
 		return fmt.Errorf("update agent %s: %w", canvasID, err)
+	}
+	if dslValue, ok := updates["dsl"]; ok {
+		dsl, ok := dslValue.(entity.JSONMap)
+		if !ok {
+			return fmt.Errorf("update agent %s: normalized dsl must be an object", canvasID)
+		}
+		title := ""
+		if value, ok := updates["title"]; ok {
+			title, _ = value.(string)
+		} else if canvasInstance.Title != nil {
+			title = *canvasInstance.Title
+		}
+		if _, err := s.saveOrReplaceVersion(ctx, userID, canvasID, dsl, title, nil, false); err != nil {
+			return fmt.Errorf("update agent %s: save version: %w", canvasID, err)
+		}
 	}
 	return nil
 }
@@ -465,11 +477,9 @@ func (s *AgentService) UpdateAgent(ctx context.Context, userID, canvasID string,
 // returned so the caller can render it back to the client without an
 // extra GET.
 //
-// Reset does NOT create a new user_canvas_version row — that mirrors
-// the Python behavior and UpdateAgent: versions are owned by
-// PublishAgent. It also does NOT touch the in-flight run state of any
-// currently executing canvas session; that is owned by the Python task
-// executor and is out of scope for the Go port.
+// Reset does NOT create a new user_canvas_version row. It also does NOT touch
+// the in-flight run state of any currently executing canvas session; that is
+// owned by the Python task executor and is out of scope for the Go port.
 //
 // Errors propagate the same way as GetAgent: a missing canvas, or a
 // canvas that the user has no access to, surfaces as
@@ -557,7 +567,7 @@ func (s *AgentService) PublishAgent(ctx context.Context, userID, canvasID string
 		}
 	}
 	row := &entity.UserCanvasVersion{
-		ID:           genID32(),
+		ID:           utility.GenerateUUID(),
 		UserCanvasID: canvasID,
 		Title:        title,
 		Description:  description,
@@ -579,6 +589,41 @@ func (s *AgentService) PublishAgent(ctx context.Context, userID, canvasID string
 		return nil, err
 	}
 	return row, nil
+}
+
+func (s *AgentService) saveOrReplaceVersion(ctx context.Context, userID, canvasID string, dsl entity.JSONMap, title string, description *string, release bool) (*entity.UserCanvasVersion, error) {
+	nickname, err := s.userDAO.GetNicknameByID(ctx, userID)
+	if err != nil || strings.TrimSpace(nickname) == "" {
+		nickname = userID
+	}
+	versionTitle := buildVersionTitle(nickname, title, time.Now())
+	return s.versionDAO.SaveOrReplaceLatest(dao.SaveOrReplaceLatestVersionOptions{
+		NewID:           utility.GenerateUUID(),
+		UserCanvasID:    canvasID,
+		Title:           &versionTitle,
+		Description:     description,
+		DSL:             dsl,
+		Release:         release,
+		KeepUnpublished: 20,
+		SameDSL: func(latestDSL entity.JSONMap) bool {
+			return reflect.DeepEqual(
+				entity.JSONMap(dslpkg.NormalizeForCanvas(latestDSL)),
+				dsl,
+			)
+		},
+	})
+}
+
+func buildVersionTitle(userNickname, agentTitle string, ts time.Time) string {
+	tenant := strings.TrimSpace(userNickname)
+	if tenant == "" {
+		tenant = "tenant"
+	}
+	title := strings.TrimSpace(agentTitle)
+	if title == "" {
+		title = "agent"
+	}
+	return fmt.Sprintf("%s_%s_%s", tenant, title, ts.Format("2006-01-02 15:04:05"))
 }
 
 // ListVersions returns every version for a canvas the user can see,
@@ -660,7 +705,7 @@ func (s *AgentService) RunAgent(ctx context.Context, userID, canvasID, sessionID
 		return nil, err
 	}
 	if sessionID == "" {
-		sessionID = strings.ReplaceAll(uuid.New().String(), "-", "")
+		sessionID = utility.GenerateToken()
 	}
 
 	// Load the version row up front so the run is bound to a real DSL.
@@ -772,20 +817,25 @@ func (s *AgentService) RunAgent(ctx context.Context, userID, canvasID, sessionID
 	if payload, ok := ctx.Value(webhookPayloadKey{}).(map[string]any); ok && payload != nil {
 		root["webhook_payload"] = payload
 	}
-	// Phase 4.4 V2.1 (v3.6.1): populate root["tenant_id"] so the
-	// RunTracker.Start call (in buildRunFunc) records the run
-	// under the right tenant. The lookup is best-effort — a
-	// failure here (DAO down, user has no tenants) logs and
-	// continues with an empty tenant_id rather than failing
-	// the run; the run still works, the only loss is the
-	// per-tenant filterability of the run-history log.
+	// Match Python's @add_tenant_id_to_kwargs behavior for runtime
+	// components and model credential lookup: the canvas runs under
+	// the current caller's tenant id. Team-agent access was already
+	// authorized by loadCanvasForUser above; do not replace this with
+	// an arbitrary joined team tenant or LLM credential lookup can miss
+	// the caller's configured provider key.
+	root["tenant_id"] = userID
+
+	// Preserve the historical RunTracker tenant dimension separately.
+	// Existing tests and log filters expect the joined tenant id in the
+	// run hash, but runtime state must keep tenant_id=userID.
 	if tenantIDs, terr := s.userTenantDAO.GetTenantIDsByUserID(userID); terr == nil && len(tenantIDs) > 0 {
-		root["tenant_id"] = tenantIDs[0]
+		root["run_tenant_id"] = tenantIDs[0]
 	} else if terr != nil {
-		common.Warn("service: RunAgent userTenantDAO.GetTenantIDsByUserID (best-effort, run not blocked)",
+		common.Warn("service: RunAgent userTenantDAO.GetTenantIDsByUserID (best-effort, run tracker tenant not populated)",
 			zap.String("user_id", userID),
 			zap.Error(terr))
 	}
+
 	// v3.6.1 diagnostic: log what RunAgent put into root so we can
 	// confirm tenant_id / user_id / session_id / user_input all
 	// reached the buildRunFunc closure (which runs in the runner's
@@ -835,11 +885,26 @@ func (s *AgentService) buildRunFunc(canvasID string, versionRow *entity.UserCanv
 			return nil, err
 		}
 
+		// Install a per-run token usage sink so every LLM call inside
+		// this turn records its token usage (the sink is read at the end
+		// and emitted in workflow_finished). Mirrors Python's
+		// Canvas.run() installing token_usage_sink + langfuse_run_attrs.
+		ctx = tokenizer.WithRunUsage(ctx)
+
 		// Extract the event channel + metadata injected by Runner.Run.
 		events, _ := root["__events__"].(chan canvas.RunEvent)
 		messageID, _ := root["__message_id__"].(string)
 		taskID, _ := root["__task_id__"].(string)
 		sessionID, _ := root["__session_id__"].(string)
+		userID, _ := root["user_id"].(string)
+
+		// Install per-run Langfuse correlation attrs so LLM calls inside
+		// this turn are grouped by session/user. Mirrors Python's
+		// Canvas.run() setting langfuse_run_attrs.
+		ctx = tokenizer.WithRunAttrs(ctx, &tokenizer.RunAttrs{
+			SessionID: sessionID,
+			UserID:    userID,
+		})
 
 		// Helper to build an SSE event with metadata.
 		emit := func(typ, data string) {
@@ -853,6 +918,22 @@ func (s *AgentService) buildRunFunc(canvasID string, versionRow *entity.UserCanv
 				TaskID:    taskID,
 				SessionID: sessionID,
 			})
+		}
+
+		// usagePayload returns the aggregated per-run token usage as a
+		// JSON-serializable map, or nil when no sink was installed.
+		usagePayload := func() map[string]int {
+			sink := tokenizer.GetRunUsage(ctx)
+			if sink == nil {
+				return nil
+			}
+			pt, ct, tt, calls := sink.Snapshot()
+			return map[string]int{
+				"prompt_tokens":     pt,
+				"completion_tokens": ct,
+				"total_tokens":      tt,
+				"calls":             calls,
+			}
 		}
 
 		startedAt := float64(time.Now().UnixNano()) / 1e9
@@ -883,7 +964,11 @@ func (s *AgentService) buildRunFunc(canvasID string, versionRow *entity.UserCanv
 			meData, _ := json.Marshal(canvas.MessageEndEvent{})
 			emit("message", string(msgData))
 			emit("message_end", string(meData))
-			wfData, _ := json.Marshal(map[string]any{"outputs": answer})
+			wfPayload := map[string]any{"outputs": answer}
+			if u := usagePayload(); u != nil {
+				wfPayload["usage"] = u
+			}
+			wfData, _ := json.Marshal(wfPayload)
 			emit("workflow_finished", string(wfData))
 			return state, nil
 		}
@@ -894,6 +979,10 @@ func (s *AgentService) buildRunFunc(canvasID string, versionRow *entity.UserCanv
 			s.markRunFailed(ctx, runID, "decode: "+err.Error())
 			return nil, err
 		}
+		// Close MCP tool adapters and any other closeable resources
+		// held by the canvas after execution completes. Mirrors
+		// Python's finally: canvas.close() in canvas_service.py.
+		defer c.Close()
 
 		// Store events channel + run metadata on the context so the
 		// per-node statePre/statePost wrappers (in scheduler.go) can
@@ -1055,6 +1144,7 @@ func (s *AgentService) buildRunFunc(canvasID string, versionRow *entity.UserCanv
 			if canvas.IsInterruptError(err) {
 				s.markRunFailed(ctx2, runID, "interrupt: "+err.Error())
 				if answer != "" {
+					s.persistAgentRunSession(canvasID, sessionID, messageID, userInput, answer, reference)
 					msgData, _ := json.Marshal(canvas.MessageEvent{
 						Content:   answer,
 						Reference: reference,
@@ -1069,6 +1159,7 @@ func (s *AgentService) buildRunFunc(canvasID string, versionRow *entity.UserCanv
 				return state, err
 			}
 			if shouldTreatAsCompletedLoopRun(err, answer) {
+				s.persistAgentRunSession(canvasID, sessionID, messageID, userInput, answer, reference)
 				msgData, _ := json.Marshal(canvas.MessageEvent{
 					Content:   answer,
 					Reference: reference,
@@ -1080,12 +1171,16 @@ func (s *AgentService) buildRunFunc(canvasID string, versionRow *entity.UserCanv
 				})
 				emit("message_end", string(meData))
 
-				wfData, _ := json.Marshal(map[string]interface{}{
+				wfPayload := map[string]interface{}{
 					"inputs":       map[string]any{"query": userInput},
 					"outputs":      answer,
 					"elapsed_time": now - startedAt,
 					"created_at":   now,
-				})
+				}
+				if u := usagePayload(); u != nil {
+					wfPayload["usage"] = u
+				}
+				wfData, _ := json.Marshal(wfPayload)
 				emit("workflow_finished", string(wfData))
 
 				s.markRunSucceeded(ctx2, runID)
@@ -1096,6 +1191,7 @@ func (s *AgentService) buildRunFunc(canvasID string, versionRow *entity.UserCanv
 		}
 
 		// Emit message + message_end (mirrors Python's ans dict).
+		s.persistAgentRunSession(canvasID, sessionID, messageID, userInput, answer, reference)
 		msgData, _ := json.Marshal(canvas.MessageEvent{
 			Content:   answer,
 			Reference: reference,
@@ -1107,13 +1203,18 @@ func (s *AgentService) buildRunFunc(canvasID string, versionRow *entity.UserCanv
 		})
 		emit("message_end", string(meData))
 
-		// Emit workflow_finished with the final outputs.
-		wfData, _ := json.Marshal(map[string]interface{}{
+		// Emit workflow_finished with the final outputs and aggregated
+		// per-run token usage across all LLM calls in this turn.
+		wfPayload := map[string]interface{}{
 			"inputs":       map[string]any{"query": userInput},
 			"outputs":      answer,
 			"elapsed_time": now - startedAt,
 			"created_at":   now,
-		})
+		}
+		if u := usagePayload(); u != nil {
+			wfPayload["usage"] = u
+		}
+		wfData, _ := json.Marshal(wfPayload)
 		emit("workflow_finished", string(wfData))
 
 		s.markRunSucceeded(ctx2, runID)
@@ -1132,11 +1233,61 @@ func runIDFor(canvasID string, root map[string]any) string {
 	return canvasID
 }
 
-// tenantIDFromRoot returns the optional tenant_id that the handler
-// may have populated on the root map. Empty when absent — the
-// RunTracker stores "" as the tenant id, which the test suite
-// already exercises.
+func (s *AgentService) persistAgentRunSession(agentID, sessionID, messageID string, userInput any, answer string, reference []interface{}) {
+	if sessionID == "" || s == nil || s.api4ConversationDAO == nil || dao.DB == nil {
+		return
+	}
+	session, err := s.api4ConversationDAO.GetBySessionID(sessionID, agentID)
+	if err != nil {
+		common.Warn("agent run: load session for update failed", zap.String("agent_id", agentID), zap.String("session_id", sessionID), zap.Error(err))
+		return
+	}
+	if session == nil {
+		return
+	}
+	messages := parseAgentSessionMessages(session.Message)
+	now := time.Now().Unix()
+	if text := stringifyAgentUserInput(userInput); text != "" {
+		messages = append(messages, map[string]interface{}{"role": "user", "content": text, "id": utility.GenerateToken(), "created_at": now})
+	}
+	messages = append(messages, map[string]interface{}{"role": "assistant", "content": answer, "id": messageID, "created_at": now})
+	if raw, err := json.Marshal(messages); err == nil {
+		session.Message = raw
+	}
+	references := parseAgentSessionReferences(session.Reference)
+	references = append(references, normalizeAgentReferenceEntry(map[string]interface{}{"chunks": reference}))
+	if raw, err := json.Marshal(references); err == nil {
+		session.Reference = raw
+	}
+	if err := s.api4ConversationDAO.Update(session); err != nil {
+		common.Warn("agent run: update session failed", zap.String("agent_id", agentID), zap.String("session_id", sessionID), zap.Error(err))
+	}
+}
+
+func stringifyAgentUserInput(userInput any) string {
+	switch v := userInput.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	default:
+		if b, err := json.Marshal(v); err == nil {
+			return string(b)
+		}
+		return fmt.Sprint(v)
+	}
+}
+
+// tenantIDFromRoot returns the optional run-tracker tenant id that
+// RunAgent populated on the root map. Runtime components use
+// root["tenant_id"] / state.Sys["tenant_id"] for the caller tenant;
+// RunTracker keeps the historical joined-tenant dimension separately.
+// Empty when absent — the RunTracker stores "" as the tenant id, which
+// the test suite already exercises.
 func tenantIDFromRoot(root map[string]any) string {
+	if s, ok := root["run_tenant_id"].(string); ok {
+		return s
+	}
 	if s, ok := root["tenant_id"].(string); ok {
 		return s
 	}

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"ragflow/internal/utility"
 	"regexp"
 	"strings"
 	"sync"
@@ -31,11 +32,10 @@ import (
 	"ragflow/internal/common"
 	"ragflow/internal/engine"
 	modelModule "ragflow/internal/entity/models"
-	"ragflow/internal/service/kg"
+	"ragflow/internal/service/graph"
 	"ragflow/internal/service/nlp"
 	"ragflow/internal/tokenizer"
 
-	"github.com/google/uuid"
 	"github.com/kaptinlin/jsonrepair"
 	"go.uber.org/zap"
 )
@@ -386,7 +386,7 @@ func (dr *DeepResearcher) _retrieve_information(ctx context.Context, query strin
 
 	// 3. Knowledge graph retrieval
 	if useKG, _ := dr.PromptConfig["use_kg"].(bool); useKG && dr.ChatModel != nil && len(dr.KbIDs) > 0 {
-		kgPipeline := kg.NewPipeline(dr.DocEngine, dr.KbIDs, dr.TenantIDs, query)
+		kgPipeline := graph.NewPipeline(dr.DocEngine, dr.KbIDs, dr.TenantIDs, query)
 		kgPipeline.SetChatModel(dr.ChatModel)
 		if dr.EmbModel != nil {
 			kgPipeline.SetEmbModel(dr.EmbModel)
@@ -459,7 +459,7 @@ func (dr *DeepResearcher) tavilyRetrieve(ctx context.Context, query string) (map
 	chunks := make([]map[string]interface{}, 0, len(apiResp.Results))
 	aggs := make([]interface{}, 0, len(apiResp.Results))
 	for _, r := range apiResp.Results {
-		id := strings.ReplaceAll(uuid.New().String(), "-", "")
+		id := utility.GenerateToken()
 		chunks = append(chunks, map[string]interface{}{
 			"chunk_id":            id,
 			"content_ltks":        tokenizeText(r.Content),

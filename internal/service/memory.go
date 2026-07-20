@@ -24,6 +24,7 @@ import (
 	"ragflow/internal/common"
 	"ragflow/internal/entity"
 	models "ragflow/internal/entity/models"
+	"ragflow/internal/utility"
 	"strconv"
 	"strings"
 	"time"
@@ -396,7 +397,7 @@ func (s *MemoryService) CreateMemory(tenantID string, req *CreateMemoryRequest) 
 	memoryTypeInt := dao.CalculateMemoryType(uniqueMemoryTypes)
 	systemPrompt := PromptAssembler{}.AssembleSystemPrompt(uniqueMemoryTypes)
 
-	newID := common.GenerateUUID()
+	newID := utility.GenerateUUID()
 
 	memory := &entity.Memory{
 		ID:               newID,
@@ -670,15 +671,20 @@ func (s *MemoryService) UpdateMemory(tenantID string, memoryID string, req *Upda
 		return formatRetDataFromMemory(currentMemory), nil
 	}
 
-	memorySize := currentMemory.MemorySize
 	notAllowedUpdate := []string{}
 	for _, f := range []string{"tenant_embd_id", "embd_id", "memory_type"} {
-		if _, ok := updateDict[f]; ok && memorySize > 0 {
+		if _, ok := updateDict[f]; ok {
 			notAllowedUpdate = append(notAllowedUpdate, f)
 		}
 	}
 	if len(notAllowedUpdate) > 0 {
-		return nil, fmt.Errorf("can't update %v when memory isn't empty", notAllowedUpdate)
+		messages, err := s.listMemoryMessages(context.Background(), currentMemory, []string{}, "", 1, 1)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check memory messages: %w", err)
+		}
+		if total, ok := messages["total_count"].(int64); ok && total > 0 {
+			return nil, fmt.Errorf("can't update %v when memory isn't empty", notAllowedUpdate)
+		}
 	}
 
 	if _, ok := updateDict["memory_type"]; ok {
@@ -1419,13 +1425,14 @@ func (s *MemoryService) ListMemories(userID string, tenantIDs []string, memoryTy
 		if err != nil {
 			return nil, fmt.Errorf("failed to get user tenants: %w", err)
 		}
-		tenantIDs = make([]string, len(userTenants))
-		for i, tenant := range userTenants {
-			tenantIDs[i] = tenant.TenantID
+		tenantIDs = make([]string, 0, len(userTenants)+1)
+		tenantIDs = append(tenantIDs, userID)
+		for _, tenant := range userTenants {
+			tenantIDs = append(tenantIDs, tenant.TenantID)
 		}
 	}
 
-	memories, total, err := s.memoryDAO.GetByFilter(tenantIDs, memoryTypes, storageType, keywords, page, pageSize)
+	memories, total, err := s.memoryDAO.GetByFilter(userID, tenantIDs, memoryTypes, storageType, keywords, page, pageSize)
 	if err != nil {
 		return nil, err
 	}

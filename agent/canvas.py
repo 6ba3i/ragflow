@@ -25,18 +25,19 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from functools import partial
-from typing import Any, Union, Tuple
+from typing import Any, Tuple, Union
 
 from agent.component import component_class
 from agent.component.base import ComponentBase
 from agent.dsl_migration import normalize_chunker_dsl
+from api.db.joint_services.tenant_model_service import get_tenant_default_model_by_type
 from api.db.services.file_service import FileService
 from api.db.services.llm_service import LLMBundle
 from api.db.services.task_service import has_canceled
-from api.db.joint_services.tenant_model_service import get_tenant_default_model_by_type
 from common.constants import LLMType
-from common.misc_utils import get_uuid, hash_str2int
+from common.llm_request_context import set_llm_request_context, reset_llm_request_context
 from common.exceptions import TaskCanceledException
+from common.misc_utils import get_uuid, hash_str2int
 from common.token_utils import token_usage_sink, langfuse_run_attrs
 from rag.prompts.generator import chunks_format
 from rag.utils.redis_conn import REDIS_CONN
@@ -161,6 +162,7 @@ class Graph:
 
     def close(self):
         from common.mcp_tool_call_conn import MCPToolCallSession
+
         seen = set()
         for cpn in self.components.values():
             obj = cpn.get("obj")
@@ -228,7 +230,13 @@ class Graph:
         exp = exp.strip("{").strip("}").strip(" ").strip("{").strip("}")
         if exp.find("@") < 0:
             return self.globals[exp]
-        cpn_id, var_nm = exp.split("@")
+        # Split from the left with maxsplit=1 so the trailing var_nm can
+        # legitimately contain '@' characters (defensive: although the
+        # upstream regex in `get_value_with_variable` constrains `var_nm`
+        # to `[A-Za-z0-9_.-]+`, direct callers of this method may pass
+        # any string and should not raise `ValueError: too many values
+        # to unpack`). `cpn_id` is system-generated and never contains '@'.
+        cpn_id, var_nm = exp.split("@", 1)
         cpn = self.get_component(cpn_id)
         if not cpn:
             raise Exception(f"Can't find variable: '{cpn_id}@{var_nm}'")
@@ -275,7 +283,10 @@ class Graph:
         if exp.find("@") < 0:
             self.globals[exp] = value
             return
-        cpn_id, var_nm = exp.split("@")
+        # See `get_variable_value` above for rationale on `maxsplit=1`.
+        # Without it, a var_nm containing '@' would raise
+        # `ValueError: too many values to unpack` instead of being preserved.
+        cpn_id, var_nm = exp.split("@", 1)
         cpn = self.get_component(cpn_id)
         if not cpn:
             raise Exception(f"Can't find variable: '{cpn_id}@{var_nm}'")
@@ -428,6 +439,14 @@ class Canvas(Graph):
             _lf_attrs["session_id"] = str(_session_id)[:200]
         sink_token = token_usage_sink.set(self._run_token_usage)
         attrs_token = langfuse_run_attrs.set(_lf_attrs)
+        # Forward the originating session/user to upstream LLM providers (as the
+        # OpenAI `user` field) for the duration of this run, and reset afterwards so
+        # the value never leaks to later calls in the same task. Reuse the same
+        # session/user already derived above so both integrations stay consistent.
+        _req_ctx_token = set_llm_request_context(
+            session_id=_session_id,
+            user_id=_user_id,
+        )
         try:
             async for ev in self._run_impl(**kwargs):
                 yield ev
@@ -444,6 +463,7 @@ class Canvas(Graph):
             except ValueError:
                 logging.debug("Failed to reset Langfuse run attributes ContextVar", exc_info=True)
                 langfuse_run_attrs.set(None)
+            reset_llm_request_context(_req_ctx_token)
 
     async def _run_impl(self, **kwargs):
         self.globals["sys.date"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -529,11 +549,13 @@ class Canvas(Graph):
                     if use_async:
                         await cpn_obj.invoke_async(**(call_kwargs or {}))
                         return
-                    # run_in_executor does not propagate context variables; copy the
-                    # current context so the token usage sink / Langfuse attributes set
-                    # by run() remain visible to LLMBundle calls inside sync components.
-                    ctx = contextvars.copy_context()
-                    await loop.run_in_executor(self._thread_pool, lambda: ctx.run(partial(sync_fn, **(call_kwargs or {}))))
+                    # run_in_executor does not carry context variables into the worker
+                    # thread; copy the current context so the LLM request context (the
+                    # `user` forwarding), token usage sink, and Langfuse attributes set
+                    # by run() remain visible to sync components.
+                    bound_call = partial(sync_fn, **(call_kwargs or {}))
+                    call_ctx = contextvars.copy_context()
+                    await loop.run_in_executor(self._thread_pool, partial(call_ctx.run, bound_call))
 
             i = f
             while i < t:

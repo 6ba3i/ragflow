@@ -41,6 +41,7 @@ import (
 
 	"ragflow/internal/common"
 	"ragflow/internal/dao"
+	"ragflow/internal/deepdoc/parser/pdf/pdfoxide"
 	"ragflow/internal/engine"
 	"ragflow/internal/engine/redis"
 	enginetypes "ragflow/internal/engine/types"
@@ -51,7 +52,6 @@ import (
 	"ragflow/internal/utility"
 
 	"github.com/cespare/xxhash/v2"
-	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -559,7 +559,7 @@ func (s *DocumentService) DownloadDocument(datasetID, docID string) (*DownloadDo
 // CreateDocument create document
 func (s *DocumentService) CreateDocument(req *CreateDocumentRequest) (*entity.Document, error) {
 	document := &entity.Document{
-		ID:           common.GenerateUUID(),
+		ID:           utility.GenerateUUID(),
 		Name:         &req.Name,
 		KbID:         req.KbID,
 		ParserID:     req.ParserID,
@@ -568,7 +568,7 @@ func (s *DocumentService) CreateDocument(req *CreateDocumentRequest) (*entity.Do
 		Type:         req.Type,
 		SourceType:   req.Source,
 		Suffix:       ".doc",
-		Status:       func() *string { s := "0"; return &s }(),
+		Status:       func() *string { s := "1"; return &s }(),
 	}
 
 	if err := s.InsertDocument(document); err != nil {
@@ -1565,7 +1565,7 @@ func (s *DocumentService) newDocumentParseTask(doc *entity.Document, fromPage, t
 	digest := documentParseTaskDigest(doc, fromPage, toPage)
 	chunkIDs := ""
 	return &entity.Task{
-		ID:          common.GenerateUUID(),
+		ID:          utility.GenerateUUID(),
 		DocID:       doc.ID,
 		FromPage:    fromPage,
 		ToPage:      toPage,
@@ -1617,6 +1617,10 @@ func documentParseTaskRanges(doc *entity.Document, bucket, objectName string) ([
 			}
 		}
 		if len(ranges) == 0 {
+			// pages == 0 means page count detection failed (e.g. compressed
+			// PDF where both regex and pdfoxide fallbacks failed). Fall back
+			// to maximumTaskPageNumber so the Python parser processes all
+			// pages via slicing (Python gracefully caps at actual page count).
 			ranges = append(ranges, documentParsePageRange{from: 0, to: maximumTaskPageNumber})
 		}
 		return ranges, nil
@@ -1754,7 +1758,20 @@ func documentEstimatePDFPageCount(binary []byte) int64 {
 	if len(binary) == 0 {
 		return 0
 	}
-	return int64(len(documentPDFPagePattern.FindAll(binary, -1)))
+	// Fast path: regex works for uncompressed PDFs.
+	count := int64(len(documentPDFPagePattern.FindAll(binary, -1)))
+	if count > 0 {
+		return count
+	}
+	// Fallback for compressed PDFs where /Type /Page is inside a
+	// compressed object stream: use pdf_oxide to get the real page count.
+	if doc, err := pdfoxide.OpenBytes(binary); err == nil {
+		defer doc.Close()
+		if pages, err := doc.PageCount(); err == nil {
+			return int64(pages)
+		}
+	}
+	return 0
 }
 
 func documentEstimateTableRowCount(name string, binary []byte) int {
@@ -3305,14 +3322,14 @@ func (s *DocumentService) ensureKBFolder(kb *entity.Knowledgebase, tenantID stri
 // newAFileFromKB returns the existing folder named name under parentID, or
 // creates it. Mirrors Python FileService.new_a_file_from_kb.
 func (s *DocumentService) newAFileFromKB(tenantID, name, parentID string) (*entity.File, error) {
-	for _, f := range s.fileDAO.Query(name, parentID) {
+	for _, f := range s.fileDAO.Query(name, parentID, tenantID) {
 		if f.TenantID == tenantID {
 			return f, nil
 		}
 	}
 	loc := ""
 	folder := &entity.File{
-		ID:         strings.ReplaceAll(uuid.New().String(), "-", ""),
+		ID:         utility.GenerateToken(),
 		ParentID:   parentID,
 		TenantID:   tenantID,
 		CreatedBy:  tenantID,
@@ -3343,7 +3360,7 @@ func (s *DocumentService) addFileFromKB(doc *entity.Document, kbFolderID, tenant
 	if doc.Location != nil {
 		loc = *doc.Location
 	}
-	fileID := strings.ReplaceAll(uuid.New().String(), "-", "")
+	fileID := utility.GenerateToken()
 	file := &entity.File{
 		ID:         fileID,
 		ParentID:   kbFolderID,
@@ -3360,7 +3377,7 @@ func (s *DocumentService) addFileFromKB(doc *entity.Document, kbFolderID, tenant
 	}
 	docID := doc.ID
 	if err := s.file2DocumentDAO.Create(&entity.File2Document{
-		ID:         strings.ReplaceAll(uuid.New().String(), "-", ""),
+		ID:         utility.GenerateToken(),
 		FileID:     &fileID,
 		DocumentID: &docID,
 	}); err != nil {
@@ -3447,8 +3464,9 @@ func normalizeWebDocumentName(name, contentType string, blob []byte) string {
 // newDatasetDocument builds a Document row for an upload, deriving parser_id,
 // suffix and content hash. blob may be nil for the empty/virtual document.
 func (s *DocumentService) newDatasetDocument(kb *entity.Knowledgebase, tenantID, filename, location, filetype string, parserConfig entity.JSONMap, src string, size int64, blob []byte) *entity.Document {
-	docID := strings.ReplaceAll(uuid.New().String(), "-", "")
-	zero := "0"
+	docID := utility.GenerateToken()
+	run := "0"
+	status := "1"
 	suffix := ""
 	if i := strings.LastIndex(filename, "."); i >= 0 {
 		suffix = filename[i+1:]
@@ -3467,8 +3485,8 @@ func (s *DocumentService) newDatasetDocument(kb *entity.Knowledgebase, tenantID,
 		Location:     &loc,
 		Size:         size,
 		Suffix:       suffix,
-		Run:          &zero,
-		Status:       &zero,
+		Run:          &run,
+		Status:       &status,
 	}
 	if blob != nil {
 		hash := contentHashHex(blob)
@@ -3700,6 +3718,7 @@ func (s *DocumentService) UploadDocumentInfos(userID string, files []*multipart.
 	fileSvc := &FileService{
 		fileDAO:          s.fileDAO,
 		file2DocumentDAO: s.file2DocumentDAO,
+		documentService:  s,
 	}
 	data, err := fileSvc.UploadInfos(userID, files)
 	if err != nil {
@@ -3712,6 +3731,7 @@ func (s *DocumentService) UploadDocumentInfoByURL(userID, rawURL string) (map[st
 	fileSvc := &FileService{
 		fileDAO:          s.fileDAO,
 		file2DocumentDAO: s.file2DocumentDAO,
+		documentService:  s,
 	}
 	data, err := fileSvc.UploadFromURL(userID, rawURL)
 	if err != nil {

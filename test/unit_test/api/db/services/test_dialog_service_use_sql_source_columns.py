@@ -295,6 +295,7 @@ def test_async_chat_uses_all_docs_when_no_doc_ids_selected(monkeypatch):
     dialog = SimpleNamespace(
         kb_ids=["kb-1"],
         llm_id="chat-model",
+        tenant_llm_id="",
         tenant_id="tenant-id",
         llm_setting={},
         similarity_threshold=0.1,
@@ -316,10 +317,7 @@ def test_async_chat_uses_all_docs_when_no_doc_ids_selected(monkeypatch):
     )
 
     monkeypatch.setattr(dialog_service.settings, "retriever", retriever, raising=False)
-    monkeypatch.setattr(
-        dialog_service, "get_model_type_by_name",
-        lambda _tid, _llm_id: ["chat"]
-    )
+    monkeypatch.setattr(dialog_service, "get_model_type_by_name", lambda _tid, _llm_id: ["chat"])
     monkeypatch.setattr(
         dialog_service,
         "get_model_config_from_provider_instance",

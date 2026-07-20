@@ -162,9 +162,11 @@ class Dealer:
             if key in req and req[key] is not None:
                 condition[field] = req[key]
         # TODO(yzc): `available_int` is nullable however infinity doesn't support nullable columns.
-        for key in ["knowledge_graph_kwd", "available_int", "entity_kwd", "from_entity_kwd", "to_entity_kwd", "removed_kwd"]:
+        for key in ["id", "knowledge_graph_kwd", "available_int", "entity_kwd", "from_entity_kwd", "to_entity_kwd", "removed_kwd"]:
             if key in req and req[key] is not None:
                 condition[key] = req[key]
+        if isinstance(req.get("must_not"), dict):
+            condition["must_not"] = req["must_not"]
         return condition
 
     async def search(self, req, idx_names: str | list[str], kb_ids: list[str], emb_mdl=None, highlight: bool | list | None = None, rank_feature: dict | None = None):
@@ -225,7 +227,7 @@ class Dealer:
                 highlightFields = []
             elif isinstance(highlight, list):
                 highlightFields = highlight
-            vector_similarity_weight = max(0.0, min(1.0, float(req.get("vector_similarity_weight", 0.3))))
+            vector_similarity_weight = max(0.0, min(1.0, float(req.get("vector_similarity_weight", 0.95))))
             retrieval_lane = req.get("retrieval_lane")
             sparse_enabled = vector_similarity_weight < 1.0 and retrieval_lane != "original_dense"
             dense_enabled = emb_mdl is not None and vector_similarity_weight > 0.0 and retrieval_lane not in {"exact_phrase", "original_sparse", "expanded_sparse"}
@@ -258,10 +260,11 @@ class Dealer:
 
             fusionExpr = None
             if matchText is not None and matchDense is not None:
+                fusion_weights = "0.05,0.95" if retrieval_lane is None and "vector_similarity_weight" not in req else f"{1.0 - vector_similarity_weight},{vector_similarity_weight}"
                 fusionExpr = FusionExpr(
                     "weighted_sum",
                     topk,
-                    {"weights": f"{1.0 - vector_similarity_weight},{vector_similarity_weight}"},
+                    {"weights": fusion_weights},
                 )
                 matchExprs = [matchText, matchDense, fusionExpr]
             elif matchDense is not None:
@@ -704,10 +707,12 @@ class Dealer:
             "vector": True,
             "topk": top,
             "similarity": similarity_threshold,
-            "vector_similarity_weight": vector_similarity_weight,
-            "retrieval_lane": _lane_mode,
             "available_int": 1,
+            "must_not": {"exists": "compile_kwd"},
         }
+        if _fusion_internal:
+            req["vector_similarity_weight"] = vector_similarity_weight
+            req["retrieval_lane"] = _lane_mode
         logging.debug(f"[Search] global_offset={global_offset}, rerank_limit={RERANK_LIMIT}, page_size={page_size}, page={page}")
 
         if isinstance(tenant_ids, str):
@@ -904,7 +909,7 @@ class Dealer:
         fallback_notes: list[str] = []
         phrase_capability = getattr(getattr(self, "dataStore", None), "supports_match_phrase", None)
         try:
-            phrase_supported = True if phrase_capability is None else bool(phrase_capability())
+            phrase_supported = callable(phrase_capability) and bool(phrase_capability())
         except Exception:
             phrase_supported = False
         if vector_similarity_weight < 1.0 and bundle.exact_phrases and not phrase_supported:

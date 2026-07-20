@@ -636,9 +636,7 @@ def test_dataset_update_content_type_and_payload_contract(rest_client, clear_dat
     assert bad_content_type_res.status_code == 200
     bad_content_type_payload = bad_content_type_res.json()
     assert bad_content_type_payload["code"] == 101, bad_content_type_payload
-    assert (
-        f"Unsupported content type: Expected application/json, got {bad_content_type}" in bad_content_type_payload["message"]
-    ), bad_content_type_payload
+    assert f"Unsupported content type: Expected application/json, got {bad_content_type}" in bad_content_type_payload["message"], bad_content_type_payload
 
     malformed_json_res = rest_client.put(f"/datasets/{dataset_id}", data="a")
     assert malformed_json_res.status_code == 200
@@ -810,7 +808,7 @@ def test_dataset_update_embedding_model_invalid_and_none_contract(rest_client, c
     dataset_id = create_payload["data"]["id"]
 
     invalid_cases = [
-        ("unknown@ZHIPU-AI", "Instance default not found for model unknown@ZHIPU-AI."),
+        ("unknown@ZHIPU-AI", "Model unknown@ZHIPU-AI not found for model embedding"),
         ("embedding-3@unknown", "Provider unknown not found for model embedding-3@unknown."),
         ("text-embedding-v3@Tongyi-Qianwen", "Provider Tongyi-Qianwen not found for model text-embedding-v3@Tongyi-Qianwen."),
         ("text-embedding-3-small@OpenAI", "Provider OpenAI not found for model text-embedding-3-small@OpenAI."),
@@ -868,10 +866,7 @@ def test_dataset_update_chunk_method_invalid_contract(rest_client, clear_dataset
     assert create_payload["code"] == 0, create_payload
     dataset_id = create_payload["data"]["id"]
 
-    expected_chunk_message = (
-        "Input should be 'naive', 'book', 'email', 'laws', 'manual', 'one', 'paper', "
-        "'picture', 'presentation', 'qa', 'table', 'tag' or 'resume'"
-    )
+    expected_chunk_message = "Input should be 'naive', 'book', 'email', 'laws', 'manual', 'one', 'paper', 'picture', 'presentation', 'qa', 'table', 'tag' or 'resume'"
     for chunk_method in ("", "unknown", []):
         res = rest_client.put(f"/datasets/{dataset_id}", json={"chunk_method": chunk_method})
         assert res.status_code == 200
@@ -1168,7 +1163,7 @@ def test_dataset_create_permission_contract(rest_client, clear_datasets, name, p
         ("tenant_zhipu", "embedding-3@CI@ZHIPU-AI", 0, "embedding-3@CI@ZHIPU-AI", None, True),
         ("embedding_model_unset", "__UNSET__", 0, "BAAI/bge-small-en-v1.5@Local@Builtin", None, False),
         ("embedding_model_none", None, 0, "BAAI/bge-small-en-v1.5@Local@Builtin", None, False),
-        ("unknown_llm_name", "unknown@ZHIPU-AI", 102, None, "Instance default not found for model unknown@ZHIPU-AI.", False),
+        ("unknown_llm_name", "unknown@ZHIPU-AI", 102, None, "Model unknown@ZHIPU-AI not found for model embedding", False),
         ("unknown_llm_factory", "embedding-3@unknown", 102, None, "Provider unknown not found for model embedding-3@unknown.", False),
         (
             "tenant_no_auth_default_tenant_llm",
@@ -1191,9 +1186,7 @@ def test_dataset_create_permission_contract(rest_client, clear_datasets, name, p
         "tenant_no_auth",
     ],
 )
-def test_dataset_create_embedding_model_contract(
-    rest_client, clear_datasets, name, embedding_model, expected_code, expected_embedding_model, expected_message, unauthorized_is_xfail
-):
+def test_dataset_create_embedding_model_contract(rest_client, clear_datasets, name, embedding_model, expected_code, expected_embedding_model, expected_message, unauthorized_is_xfail):
     req = {"name": name}
     if embedding_model != "__UNSET__":
         req["embedding_model"] = embedding_model
@@ -1414,9 +1407,7 @@ def test_dataset_create_parser_config_valid_matrix_contract(rest_client, clear_d
     ],
     ids=["only_raptor", "only_graphrag", "both_fields"],
 )
-def test_dataset_create_parser_config_bugfix_contract(
-    rest_client, clear_datasets, name, parser_config, expected_raptor, expected_graphrag
-):
+def test_dataset_create_parser_config_bugfix_contract(rest_client, clear_datasets, name, parser_config, expected_raptor, expected_graphrag):
     res = rest_client.post("/datasets", json={"name": name, "parser_config": parser_config})
     assert res.status_code == 200
     body = res.json()
@@ -1451,6 +1442,8 @@ def test_dataset_create_parser_config_different_chunk_methods_contract(rest_clie
     assert "graphrag" in parser_config, body
     assert parser_config["raptor"]["use_raptor"] is False, body
     assert parser_config["graphrag"]["use_graphrag"] is False, body
+
+
 def test_dataset_create_name_invalid_and_duplicate_contract(rest_client, clear_datasets):
     invalid_cases = [
         ("", "String should have at least 1 character"),
@@ -1604,10 +1597,7 @@ def test_dataset_create_permission_and_chunk_method_contract(rest_client, clear_
         ("chunk_unknown", "unknown"),
         ("chunk_type_error", []),
     ]
-    expected_chunk_message = (
-        "Input should be 'naive', 'book', 'email', 'laws', 'manual', 'one', 'paper', "
-        "'picture', 'presentation', 'qa', 'table', 'tag' or 'resume'"
-    )
+    expected_chunk_message = "Input should be 'naive', 'book', 'email', 'laws', 'manual', 'one', 'paper', 'picture', 'presentation', 'qa', 'table', 'tag' or 'resume'"
     for name, chunk_method in chunk_method_invalid_cases:
         res = rest_client.post("/datasets", json={"name": name, "chunk_method": chunk_method})
         assert res.status_code == 200
@@ -1788,9 +1778,7 @@ def test_dataset_delete_contract_matrix(rest_client, clear_datasets):
     assert bad_content_type_res.status_code == 200
     bad_content_type_payload = bad_content_type_res.json()
     assert bad_content_type_payload["code"] == 101, bad_content_type_payload
-    assert (
-        f"Unsupported content type: Expected application/json, got {bad_content_type}" in bad_content_type_payload["message"]
-    ), bad_content_type_payload
+    assert f"Unsupported content type: Expected application/json, got {bad_content_type}" in bad_content_type_payload["message"], bad_content_type_payload
 
     malformed_json_res = rest_client.delete("/datasets", data="a")
     assert malformed_json_res.status_code == 200

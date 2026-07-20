@@ -41,10 +41,11 @@ from api.utils.reference_metadata_utils import (
     enrich_chunks_with_document_metadata,
     resolve_reference_metadata_preferences,
 )
-from api.db.joint_services.tenant_model_service import get_tenant_default_model_by_type, get_model_config_from_provider_instance, get_model_type_by_name
+from api.db.joint_services.tenant_model_service import get_model_config_by_id, get_model_config_from_provider_instance, get_model_type_by_name, get_tenant_default_model_by_type
+from api.utils.model_utils import get_model_type_human
 from common.time_utils import current_timestamp, datetime_format
 from common.text_utils import normalize_arabic_digits
-from rag.graphrag.general.mind_map_extractor import MindMapExtractor
+from rag.advanced_rag.knowlege_compile.mind_map_extractor import MindMapExtractor
 from rag.advanced_rag import DeepResearcher
 from rag.app.tag import label_question
 from rag.nlp.search import index_name
@@ -297,7 +298,28 @@ async def async_chat_solo(dialog, messages, stream=True, session_id=None):
     image_attachments = []
     image_files = []
 
-    _, model_config = _resolve_dialog_llm_type_and_config(dialog)
+    if dialog.llm_id:
+        if getattr(dialog, "tenant_llm_id", None):
+            try:
+                llm_types = get_model_type_by_name(dialog.tenant_id, dialog.llm_id)
+                if LLMType.IMAGE2TEXT.value in llm_types and LLMType.CHAT.value not in llm_types:
+                    model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.IMAGE2TEXT, dialog.llm_id)
+                else:
+                    model_config = get_model_config_by_id(dialog.tenant_id, dialog.tenant_llm_id)
+            except LookupError:
+                llm_types = get_model_type_by_name(dialog.tenant_id, dialog.llm_id)
+                if LLMType.IMAGE2TEXT.value in llm_types and LLMType.CHAT.value not in llm_types:
+                    model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.IMAGE2TEXT, dialog.llm_id)
+                else:
+                    model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.CHAT, dialog.llm_id)
+        else:
+            llm_types = get_model_type_by_name(dialog.tenant_id, dialog.llm_id)
+            if LLMType.IMAGE2TEXT.value in llm_types and LLMType.CHAT.value not in llm_types:
+                model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.IMAGE2TEXT, dialog.llm_id)
+            else:
+                model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.CHAT, dialog.llm_id)
+    else:
+        model_config = get_tenant_default_model_by_type(dialog.tenant_id, LLMType.CHAT)
 
     chat_mdl = LLMBundle(dialog.tenant_id, model_config, langfuse_session_id=session_id)
     factory = model_config.get("llm_factory", "") if model_config else ""
@@ -339,7 +361,7 @@ async def async_chat_solo(dialog, messages, stream=True, session_id=None):
         yield {"answer": answer, "reference": {}, "audio_binary": tts(tts_mdl, answer), "prompt": "", "created_at": time.time()}
 
 
-def get_models(dialog, trace_context=None, langfuse_session_id=None):
+def get_models(dialog, trace_context=None, langfuse_session_id=None, chat_model_config=None):
     embd_mdl, chat_mdl, rerank_mdl, tts_mdl = None, None, None, None
     kbs = KnowledgebaseService.get_by_ids(dialog.kb_ids)
     embedding_list = list(set([kb.embd_id for kb in kbs]))
@@ -353,15 +375,28 @@ def get_models(dialog, trace_context=None, langfuse_session_id=None):
         if not embd_mdl:
             raise LookupError("Embedding model(%s) not found" % embedding_list[0])
 
-    if dialog.llm_id:
-        chat_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.CHAT, dialog.llm_id)
-    else:
-        chat_model_config = get_tenant_default_model_by_type(dialog.tenant_id, LLMType.CHAT)
+    if chat_model_config is None:
+        if dialog.llm_id:
+            if getattr(dialog, "tenant_llm_id", None):
+                try:
+                    chat_model_config = get_model_config_by_id(dialog.tenant_id, dialog.tenant_llm_id)
+                except LookupError:
+                    chat_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.CHAT, dialog.llm_id)
+            else:
+                chat_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.CHAT, dialog.llm_id)
+        else:
+            chat_model_config = get_tenant_default_model_by_type(dialog.tenant_id, LLMType.CHAT)
 
     chat_mdl = LLMBundle(dialog.tenant_id, chat_model_config, trace_context=trace_context, langfuse_session_id=langfuse_session_id)
 
     if dialog.rerank_id:
-        rerank_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.RERANK, dialog.rerank_id)
+        if getattr(dialog, "tenant_rerank_id", None):
+            try:
+                rerank_model_config = get_model_config_by_id(dialog.tenant_id, dialog.tenant_rerank_id)
+            except LookupError:
+                rerank_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.RERANK, dialog.rerank_id)
+        else:
+            rerank_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.RERANK, dialog.rerank_id)
         rerank_mdl = LLMBundle(dialog.tenant_id, rerank_model_config, trace_context=trace_context, langfuse_session_id=langfuse_session_id)
 
     if dialog.prompt_config.get("tts"):
@@ -557,7 +592,28 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         return
 
     chat_start_ts = timer()
-    _, llm_model_config = _resolve_dialog_llm_type_and_config(dialog)
+    if dialog.llm_id:
+        if getattr(dialog, "tenant_llm_id", None):
+            try:
+                llm_types = get_model_type_by_name(dialog.tenant_id, dialog.llm_id)
+                if LLMType.IMAGE2TEXT.value in llm_types and LLMType.CHAT.value not in llm_types:
+                    llm_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.IMAGE2TEXT, dialog.llm_id)
+                else:
+                    llm_model_config = get_model_config_by_id(dialog.tenant_id, dialog.tenant_llm_id)
+            except LookupError:
+                llm_types = get_model_type_by_name(dialog.tenant_id, dialog.llm_id)
+                if LLMType.IMAGE2TEXT.value in llm_types and LLMType.CHAT.value not in llm_types:
+                    llm_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.IMAGE2TEXT, dialog.llm_id)
+                else:
+                    llm_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.CHAT, dialog.llm_id)
+        else:
+            llm_types = get_model_type_by_name(dialog.tenant_id, dialog.llm_id)
+            if LLMType.IMAGE2TEXT.value in llm_types and LLMType.CHAT.value not in llm_types:
+                llm_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.IMAGE2TEXT, dialog.llm_id)
+            else:
+                llm_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.CHAT, dialog.llm_id)
+    else:
+        llm_model_config = get_tenant_default_model_by_type(dialog.tenant_id, LLMType.CHAT)
 
     factory = llm_model_config.get("llm_factory", "") if llm_model_config else ""
     max_tokens = llm_model_config.get("max_tokens") or 8192
@@ -820,7 +876,12 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                         used_web=True,
                         started_ms=web_started_ms,
                     )
-                    rag_trace.add_evidence_from_chunks(tav_res.get("chunks", []), source_type="web", retrieval_call_id=web_retrieval_call_id, start_citation_index=max(0, len(kbinfos.get("chunks", [])) - len(tav_res.get("chunks", []))))
+                    rag_trace.add_evidence_from_chunks(
+                        tav_res.get("chunks", []),
+                        source_type="web",
+                        retrieval_call_id=web_retrieval_call_id,
+                        start_citation_index=max(0, len(kbinfos.get("chunks", [])) - len(tav_res.get("chunks", []))),
+                    )
             if prompt_config.get("use_kg"):
                 default_chat_model = get_tenant_default_model_by_type(dialog.tenant_id, LLMType.CHAT)
                 ck = await settings.kg_retriever.retrieval(
@@ -851,6 +912,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
     retrieval_ts = timer()
     if not knowledges and prompt_config.get("empty_response"):
         empty_res = prompt_config["empty_response"]
+        yield {"answer": empty_res, "reference": {}, "prompt": "", "audio_binary": None, "final": False}
         yield {"answer": empty_res, "reference": kbinfos, "prompt": "\n\n### Query:\n%s" % " ".join(questions), "audio_binary": tts(tts_mdl, empty_res), "final": True}
         return
 
@@ -963,7 +1025,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
             langfuse_output = {"time_elapsed:": re.sub(r"\n", "  \n", langfuse_output), "created_at": time.time()}
             langfuse_generation.update(
                 output=langfuse_output,
-            usage_details={
+                usage_details={
                     "input": used_token_count,
                     "output": tk_num,
                     "total": used_token_count + tk_num,
@@ -1912,27 +1974,34 @@ async def gen_mindmap(question, kb_ids, tenant_id, search_config={}):
 
 
 def _resolve_dialog_llm_type_and_config(dialog):
-    """Resolve the dialog chat model config.
-
-    Dialog completion routes are chat routes. If a configured dialog model is not explicitly
-    image2text-only, prefer the CHAT provider-instance lookup. The previous
-    fallback treated any non-``chat`` type-list result as IMAGE2TEXT, which makes
-    valid chat models fail with "is not a image2text model" when the provider
-    type lookup is incomplete or stale.
-    """
+    """Resolve the agent runner through the current tenant model-instance contract."""
     if not dialog.llm_id:
         return LLMType.CHAT.value, get_tenant_default_model_by_type(dialog.tenant_id, LLMType.CHAT)
 
+    config = None
+    if getattr(dialog, "tenant_llm_id", None):
+        try:
+            config = get_model_config_by_id(dialog.tenant_id, dialog.tenant_llm_id)
+        except LookupError:
+            pass
+
+    if config is not None:
+        configured_types = config.get("model_type")
+        if isinstance(configured_types, int):
+            configured_types = get_model_type_human(configured_types)
+        elif isinstance(configured_types, str):
+            configured_types = [configured_types]
+        else:
+            configured_types = list(configured_types or [])
+        model_type = LLMType.IMAGE2TEXT if LLMType.IMAGE2TEXT.value in configured_types and LLMType.CHAT.value not in configured_types else LLMType.CHAT
+        return model_type.value, config
+
+    model_type = LLMType.CHAT
     llm_types = set(get_model_type_by_name(dialog.tenant_id, dialog.llm_id) or [])
     if LLMType.IMAGE2TEXT.value in llm_types and LLMType.CHAT.value not in llm_types:
-        return (
-            LLMType.IMAGE2TEXT.value,
-            get_model_config_from_provider_instance(dialog.tenant_id, LLMType.IMAGE2TEXT, dialog.llm_id),
-        )
-    return (
-        LLMType.CHAT.value,
-        get_model_config_from_provider_instance(dialog.tenant_id, LLMType.CHAT, dialog.llm_id),
-    )
+        model_type = LLMType.IMAGE2TEXT
+    config = get_model_config_from_provider_instance(dialog.tenant_id, model_type, dialog.llm_id)
+    return model_type.value, config
 
 
 def _resolve_rag_agent_llm_type_and_config(dialog):
@@ -1945,21 +2014,38 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
     agent_start_ts = timer()
     rag_trace = RagTraceCollector.from_kwargs(path="rag_agent", dialog=dialog, messages=messages, kwargs=kwargs)
     prompt_config = dialog.prompt_config
-    kbs, embd_mdl, rerank_mdl, chat_mdl, tts_mdl = get_models(dialog)
+    session_id = kwargs.get("session_id")
+    trace_context = {}
+    langfuse_keys = TenantLangfuseService.filter_by_tenant(tenant_id=dialog.tenant_id)
+    if langfuse_keys:
+        langfuse = Langfuse(public_key=langfuse_keys.public_key, secret_key=langfuse_keys.secret_key, host=langfuse_keys.host)
+        try:
+            if langfuse.auth_check():
+                trace_context = {"trace_id": langfuse.create_trace_id()}
+        except Exception:
+            pass
+
+    llm_type, llm_model_config = _resolve_rag_agent_llm_type_and_config(dialog)
+    kbs, embd_mdl, rerank_mdl, chat_mdl, tts_mdl = get_models(
+        dialog,
+        trace_context=trace_context,
+        langfuse_session_id=session_id,
+        chat_model_config=llm_model_config,
+    )
     use_web_search = _should_use_web_search(prompt_config, kwargs.get("internet"))
     logging.debug("web_search kb=%s tavily=%s internet=%r enabled=%s", bool(dialog.kb_ids), bool(dialog.prompt_config.get("tavily_api_key")), kwargs.get("internet"), use_web_search)
     tenant_ids = list(set([kb.tenant_id for kb in kbs]))
     tool_support_claimed = getattr(chat_mdl, "is_tools", None)
-    rag_tools = RAGTools(tenant_ids, 
-                         chat_mdl,
-                         embed_mdl=embd_mdl,
-                         kb_ids=dialog.kb_ids, 
-                         tav=Tavily(prompt_config["tavily_api_key"]) if use_web_search else None,
-                         trace=rag_trace,
-                         context_builder_config=EvidenceBundleConfig.from_env(kwargs),
-                         )
+    rag_tools = RAGTools(
+        tenant_ids,
+        chat_mdl,
+        embed_mdl=embd_mdl,
+        kb_ids=dialog.kb_ids,
+        tav=Tavily(prompt_config["tavily_api_key"]) if use_web_search else None,
+        trace=rag_trace,
+        context_builder_config=EvidenceBundleConfig.from_env(kwargs),
+    )
 
-    llm_type, llm_model_config = _resolve_rag_agent_llm_type_and_config(dialog)
     if rag_trace:
         rag_trace.set_llm_info(
             model_provider=llm_model_config.get("llm_factory") if llm_model_config else None,
@@ -1968,10 +2054,10 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
             tool_binding_success=bool(getattr(chat_mdl, "toolcall_session", None) and getattr(chat_mdl, "tools", None)),
         )
 
-    #attachments = None
-    #if "doc_ids" in kwargs:
+    # attachments = None
+    # if "doc_ids" in kwargs:
     #    attachments = [doc_id for doc_id in kwargs["doc_ids"].split(",") if doc_id]
-    #if "doc_ids" in messages[-1]:
+    # if "doc_ids" in messages[-1]:
     #    attachments = [doc_id for doc_id in messages[-1]["doc_ids"] if doc_id]
     attachments_ = ""
     image_attachments = []
