@@ -161,6 +161,7 @@ export function useSendSingleMessage({
     removeMessageById,
     removeMessagesAfterCurrentMessage,
     handlePressEnter,
+    sendMessage,
     sendLoading: !done,
   };
 }
