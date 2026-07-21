@@ -42,6 +42,25 @@ export const LocalLlmConfigs: Record<string, ProviderConfig> = {
     undefined,
     'https://inference.readthedocs.io/en/latest/user_guide',
   ),
+  [LLMFactory.FunASR]: buildLocalConfig(
+    LLMFactory.FunASR,
+    'FunASR',
+    ['speech2text'],
+    undefined,
+    false,
+    [
+      {
+        name: 'base_url',
+        label: 'addLlmBaseUrl',
+        type: 'inputSelect',
+        required: true,
+        defaultValue: 'http://localhost:8000/v1',
+        placeholder: 'baseUrlNameMessage',
+        shouldRender: 'hideWhenInstanceExists',
+      },
+    ],
+    'https://github.com/modelscope/FunASR',
+  ),
   [LLMFactory.ModelScope]: buildLocalConfig(
     LLMFactory.ModelScope,
     'ModelScope',
@@ -216,7 +235,7 @@ function buildLocalConfig(
     {
       name: 'api_key',
       label: 'apiKey',
-      type: FormFieldType.Text,
+      type: FormFieldType.Password,
       required: false,
       placeholder: 'apiKeyMessage',
       shouldRender: 'hideWhenInstanceExists',
@@ -276,15 +295,20 @@ function buildLocalConfig(
       baseUrl: values.base_url,
       modelInfo: buildModelInfoFromValues(values),
     }),
-    submitTransform: (values) => ({
-      instance_name: values.instance_name,
-      llm_factory: llmFactory,
-      model_info: buildModelInfoFromValues(values),
-      api_base: values.base_url,
-      api_key: values.api_key,
-      ...(values.provider_order
-        ? { provider_order: values.provider_order }
-        : {}),
-    }),
+    submitTransform: (values) => {
+      const apiKey = values.provider_order
+        ? {
+            api_key: values.api_key ?? '',
+            provider_order: values.provider_order,
+          }
+        : (values.api_key ?? '');
+      return {
+        instance_name: values.instance_name,
+        llm_factory: llmFactory,
+        model_info: buildModelInfoFromValues(values),
+        api_base: values.base_url,
+        api_key: apiKey,
+      };
+    },
   };
 }

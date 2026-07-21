@@ -71,6 +71,7 @@ export interface IEditInstanceModelRequestBody {
 
 export interface IListAllModelsRequestParams {
   type?: string;
+  owner_tenant_id?: string;
 }
 
 export interface IUpdateModelStatusRequestBody {
@@ -116,12 +117,17 @@ export interface IUpdateProviderInstanceRequestBody {
   verify?: boolean;
 }
 
-export interface ISetDefaultModelRequestBody {
-  model_provider: string;
-  model_instance: string;
-  model_type: string;
-  model_name: string;
-}
+export type ISetDefaultModelRequestBody =
+  | {
+      model_type: string;
+      model_id: string;
+    }
+  | {
+      model_type: string;
+      model_provider: string;
+      model_instance: string;
+      model_name: string;
+    };
 
 /**
  * Item shape returned by the list-provider-models endpoint.

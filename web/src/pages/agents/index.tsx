@@ -30,6 +30,7 @@ import { useRenameAgent } from './use-rename-agent';
 export default function Agents() {
   const {
     data,
+    loading: listLoading,
     pagination,
     setPagination,
     searchString,
@@ -101,7 +102,7 @@ export default function Agents() {
               value={filterValue}
             >
               <DropdownMenu>
-                <DropdownMenuTrigger data-testid="create-agent">
+                <DropdownMenuTrigger data-testid="create-agent" asChild>
                   <Button>
                     <Plus className="size-[1em]" />
                     {t('flow.createGraph')}
@@ -170,6 +171,8 @@ export default function Agents() {
             </div>
           )}
         </article>
+      ) : listLoading ? (
+        <article className="size-full" data-testid="agents-list"></article>
       ) : (
         <article
           className="size-full flex items-center justify-center"

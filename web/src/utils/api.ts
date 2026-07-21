@@ -27,7 +27,7 @@ export default {
   listAllAddedModels: `${restAPIv1}/models`,
   defaultModel: `${restAPIv1}/models/default`,
   listProviders: `${restAPIv1}/providers`,
-  addProvider: `${restAPIv1}/providers/`,
+  addProvider: `${restAPIv1}/providers`,
   addProviderInstance: ({ llm_factory }: { llm_factory: string }) =>
     `${restAPIv1}/providers/${llm_factory}/instances`,
   verifyProviderConnection: ({ provider_name }: { provider_name: string }) =>
@@ -153,6 +153,34 @@ export default {
   getMeta: `${restAPIv1}/datasets/metadata/flattened`,
   getKnowledgeBasicInfo: (datasetId: string) =>
     `${restAPIv1}/datasets/${datasetId}/ingestions/summary`,
+  artifactsList: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/artifacts`,
+  artifactsTopicList: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/artifacts_topics`,
+  getArtifactPage: (datasetId: string, pageType: string, slug: string) =>
+    `${restAPIv1}/datasets/${datasetId}/artifacts/${pageType}/${slug}`,
+  listWikiCommits: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/commits`,
+  getWikiCommit: (datasetId: string, commitId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/commits/${commitId}`,
+  getArtifactGraph: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/artifacts/graph`,
+  clearWiki: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/artifacts`,
+  getDatasetSkillTree: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/skills`,
+  getDatasetSkillPage: (datasetId: string, skillKwd: string) =>
+    `${restAPIv1}/datasets/${datasetId}/skills/${skillKwd
+      .split('/')
+      .map((s) => encodeURIComponent(s))
+      .join('/')}`,
+  deleteDatasetSkillTree: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/skills`,
+  deleteDatasetSkillPage: (datasetId: string, skillKwd: string) =>
+    `${restAPIv1}/datasets/${datasetId}/skills/${skillKwd
+      .split('/')
+      .map((s) => encodeURIComponent(s))
+      .join('/')}`,
   // data pipeline log
   fetchDataPipelineLog: (datasetId: string) =>
     `${restAPIv1}/datasets/${datasetId}/ingestions`,
@@ -160,6 +188,7 @@ export default {
     `${restAPIv1}/datasets/${datasetId}/ingestions/${logId}`,
   fetchPipelineDatasetLogs: (datasetId: string) =>
     `${restAPIv1}/datasets/${datasetId}/ingestions`,
+  listPipelines: `${restAPIv1}/pipelines?type=builtin`,
   runIndex: (datasetId: string, indexType: string) =>
     `${restAPIv1}/datasets/${datasetId}/index?type=${indexType.toLowerCase()}`,
   traceIndex: (datasetId: string, indexType: string) =>
@@ -189,6 +218,8 @@ export default {
     `${restAPIv1}/datasets/${datasetId}/documents/${documentId}/chunks`,
   chunkDetail: (datasetId: string, documentId: string, chunkId: string) =>
     `${restAPIv1}/datasets/${datasetId}/documents/${documentId}/chunks/${chunkId}`,
+  documentStructureGraph: (datasetId: string, documentId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/documents/${documentId}/structure/graph`,
   retrievalTest: `${restAPIv1}/datasets/search`,
 
   // document
@@ -329,6 +360,15 @@ export default {
 
   // explore
 
+  // compilation templates
+  compilationTemplates: `${restAPIv1}/compilation_templates`,
+  compilationTemplate: (id: string) =>
+    `${restAPIv1}/compilation_templates/${id}`,
+  compilationTemplateGroups: `${restAPIv1}/compilation_template_groups`,
+  compilationTemplateGroup: (id: string) =>
+    `${restAPIv1}/compilation_template_groups/${id}`,
+  wikiPresets: `${restAPIv1}/compilation_templates/wiki_presets`,
+
   // mcp server
   listMcpServer: `${restAPIv1}/mcp/servers`,
   getMcpServer: (id: string) => `${restAPIv1}/mcp/servers/${id}`,
@@ -375,6 +415,8 @@ export default {
   removeDataflow: `${webAPI}/dataflow/rm`,
   listDataflow: `${webAPI}/dataflow/list`,
   runDataflow: `${webAPI}/dataflow/run`,
+  listBuiltinPipelines: `${restAPIv1}/pipelines`,
+  getBuiltinPipeline: (id: string) => `${restAPIv1}/pipelines/${id}`,
 
   // admin
   adminLogin: `${restAPIv1}/admin/login`,

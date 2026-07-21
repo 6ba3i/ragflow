@@ -25,19 +25,17 @@ import (
 	officeOxide "github.com/yfedoseev/office_oxide/go"
 )
 
+// PPTXParser parses both .pptx (OOXML) and .ppt (OLE binary)
+// files via the office_oxide backend. The format field controls
+// the container format passed to OpenFromBytes — "pptx" for
+// ZIP-based OOXML presentations and "ppt" for the legacy binary
+// OLE format.
 type PPTXParser struct {
-	libType string
+	format string
 }
 
-func NewPPTXParser(libType string) (*PPTXParser, error) {
-	switch libType {
-	case OfficeOxide:
-		return &PPTXParser{
-			libType: OfficeOxide,
-		}, nil
-	default:
-		return nil, fmt.Errorf("unsupported PPTX library type: %s", libType)
-	}
+func NewPPTXParser() *PPTXParser {
+	return &PPTXParser{format: "pptx"}
 }
 
 func (p *PPTXParser) String() string {
@@ -48,9 +46,9 @@ func (p *PPTXParser) String() string {
 // plain text. Mirrors the python parser.py:slides branch which
 // forces output_format="json" for the slide family.
 func (p *PPTXParser) ParseWithResult(filename string, data []byte) ParseResult {
-	doc, err := officeOxide.OpenFromBytes(data, "pptx")
+	doc, err := officeOxide.OpenFromBytes(data, p.format)
 	if err != nil {
-		return ParseResult{Err: fmt.Errorf("pptx open: %w", err)}
+		return ParseResult{Err: fmt.Errorf("presentation open: %w", err)}
 	}
 	defer doc.Close()
 
@@ -60,7 +58,7 @@ func (p *PPTXParser) ParseWithResult(filename string, data []byte) ParseResult {
 	}
 
 	// Split on form-feed (the python TxtParser convention used by
-	// ragflow's slide parser) — each block becomes a JSON item.
+	// RAGFlow's slide parser) — each block becomes a JSON item.
 	var items []map[string]any
 	for i, raw := range strings.Split(text, "\f") {
 		trimmed := strings.TrimSpace(raw)
@@ -79,7 +77,7 @@ func (p *PPTXParser) ParseWithResult(filename string, data []byte) ParseResult {
 
 	return ParseResult{
 		OutputFormat: "json",
-		File:         map[string]any{"name": filename, "format": "pptx"},
+		File:         map[string]any{"name": filename, "format": p.format},
 		JSON:         items,
 	}
 }

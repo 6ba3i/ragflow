@@ -26,11 +26,22 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+type StatsHandler struct {
+	statsService *service.StatsService
+}
+
+// NewStatsHandler create stats handler
+func NewStatsHandler(statsService *service.StatsService) *StatsHandler {
+	return &StatsHandler{
+		statsService: statsService,
+	}
+}
+
 // GetStats returns API conversation statistics for the current user's tenant.
-func (h *SystemHandler) GetStats(c *gin.Context) {
+func (h *StatsHandler) GetStats(c *gin.Context) {
 	user, errorCode, errorMessage := GetUser(c)
 	if errorCode != common.CodeSuccess {
-		common.ErrorWithCode(c, int(errorCode), errorMessage)
+		common.ErrorWithCode(c, errorCode, errorMessage)
 		return
 	}
 
@@ -47,13 +58,13 @@ func (h *SystemHandler) GetStats(c *gin.Context) {
 		source = &agentSource
 	}
 
-	stats, err := h.systemService.GetStats(user.ID, fromDate, toDate, source)
+	stats, err := h.statsService.GetStats(user.ID, fromDate, toDate, source)
 	if err != nil {
 		code := common.CodeExceptionError
 		if errors.Is(err, service.ErrTenantNotFound) {
 			code = common.CodeDataError
 		}
-		common.ErrorWithCode(c, int(code), err.Error())
+		common.ErrorWithCode(c, code, err.Error())
 		return
 	}
 

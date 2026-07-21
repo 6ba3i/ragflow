@@ -20,16 +20,18 @@ import (
 	"fmt"
 	"net/http"
 	"ragflow/internal/common"
+	"ragflow/internal/engine/clickhouse"
 	"ragflow/internal/engine/redis"
 	"ragflow/internal/server"
 	"ragflow/internal/server/local"
 	"ragflow/internal/utility"
 	"strconv"
+	"time"
+
+	"ragflow/internal/service"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
-
-	"ragflow/internal/service"
 )
 
 // UserHandler user handler
@@ -102,27 +104,60 @@ func (h *UserHandler) Register(c *gin.Context) {
 // @Success 200 {object} map[string]interface{}
 // @Router /api/v1/users/login [post]
 func (h *UserHandler) Login(c *gin.Context) {
+	startAt := time.Now()
+	operationLog := &common.OperationLog{
+		EventTime:  startAt,
+		Operation:  "login",
+		APIPath:    c.FullPath(),
+		HTTPMethod: c.Request.Method,
+		IPAddress:  c.ClientIP(),
+	}
+	defer func() {
+		operationLog.DurationMS = time.Since(startAt).Milliseconds()
+		clickhouseDriver := clickhouse.GetDriver()
+		err := clickhouseDriver.SaveOperationLog(operationLog)
+		if err != nil {
+			common.ResponseWithCodeData(c, common.CodeServerError, false, err.Error())
+			return
+		}
+	}()
+
 	var req service.LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.ResponseWithCodeData(c, common.CodeBadRequest, false, err.Error())
+		operationLog.ErrorCode = uint16(common.CodeBadRequest)
+		operationLog.Message = err.Error()
+		operationLog.DurationMS = time.Since(startAt).Milliseconds()
 		return
 	}
+	operationLog.ResourceName = req.Username
 
 	user, code, err := h.userService.Login(&req)
 	if err != nil {
 		common.ResponseWithCodeData(c, code, false, err.Error())
+		operationLog.ErrorCode = uint16(code)
+		operationLog.Message = err.Error()
+		operationLog.DurationMS = time.Since(startAt).Milliseconds()
 		return
 	}
+	operationLog.UserID = user.ID
 
 	// Sign the access_token using itsdangerous (compatible with Python)
 	secretKey, err := server.GetSecretKey(redis.Get())
 	if err != nil {
-		common.ResponseWithCodeData(c, common.CodeServerError, false, fmt.Sprintf("Failed to get secret key: %s", err.Error()))
+		errMessage := fmt.Sprintf("Failed to get secret key: %s", err.Error())
+		common.ResponseWithCodeData(c, common.CodeServerError, false, errMessage)
+		operationLog.ErrorCode = uint16(common.CodeServerError)
+		operationLog.Message = errMessage
+		operationLog.DurationMS = time.Since(startAt).Milliseconds()
 		return
 	}
 	authToken, err := utility.DumpAccessToken(*user.AccessToken, secretKey)
 	if err != nil {
 		common.ResponseWithCodeData(c, common.CodeServerError, false, "Failed to generate auth token")
+		operationLog.ErrorCode = uint16(common.CodeServerError)
+		operationLog.Message = "Failed to generate auth token"
+		operationLog.DurationMS = time.Since(startAt).Milliseconds()
 		return
 	}
 
@@ -149,32 +184,68 @@ func (h *UserHandler) Login(c *gin.Context) {
 // @Success 200 {object} map[string]interface{}
 // @Router /v1/user/login [post]
 func (h *UserHandler) LoginByEmail(c *gin.Context) {
+	startAt := time.Now()
+	operationLog := &common.OperationLog{
+		EventTime:  startAt,
+		Operation:  "login",
+		APIPath:    c.FullPath(),
+		HTTPMethod: c.Request.Method,
+		IPAddress:  c.ClientIP(),
+	}
+	defer func() {
+		operationLog.DurationMS = time.Since(startAt).Milliseconds()
+		clickhouseDriver := clickhouse.GetDriver()
+		err := clickhouseDriver.SaveOperationLog(operationLog)
+		if err != nil {
+			common.ResponseWithCodeData(c, common.CodeServerError, false, err.Error())
+			return
+		}
+	}()
+
 	var req service.EmailLoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.ResponseWithCodeData(c, common.CodeBadRequest, false, err.Error())
+		operationLog.ErrorCode = uint16(common.CodeBadRequest)
+		operationLog.Message = err.Error()
+		operationLog.DurationMS = time.Since(startAt).Milliseconds()
 		return
 	}
+	operationLog.ResourceName = req.Email
 
 	if !local.IsAdminAvailable() {
 		license := local.GetAdminStatus()
 		common.ResponseWithCodeData(c, common.CodeAuthenticationError, "No", license.Reason)
+		operationLog.ErrorCode = uint16(common.CodeAuthenticationError)
+		operationLog.Message = license.Reason
+		operationLog.DurationMS = time.Since(startAt).Milliseconds()
 		return
 	}
 
 	user, code, err := h.userService.LoginByEmail(&req)
 	if err != nil {
 		common.ResponseWithCodeData(c, code, false, err.Error())
+		operationLog.ErrorCode = uint16(code)
+		operationLog.Message = err.Error()
+		operationLog.DurationMS = time.Since(startAt).Milliseconds()
 		return
 	}
+	operationLog.UserID = user.ID
 
 	secretKey, err := server.GetSecretKey(redis.Get())
 	if err != nil {
-		common.ResponseWithCodeData(c, common.CodeServerError, false, fmt.Sprintf("Failed to get secret key: %s", err.Error()))
+		errorMessage := fmt.Sprintf("Failed to get secret key: %s", err.Error())
+		common.ResponseWithCodeData(c, common.CodeServerError, false, errorMessage)
+		operationLog.ErrorCode = uint16(common.CodeServerError)
+		operationLog.Message = errorMessage
+		operationLog.DurationMS = time.Since(startAt).Milliseconds()
 		return
 	}
 	authToken, err := utility.DumpAccessToken(*user.AccessToken, secretKey)
 	if err != nil {
 		common.ResponseWithCodeData(c, common.CodeServerError, false, "Failed to generate auth token")
+		operationLog.ErrorCode = uint16(common.CodeServerError)
+		operationLog.Message = "Failed to generate auth token"
+		operationLog.DurationMS = time.Since(startAt).Milliseconds()
 		return
 	}
 	setOAuthAuthCookie(c, authToken)
@@ -214,41 +285,6 @@ func (h *UserHandler) GetUserByID(c *gin.Context) {
 	common.SuccessWithData(c, user, "success")
 }
 
-// ListUsers user list
-// @Summary User List
-// @Description Get paginated user list
-// @Tags users
-// @Accept json
-// @Produce json
-// @Param page query int false "page number" default(1)
-// @Param page_size query int false "items per page" default(10)
-// @Success 200 {object} map[string]interface{}
-// @Router /api/v1/users [get]
-func (h *UserHandler) ListUsers(c *gin.Context) {
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "10"))
-
-	if page < 1 {
-		page = 1
-	}
-	if pageSize < 1 || pageSize > 100 {
-		pageSize = 10
-	}
-
-	users, total, code, err := h.userService.ListUsers(page, pageSize)
-	if err != nil {
-		common.ResponseWithCodeData(c, code, false, err.Error())
-		return
-	}
-
-	common.SuccessWithData(c, gin.H{
-		"items":     users,
-		"total":     total,
-		"page":      page,
-		"page_size": pageSize,
-	}, "success")
-}
-
 // Logout user logout
 // @Summary User Logout
 // @Description Logout user and invalidate access token
@@ -259,6 +295,24 @@ func (h *UserHandler) ListUsers(c *gin.Context) {
 // @Success 200 {object} map[string]interface{}
 // @Router /v1/user/logout [post]
 func (h *UserHandler) Logout(c *gin.Context) {
+	startAt := time.Now()
+	operationLog := &common.OperationLog{
+		EventTime:  startAt,
+		Operation:  "logout",
+		APIPath:    c.FullPath(),
+		HTTPMethod: c.Request.Method,
+		IPAddress:  c.ClientIP(),
+	}
+	defer func() {
+		operationLog.DurationMS = time.Since(startAt).Milliseconds()
+		clickhouseDriver := clickhouse.GetDriver()
+		err := clickhouseDriver.SaveOperationLog(operationLog)
+		if err != nil {
+			common.ResponseWithCodeData(c, common.CodeServerError, false, err.Error())
+			return
+		}
+	}()
+
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     oauthAuthCookie,
 		Value:    "",
@@ -272,8 +326,11 @@ func (h *UserHandler) Logout(c *gin.Context) {
 	// Same as AuthMiddleware@auth.go
 	token := c.GetHeader("Authorization")
 	if token == "" {
-		common.ResponseWithHttpCodeData(c, http.StatusUnauthorized, 401, nil, "Missing Authorization header")
+		common.ResponseWithHttpCodeData(c, http.StatusUnauthorized, common.CodeUnauthorized, nil, "Missing Authorization header")
 		c.Abort()
+		operationLog.ErrorCode = uint16(common.CodeUnauthorized)
+		operationLog.Message = "Missing Authorization header"
+		operationLog.DurationMS = time.Since(startAt).Milliseconds()
 		return
 	}
 
@@ -282,13 +339,20 @@ func (h *UserHandler) Logout(c *gin.Context) {
 	if err != nil {
 		common.ResponseWithHttpCodeData(c, http.StatusUnauthorized, code, nil, "Invalid access token")
 		c.Abort()
+		operationLog.ErrorCode = uint16(code)
+		operationLog.Message = "Invalid access token"
+		operationLog.DurationMS = time.Since(startAt).Milliseconds()
 		return
 	}
+	operationLog.UserID = user.ID
 
 	// Logout user
 	code, err = h.userService.Logout(user)
 	if err != nil {
 		common.ResponseWithCodeData(c, code, false, err.Error())
+		operationLog.ErrorCode = uint16(code)
+		operationLog.Message = err.Error()
+		operationLog.DurationMS = time.Since(startAt).Milliseconds()
 		return
 	}
 
@@ -307,7 +371,7 @@ func (h *UserHandler) Logout(c *gin.Context) {
 func (h *UserHandler) Info(c *gin.Context) {
 	user, errorCode, errorMessage := GetUser(c)
 	if errorCode != common.CodeSuccess {
-		common.ErrorWithCode(c, int(errorCode), errorMessage)
+		common.ErrorWithCode(c, errorCode, errorMessage)
 		return
 	}
 
@@ -330,7 +394,7 @@ func (h *UserHandler) Info(c *gin.Context) {
 func (h *UserHandler) Setting(c *gin.Context) {
 	user, errorCode, errorMessage := GetUser(c)
 	if errorCode != common.CodeSuccess {
-		common.ErrorWithCode(c, int(errorCode), errorMessage)
+		common.ErrorWithCode(c, errorCode, errorMessage)
 		return
 	}
 
@@ -368,7 +432,7 @@ func (h *UserHandler) Setting(c *gin.Context) {
 func (h *UserHandler) ChangePassword(c *gin.Context) {
 	user, errorCode, errorMessage := GetUser(c)
 	if errorCode != common.CodeSuccess {
-		common.ErrorWithCode(c, int(errorCode), errorMessage)
+		common.ErrorWithCode(c, errorCode, errorMessage)
 		return
 	}
 
@@ -420,7 +484,7 @@ func (h *UserHandler) GetLoginChannels(c *gin.Context) {
 func (h *UserHandler) SetTenantInfo(c *gin.Context) {
 	user, errorCode, errorMessage := GetUser(c)
 	if errorCode != common.CodeSuccess {
-		common.ErrorWithCode(c, int(errorCode), errorMessage)
+		common.ErrorWithCode(c, errorCode, errorMessage)
 		return
 	}
 

@@ -50,7 +50,7 @@ export const ProviderConfigMap: Record<string, ProviderConfig> = {
       {
         name: 'api_key',
         label: 'apiKey',
-        type: FormFieldType.Text,
+        type: FormFieldType.Password,
         required: false,
         placeholder: 'apiKeyMessage',
         shouldRender: 'hideWhenInstanceExists',
@@ -70,14 +70,18 @@ export const ProviderConfigMap: Record<string, ProviderConfig> = {
       baseUrl: values.api_base,
       modelInfo: [],
     }),
-    submitTransform: (values) => ({
-      instance_name: values.instance_name,
-      llm_factory: LLMFactory.AzureOpenAI,
-      api_base: values.api_base,
-      api_key: values.api_key,
-      api_version: values.api_version,
-      model_info: [],
-    }),
+    submitTransform: (values) => {
+      const apiKey = values.api_version
+        ? { api_key: values.api_key ?? '', api_version: values.api_version }
+        : (values.api_key ?? '');
+      return {
+        instance_name: values.instance_name,
+        llm_factory: LLMFactory.AzureOpenAI,
+        api_base: values.api_base,
+        api_key: apiKey,
+        model_info: [],
+      };
+    },
   },
 
   // ============ VolcEngine ============
@@ -99,7 +103,7 @@ export const ProviderConfigMap: Record<string, ProviderConfig> = {
       {
         name: 'api_key',
         label: 'addArkApiKey',
-        type: FormFieldType.Text,
+        type: FormFieldType.Password,
         required: true,
         placeholder: 'ArkApiKeyMessage',
         shouldRender: 'hideWhenInstanceExists',
@@ -153,7 +157,7 @@ export const ProviderConfigMap: Record<string, ProviderConfig> = {
       {
         name: 'google_service_account_key',
         label: 'addGoogleServiceAccountKey',
-        type: FormFieldType.Text,
+        type: FormFieldType.Password,
         required: true,
         placeholder: 'GoogleServiceAccountKeyMessage',
         shouldRender: 'hideWhenInstanceExists',
@@ -246,7 +250,7 @@ export const ProviderConfigMap: Record<string, ProviderConfig> = {
       {
         name: 'spark_api_password',
         label: 'addSparkAPIPassword',
-        type: FormFieldType.Text,
+        type: FormFieldType.Password,
         required: true,
         placeholder: 'SparkAPIPasswordMessage',
         shouldRender: 'hideWhenInstanceExists',
@@ -429,7 +433,7 @@ export const ProviderConfigMap: Record<string, ProviderConfig> = {
       {
         name: 'opendataloader_api_key',
         label: 'apiKey',
-        type: FormFieldType.Text,
+        type: FormFieldType.Password,
         required: false,
         placeholder: 'apiKeyPlaceholder',
       },
@@ -491,7 +495,7 @@ export const ProviderConfigMap: Record<string, ProviderConfig> = {
       {
         name: 'paddleocr_access_token',
         label: 'paddleocrAccessToken',
-        type: FormFieldType.Text,
+        type: FormFieldType.Password,
         required: false,
         placeholder: 'paddleocrAccessTokenPlaceholder',
         validation: { message: 'paddleocrAccessTokenMessage' },

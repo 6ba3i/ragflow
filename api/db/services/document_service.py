@@ -917,7 +917,7 @@ class DocumentService(CommonService):
             info["run"] = TaskStatus.RUNNING.value
             # keep the doc in DONE state when keep_progress=True for GraphRAG, RAPTOR and Mindmap tasks
 
-        cls.update_by_id(doc_id, info)
+        cls.model.update(info).where((cls.model.id == doc_id) & ((cls.model.run.is_null(True)) | (cls.model.run != TaskStatus.CANCEL.value))).execute()
 
     @classmethod
     @DB.connection_context()
@@ -1210,12 +1210,7 @@ def get_pending_task_count(priority=None):
         query = (
             Task.select(fn.COUNT(Task.id))
             .join(Document, on=(Task.doc_id == Document.id))
-            .where(
-                (Task.progress == 0)
-                & ((Document.run.is_null(True)) | (Document.run != TaskStatus.CANCEL.value))
-                & (Document.progress >= 0)
-                & (Document.status == StatusEnum.VALID.value)
-            )
+            .where((Task.progress == 0) & ((Document.run.is_null(True)) | (Document.run != TaskStatus.CANCEL.value)) & (Document.progress >= 0) & (Document.status == StatusEnum.VALID.value))
         )
         if priority is not None:
             query = query.where(Task.priority == priority)
