@@ -53,39 +53,6 @@ func (a *AvianModel) Name() string {
 	return "Avian"
 }
 
-func (a *AvianModel) chatPayload(modelName string, messages []Message, stream bool, chatModelConfig *ChatConfig) map[string]interface{} {
-	apiMessages := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
-	reqBody := map[string]interface{}{
-		"model":    modelName,
-		"messages": apiMessages,
-		"stream":   stream,
-	}
-
-	if chatModelConfig != nil {
-		if chatModelConfig.MaxTokens != nil {
-			reqBody["max_tokens"] = *chatModelConfig.MaxTokens
-		}
-		if chatModelConfig.Temperature != nil {
-			reqBody["temperature"] = *chatModelConfig.Temperature
-		}
-		if chatModelConfig.TopP != nil {
-			reqBody["top_p"] = *chatModelConfig.TopP
-		}
-		if chatModelConfig.Stop != nil {
-			reqBody["stop"] = *chatModelConfig.Stop
-		}
-	}
-
-	return reqBody
-}
-
 func (a *AvianModel) chatURL(apiConfig *APIConfig) (string, error) {
 
 	baseURL, err := a.baseModel.GetBaseURL(apiConfig)
@@ -130,7 +97,7 @@ func (a *AvianModel) ChatWithMessages(ctx context.Context, modelName string, mes
 		return nil, err
 	}
 
-	jsonData, err := json.Marshal(a.chatPayload(modelName, messages, false, chatModelConfig))
+	jsonData, err := json.Marshal(buildRequestBody(chatModelConfig, modelName, messages, false))
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
@@ -204,7 +171,7 @@ func (a *AvianModel) ChatStreamlyWithSender(ctx context.Context, modelName strin
 		return err
 	}
 
-	jsonData, err := json.Marshal(a.chatPayload(modelName, messages, true, chatModelConfig))
+	jsonData, err := json.Marshal(buildRequestBody(chatModelConfig, modelName, messages, true))
 	if err != nil {
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
@@ -231,31 +198,39 @@ func (a *AvianModel) ChatStreamlyWithSender(ctx context.Context, modelName strin
 	}
 
 	sawTerminal := false
-	done, err := ParseSSEStream[avianChatResponse](resp.Body, func(event avianChatResponse) error {
-		if event.Error != nil {
-			return fmt.Errorf("avian: upstream stream error: %v", event.Error)
-		}
-		if len(event.Choices) == 0 {
+	accumulatedToolCalls := make(map[int]map[string]any)
+	done, err := ParseSSEStream[map[string]any](resp.Body, func(event map[string]any) error {
+		choices, ok := event["choices"].([]interface{})
+		if !ok || len(choices) == 0 {
 			return nil
 		}
-		choice := event.Choices[0]
-		if reasoning := choice.Delta.ReasoningContent; reasoning != "" {
-			if err := sender(nil, &reasoning); err != nil {
-				return err
-			}
-		} else if reasoning := choice.Delta.Reasoning; reasoning != "" {
-			if err := sender(nil, &reasoning); err != nil {
+
+		firstChoice, ok := choices[0].(map[string]interface{})
+		if !ok {
+			return nil
+		}
+
+		delta, ok := firstChoice["delta"].(map[string]interface{})
+		if !ok {
+			return nil
+		}
+
+		accumulateToolCallDeltas(delta, accumulatedToolCalls)
+
+		reasoningContent, ok := delta["reasoning_content"].(string)
+		if ok && reasoningContent != "" {
+			if err = sender(nil, &reasoningContent); err != nil {
 				return err
 			}
 		}
-		if choice.Delta.Content != "" {
-			if err := sender(&choice.Delta.Content, nil); err != nil {
+
+		content, ok := delta["content"].(string)
+		if ok && content != "" {
+			if err = sender(&content, nil); err != nil {
 				return err
 			}
 		}
-		if choice.FinishReason != "" || event.FinishReason != "" {
-			sawTerminal = true
-		}
+
 		return nil
 	})
 	if err != nil {
@@ -264,6 +239,8 @@ func (a *AvianModel) ChatStreamlyWithSender(ctx context.Context, modelName strin
 	if !done && !sawTerminal {
 		return fmt.Errorf("avian: stream ended before [DONE] or finish_reason")
 	}
+
+	setSortedToolCallsResult(chatModelConfig, accumulatedToolCalls)
 
 	endOfStream := "[DONE]"
 	return sender(&endOfStream, nil)

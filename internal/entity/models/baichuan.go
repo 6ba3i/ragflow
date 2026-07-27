@@ -62,41 +62,7 @@ func (b *BaichuanModel) ChatWithMessages(ctx context.Context, modelName string, 
 		return nil, err
 	}
 	url := fmt.Sprintf("%s/%s", resolvedBaseURL, b.baseModel.URLSuffix.Chat)
-
-	// Convert messages to API format
-	apiMessages := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
-	// Build request body
-	reqBody := map[string]interface{}{
-		"model":       modelName,
-		"messages":    apiMessages,
-		"stream":      false,
-		"temperature": 1,
-	}
-
-	if chatModelConfig != nil {
-		if chatModelConfig.Temperature != nil {
-			reqBody["temperature"] = *chatModelConfig.Temperature
-		}
-
-		if chatModelConfig.MaxTokens != nil {
-			reqBody["max_tokens"] = *chatModelConfig.MaxTokens
-		}
-
-		if chatModelConfig.Stream != nil {
-			reqBody["stream"] = *chatModelConfig.Stream
-		}
-
-		if chatModelConfig.TopP != nil {
-			reqBody["top_p"] = *chatModelConfig.TopP
-		}
-	}
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, false)
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
@@ -151,7 +117,8 @@ func (b *BaichuanModel) ChatWithMessages(ctx context.Context, modelName string, 
 	}
 
 	content, ok := messageMap["content"].(string)
-	if !ok {
+	toolCalls := extractToolCalls(messageMap)
+	if !ok && len(toolCalls) == 0 {
 		return nil, fmt.Errorf("no message in response")
 	}
 
@@ -160,6 +127,7 @@ func (b *BaichuanModel) ChatWithMessages(ctx context.Context, modelName string, 
 	chatResponse := &ChatResponse{
 		Answer:        &content,
 		ReasonContent: &emptyReason,
+		ToolCalls:     toolCalls,
 	}
 
 	return chatResponse, nil
@@ -180,43 +148,7 @@ func (b *BaichuanModel) ChatStreamlyWithSender(ctx context.Context, modelName st
 	}
 	url := fmt.Sprintf("%s/%s", resolvedBaseURL, b.baseModel.URLSuffix.Chat)
 
-	// Convert messages to API format
-	apiMessages := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
-	reqBody := map[string]interface{}{
-		"model":       modelName,
-		"messages":    apiMessages,
-		"stream":      true,
-		"temperature": 1,
-	}
-
-	if modelConfig != nil {
-		if modelConfig.Stream != nil {
-			reqBody["stream"] = *modelConfig.Stream
-		}
-
-		if modelConfig.MaxTokens != nil {
-			reqBody["max_tokens"] = *modelConfig.MaxTokens
-		}
-
-		if modelConfig.Temperature != nil {
-			reqBody["temperature"] = *modelConfig.Temperature
-		}
-
-		if modelConfig.TopP != nil {
-			reqBody["top_p"] = *modelConfig.TopP
-		}
-
-		if modelConfig.Stop != nil {
-			reqBody["stop"] = *modelConfig.Stop
-		}
-	}
+	reqBody := buildRequestBody(modelConfig, modelName, messages, true)
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
@@ -247,6 +179,7 @@ func (b *BaichuanModel) ChatStreamlyWithSender(ctx context.Context, modelName st
 
 	// SSE parsing: read line by line
 	sawTerminal := false
+	accumulatedToolCalls := make(map[int]map[string]any)
 	done, err := ParseSSEStream[map[string]interface{}](resp.Body, func(event map[string]interface{}) error {
 		common.Info(fmt.Sprintf("%v", event))
 
@@ -264,6 +197,8 @@ func (b *BaichuanModel) ChatStreamlyWithSender(ctx context.Context, modelName st
 		if !ok {
 			return nil
 		}
+
+		accumulateToolCallDeltas(delta, accumulatedToolCalls)
 
 		content, ok := delta["content"].(string)
 		if ok && content != "" {
@@ -284,6 +219,8 @@ func (b *BaichuanModel) ChatStreamlyWithSender(ctx context.Context, modelName st
 	if !done && !sawTerminal {
 		return fmt.Errorf("baichuan: stream ended before [DONE] or finish_reason")
 	}
+
+	setSortedToolCallsResult(modelConfig, accumulatedToolCalls)
 
 	// Send [DONE] marker for OpenAI compatibility
 	endOfStream := "[DONE]"

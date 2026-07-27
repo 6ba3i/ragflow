@@ -61,41 +61,9 @@ func (o *OrcaRouterModel) ChatWithMessages(ctx context.Context, modelName string
 		return nil, err
 	}
 	url := fmt.Sprintf("%s/%s", resolvedBaseURL, o.baseModel.URLSuffix.Chat)
-
-	// Convert messages to API format
-	apiMessages := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
-	// Build request body
-	reqBody := map[string]interface{}{
-		"model":       modelName,
-		"messages":    apiMessages,
-		"stream":      false,
-		"temperature": 1,
-	}
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, false)
 
 	if chatModelConfig != nil {
-		if chatModelConfig.Temperature != nil {
-			reqBody["temperature"] = *chatModelConfig.Temperature
-		}
-
-		if chatModelConfig.MaxTokens != nil {
-			reqBody["max_tokens"] = *chatModelConfig.MaxTokens
-		}
-
-		if chatModelConfig.Stream != nil {
-			reqBody["stream"] = *chatModelConfig.Stream
-		}
-
-		if chatModelConfig.TopP != nil {
-			reqBody["top_p"] = *chatModelConfig.TopP
-		}
-		// TODO gpt and claude
 		if chatModelConfig.Effort != nil {
 			reqBody["reasoning_effort"] = *chatModelConfig.Effort
 		}
@@ -183,41 +151,11 @@ func (o *OrcaRouterModel) ChatStreamlyWithSender(ctx context.Context, modelName 
 	}
 	url := fmt.Sprintf("%s/%s", resolvedBaseURL, o.baseModel.URLSuffix.Chat)
 
-	// Convert messages to API format
-	apiMessages := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
-	reqBody := map[string]interface{}{
-		"model":       modelName,
-		"messages":    apiMessages,
-		"stream":      true,
-		"temperature": 1,
-	}
+	reqBody := buildRequestBody(modelConfig, modelName, messages, true)
 
 	if modelConfig != nil {
-		if modelConfig.Stream != nil {
-			reqBody["stream"] = *modelConfig.Stream
-		}
-
-		if modelConfig.MaxTokens != nil {
-			reqBody["max_tokens"] = *modelConfig.MaxTokens
-		}
-
-		if modelConfig.Temperature != nil {
-			reqBody["temperature"] = *modelConfig.Temperature
-		}
-
-		if modelConfig.TopP != nil {
-			reqBody["top_p"] = *modelConfig.TopP
-		}
-
-		if modelConfig.Stop != nil {
-			reqBody["stop"] = *modelConfig.Stop
+		if modelConfig.Effort != nil {
+			reqBody["reasoning_effort"] = *modelConfig.Effort
 		}
 	}
 
@@ -250,6 +188,7 @@ func (o *OrcaRouterModel) ChatStreamlyWithSender(ctx context.Context, modelName 
 
 	// SSE parsing: read line by line
 	sawTerminal := false
+	accumulatedToolCalls := make(map[int]map[string]any)
 	done, err := ParseSSEStream[map[string]interface{}](resp.Body, func(event map[string]interface{}) error {
 		common.Info(fmt.Sprintf("%v", event))
 
@@ -268,6 +207,8 @@ func (o *OrcaRouterModel) ChatStreamlyWithSender(ctx context.Context, modelName 
 			return nil
 		}
 
+		accumulateToolCallDeltas(delta, accumulatedToolCalls)
+
 		content, ok := delta["content"].(string)
 		if ok && content != "" {
 			if err := sender(&content, nil); err != nil {
@@ -284,6 +225,7 @@ func (o *OrcaRouterModel) ChatStreamlyWithSender(ctx context.Context, modelName 
 	if err != nil {
 		return fmt.Errorf("failed to scan response body: %w", err)
 	}
+	setSortedToolCallsResult(modelConfig, accumulatedToolCalls)
 	_ = done
 	_ = sawTerminal
 

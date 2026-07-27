@@ -67,38 +67,12 @@ func (c *CoHereModel) ChatWithMessages(ctx context.Context, modelName string, me
 	}
 	url := fmt.Sprintf("%s/%s", resolvedBaseURL, c.baseModel.URLSuffix.Chat)
 
-	// Convert messages to API format
-	apiMessages := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
 	// Build request body
-	reqBody := map[string]interface{}{
-		"model":       modelName,
-		"messages":    apiMessages,
-		"stream":      false,
-		"temperature": 0.3,
-	}
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, false)
 
 	if chatModelConfig != nil {
-		if chatModelConfig.Stream != nil {
-			reqBody["stream"] = *chatModelConfig.Stream
-		}
-
-		if chatModelConfig.MaxTokens != nil {
-			reqBody["max_tokens"] = *chatModelConfig.MaxTokens
-		}
-
-		if chatModelConfig.Temperature != nil {
-			reqBody["temperature"] = *chatModelConfig.Temperature
-		}
-
 		if chatModelConfig.TopP != nil {
-			reqBody["top_p"] = *chatModelConfig.TopP
+			reqBody["p"] = *chatModelConfig.TopP
 		}
 
 		if chatModelConfig.Thinking != nil {
@@ -201,48 +175,11 @@ func (c *CoHereModel) ChatStreamlyWithSender(ctx context.Context, modelName stri
 	}
 	url := fmt.Sprintf("%s/%s", resolvedBaseURL, c.baseModel.URLSuffix.Chat)
 
-	apiMessages := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
-	reqBody := map[string]interface{}{
-		"model":       modelName,
-		"messages":    apiMessages,
-		"stream":      true,
-		"temperature": 1,
-	}
+	reqBody := buildRequestBody(modelConfig, modelName, messages, true)
 
 	if modelConfig != nil {
-		if modelConfig.MaxTokens != nil {
-			reqBody["max_tokens"] = *modelConfig.MaxTokens
-		}
-		if modelConfig.Temperature != nil {
-			reqBody["temperature"] = *modelConfig.Temperature
-		}
 		if modelConfig.TopP != nil {
 			reqBody["p"] = *modelConfig.TopP
-		}
-	}
-
-	if modelConfig != nil {
-		if modelConfig.Stream != nil {
-			reqBody["stream"] = *modelConfig.Stream
-		}
-
-		if modelConfig.MaxTokens != nil {
-			reqBody["max_tokens"] = *modelConfig.MaxTokens
-		}
-
-		if modelConfig.Temperature != nil {
-			reqBody["temperature"] = *modelConfig.Temperature
-		}
-
-		if modelConfig.TopP != nil {
-			reqBody["top_p"] = *modelConfig.TopP
 		}
 
 		if modelConfig.Thinking != nil {
@@ -287,6 +224,7 @@ func (c *CoHereModel) ChatStreamlyWithSender(ctx context.Context, modelName stri
 	}
 
 	sawTerminal := false
+	accumulatedToolCalls := make(map[int]map[string]any)
 	done, err := ParseSSEStream[map[string]interface{}](resp.Body, func(event map[string]interface{}) error {
 		eventType, ok := event["type"].(string)
 		if !ok {
@@ -303,6 +241,9 @@ func (c *CoHereModel) ChatStreamlyWithSender(ctx context.Context, modelName stri
 			if !ok {
 				return nil
 			}
+
+			accumulateToolCallDeltas(delta, accumulatedToolCalls)
+
 			msg, ok := delta["message"].(map[string]interface{})
 			if !ok {
 				return nil
@@ -332,6 +273,8 @@ func (c *CoHereModel) ChatStreamlyWithSender(ctx context.Context, modelName stri
 	if !done && !sawTerminal {
 		return fmt.Errorf("Cohere: stream ended before [DONE] or finish_reason")
 	}
+
+	setSortedToolCallsResult(modelConfig, accumulatedToolCalls)
 
 	endOfStream := "[DONE]"
 	return sender(&endOfStream, nil)

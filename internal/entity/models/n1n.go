@@ -88,55 +88,6 @@ func newN1NJSONRequest(ctx context.Context, method, endpoint string, payload int
 	return req, nil
 }
 
-type n1nAPIMessage struct {
-	Role    string      `json:"role"`
-	Content interface{} `json:"content"`
-}
-
-type n1nThinking struct {
-	Type string `json:"type"`
-}
-
-type n1nChatRequest struct {
-	Model       string          `json:"model"`
-	Messages    []n1nAPIMessage `json:"messages"`
-	Stream      bool            `json:"stream"`
-	MaxTokens   *int            `json:"max_tokens,omitempty"`
-	Temperature *float64        `json:"temperature,omitempty"`
-	TopP        *float64        `json:"top_p,omitempty"`
-	Stop        *[]string       `json:"stop,omitempty"`
-	Thinking    *n1nThinking    `json:"thinking,omitempty"`
-}
-
-func buildN1NChatRequest(modelName string, messages []Message, stream bool, chatModelConfig *ChatConfig) n1nChatRequest {
-	apiMessages := make([]n1nAPIMessage, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = n1nAPIMessage{
-			Role:    msg.Role,
-			Content: msg.Content,
-		}
-	}
-	reqBody := n1nChatRequest{
-		Model:    modelName,
-		Messages: apiMessages,
-		Stream:   stream,
-	}
-	if chatModelConfig != nil {
-		reqBody.MaxTokens = chatModelConfig.MaxTokens
-		reqBody.Temperature = chatModelConfig.Temperature
-		reqBody.TopP = chatModelConfig.TopP
-		reqBody.Stop = chatModelConfig.Stop
-		if chatModelConfig.Thinking != nil {
-			if *chatModelConfig.Thinking {
-				reqBody.Thinking = &n1nThinking{Type: "enabled"}
-			} else {
-				reqBody.Thinking = &n1nThinking{Type: "disabled"}
-			}
-		}
-	}
-	return reqBody
-}
-
 type n1nChatChoice struct {
 	Message      n1nChatMessage `json:"message"`
 	Delta        n1nChatDelta   `json:"delta"`
@@ -176,7 +127,14 @@ func (n *N1NModel) ChatWithMessages(ctx context.Context, modelName string, messa
 		return nil, err
 	}
 
-	reqBody := buildN1NChatRequest(modelName, messages, false, chatModelConfig)
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, false)
+	if chatModelConfig != nil && chatModelConfig.Thinking != nil {
+		thinkingType := "disabled"
+		if *chatModelConfig.Thinking {
+			thinkingType = "enabled"
+		}
+		reqBody["thinking"] = map[string]interface{}{"type": thinkingType}
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, nonStreamCallTimeout)
 	defer cancel()
@@ -249,7 +207,14 @@ func (n *N1NModel) ChatStreamlyWithSender(ctx context.Context, modelName string,
 		return fmt.Errorf("stream must be true in ChatStreamlyWithSender")
 	}
 
-	reqBody := buildN1NChatRequest(modelName, messages, true, chatModelConfig)
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, true)
+	if chatModelConfig != nil && chatModelConfig.Thinking != nil {
+		thinkingType := "disabled"
+		if *chatModelConfig.Thinking {
+			thinkingType = "enabled"
+		}
+		reqBody["thinking"] = map[string]interface{}{"type": thinkingType}
+	}
 
 	req, err := newN1NJSONRequest(ctx, "POST", endpoint, reqBody, apiKey)
 	if err != nil {
@@ -268,24 +233,51 @@ func (n *N1NModel) ChatStreamlyWithSender(ctx context.Context, modelName string,
 	}
 
 	sawTerminal := false
-	done, err := ParseSSEStream[n1nChatResponse](resp.Body, func(event n1nChatResponse) error {
-		if len(event.Choices) == 0 {
+	accumulatedToolCalls := make(map[int]map[string]interface{})
+	done, err := ParseSSEStream[map[string]interface{}](resp.Body, func(event map[string]interface{}) error {
+		common.Info(fmt.Sprintf("%v", event))
+
+		tokenUsage, found, usageErr := decodeOpenAICompatibleStreamUsage(event)
+		if usageErr != nil {
+			return usageErr
+		}
+		if found {
+			applyStreamUsage(chatModelConfig, modelUsage, tokenUsage)
+		}
+
+		choices, ok := event["choices"].([]interface{})
+		if !ok || len(choices) == 0 {
 			return nil
 		}
-		choice := event.Choices[0]
-		if choice.Delta.ReasoningContent != "" {
-			r := choice.Delta.ReasoningContent
-			if err := sender(nil, &r); err != nil {
+
+		firstChoice, ok := choices[0].(map[string]interface{})
+		if !ok {
+			return nil
+		}
+
+		delta, ok := firstChoice["delta"].(map[string]interface{})
+		if !ok {
+			return nil
+		}
+
+		accumulateToolCallDeltas(delta, accumulatedToolCalls)
+
+		content, ok := delta["content"].(string)
+		if ok && content != "" {
+			if err := sender(&content, nil); err != nil {
 				return err
 			}
 		}
-		if choice.Delta.Content != "" {
-			c := choice.Delta.Content
-			if err := sender(&c, nil); err != nil {
+
+		reasoningContent, ok := delta["reasoning_content"].(string)
+		if ok && reasoningContent != "" {
+			if err := sender(nil, &reasoningContent); err != nil {
 				return err
 			}
 		}
-		if choice.FinishReason != "" {
+
+		finishReason, ok := firstChoice["finish_reason"].(string)
+		if ok && finishReason != "" {
 			sawTerminal = true
 		}
 		return nil
@@ -294,8 +286,10 @@ func (n *N1NModel) ChatStreamlyWithSender(ctx context.Context, modelName string,
 		return fmt.Errorf("failed to scan response body: %w", err)
 	}
 	if !done && !sawTerminal {
-		return fmt.Errorf("n1n: stream ended before [DONE] or finish_reason")
+		return fmt.Errorf("deepseek: stream ended before [DONE] or finish_reason")
 	}
+
+	setSortedToolCallsResult(chatModelConfig, accumulatedToolCalls)
 
 	endOfStream := "[DONE]"
 	if err := sender(&endOfStream, nil); err != nil {

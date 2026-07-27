@@ -89,39 +89,10 @@ func (a *AI302Model) ChatWithMessages(ctx context.Context, modelName string, mes
 	}
 	url := fmt.Sprintf("%s/%s", resolvedBaseURL, a.baseModel.URLSuffix.Chat)
 
-	// Convert messages to API format
-	apiMessages := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
 	// Build request body
-	reqBody := map[string]interface{}{
-		"model":       strings.TrimSpace(modelName),
-		"messages":    apiMessages,
-		"stream":      false,
-		"temperature": 1,
-	}
+	reqBody := buildRequestBody(chatModelConfig, strings.TrimSpace(modelName), messages, false)
 
 	if chatModelConfig != nil {
-		if chatModelConfig.MaxTokens != nil {
-			reqBody["max_tokens"] = *chatModelConfig.MaxTokens
-		}
-
-		if chatModelConfig.Temperature != nil {
-			reqBody["temperature"] = *chatModelConfig.Temperature
-		}
-
-		if chatModelConfig.TopP != nil {
-			reqBody["top_p"] = *chatModelConfig.TopP
-		}
-
-		if chatModelConfig.Stop != nil {
-			reqBody["stop"] = *chatModelConfig.Stop
-		}
 
 		if chatModelConfig.Effort != nil {
 			reqBody["reasoning"] = map[string]interface{}{
@@ -195,7 +166,8 @@ func (a *AI302Model) ChatWithMessages(ctx context.Context, modelName string, mes
 	}
 
 	content, ok := messageMap["content"].(string)
-	if !ok {
+	toolCalls := extractToolCalls(messageMap)
+	if !ok && len(toolCalls) == 0 {
 		return nil, fmt.Errorf("invalid content format")
 	}
 
@@ -214,6 +186,7 @@ func (a *AI302Model) ChatWithMessages(ctx context.Context, modelName string, mes
 	chatResponse := &ChatResponse{
 		Answer:        &content,
 		ReasonContent: &reasonContent,
+		ToolCalls:     toolCalls,
 	}
 
 	return chatResponse, nil
@@ -240,43 +213,10 @@ func (a *AI302Model) ChatStreamlyWithSender(ctx context.Context, modelName strin
 	}
 	url := fmt.Sprintf("%s/%s", strings.TrimSuffix(resolvedBaseURL, "/"), a.baseModel.URLSuffix.Chat)
 
-	// Convert messages to API format
-	apiMessages := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
 	// Build request body with streaming enabled
-	reqBody := map[string]interface{}{
-		"model":       strings.TrimSpace(modelName),
-		"messages":    apiMessages,
-		"stream":      true,
-		"temperature": 1,
-	}
+	reqBody := buildRequestBody(modelConfig, strings.TrimSpace(modelName), messages, true)
 
 	if modelConfig != nil {
-		if modelConfig.MaxTokens != nil {
-			reqBody["max_tokens"] = *modelConfig.MaxTokens
-		}
-
-		if modelConfig.Temperature != nil {
-			reqBody["temperature"] = *modelConfig.Temperature
-		}
-
-		if modelConfig.DoSample != nil {
-			reqBody["do_sample"] = *modelConfig.DoSample
-		}
-
-		if modelConfig.TopP != nil {
-			reqBody["top_p"] = *modelConfig.TopP
-		}
-
-		if modelConfig.Stop != nil {
-			reqBody["stop"] = *modelConfig.Stop
-		}
 
 		if modelConfig.Effort != nil {
 			reqBody["reasoning"] = map[string]interface{}{
@@ -325,6 +265,7 @@ func (a *AI302Model) ChatStreamlyWithSender(ctx context.Context, modelName strin
 		return fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
+	accumulatedToolCalls := make(map[int]map[string]any)
 	if _, err = ParseSSEStream[map[string]interface{}](resp.Body, func(event map[string]interface{}) error {
 		choices, ok := event["choices"].([]interface{})
 		if !ok || len(choices) == 0 {
@@ -340,6 +281,8 @@ func (a *AI302Model) ChatStreamlyWithSender(ctx context.Context, modelName strin
 		if !ok {
 			return nil
 		}
+
+		accumulateToolCallDeltas(delta, accumulatedToolCalls)
 
 		reasoningContent, ok := delta["reasoning_content"].(string)
 		if ok && reasoningContent != "" {
@@ -359,6 +302,8 @@ func (a *AI302Model) ChatStreamlyWithSender(ctx context.Context, modelName strin
 	}); err != nil {
 		return fmt.Errorf("failed to scan response body: %w", err)
 	}
+
+	setSortedToolCallsResult(modelConfig, accumulatedToolCalls)
 
 	// Send [DONE] marker for OpenAI compatibility
 	endOfStream := "[DONE]"

@@ -888,13 +888,9 @@ func (m *ModelProviderService) CheckConnection(ctx context.Context, providerName
 	}
 
 	apiConfig := &modelModule.APIConfig{
-		ApiKey: &apiKey,
-		Region: &region,
-	}
-
-	err := driver.CheckConnection(ctx, apiConfig)
-	if err != nil {
-		return common.CodeServerError, err
+		ApiKey:  &apiKey,
+		Region:  &region,
+		BaseURL: &baseURL,
 	}
 
 	// Mirror Python verify_api_key: verify each model by making a real
@@ -1004,7 +1000,29 @@ func verifyProviderModel(ctx context.Context, driver modelModule.ModelDriver, pr
 	}
 
 	if len(modelsToVerify) == 0 {
-		return modelVerifyResult, fmt.Errorf("no models found for provider")
+		// Third fallback: try to fetch remote models via the provider's API,
+		// mirroring Python's get_model_list() fallback in verify_api_key.
+		remoteModels, listErr := driver.ListModels(ctx, apiConfig)
+		if listErr == nil {
+			for _, rm := range remoteModels {
+				modelName := strings.TrimSpace(rm.Name)
+				if modelName == "" {
+					continue
+				}
+				modelTypes := rm.ModelTypes
+				if len(modelTypes) == 0 {
+					modelTypes = modelModule.InferModelTypes(modelName)
+				}
+				modelsToVerify = append(modelsToVerify, &modelModule.Model{
+					Name:       modelName,
+					ModelTypes: modelTypes,
+				})
+			}
+		}
+
+		if len(modelsToVerify) == 0 {
+			return modelVerifyResult, fmt.Errorf("no models found for provider")
+		}
 	}
 
 	var errs []error
@@ -1040,6 +1058,8 @@ func verifyProviderModel(ctx context.Context, driver modelModule.ModelDriver, pr
 				err = verifyASRModel(ctx, driver, modelName, apiConfig)
 			case "ocr":
 				err = verifyOCRModel(ctx, driver, modelName, apiConfig)
+			case "doc_parse":
+				err = driver.CheckConnection(ctx, apiConfig)
 			default:
 				continue
 			}
@@ -3193,7 +3213,7 @@ func (m *ModelProviderService) ParseFile(ctx context.Context, providerName, inst
 }
 
 // GetEmbeddingModel returns an EmbeddingModel wrapper for the given tenant
-func (m *ModelProviderService) GetEmbeddingModel(tenantID, compositeModelName string) (*modelModule.EmbeddingModel, error) {
+func (m *ModelProviderService) GetEmbeddingModel(ctx context.Context, tenantID, compositeModelName string) (*modelModule.EmbeddingModel, error) {
 	driver, modelName, apiConfig, maxTokens, err := m.ResolveModelConfig(tenantID, entity.ModelTypeEmbedding, compositeModelName)
 	if err != nil {
 		return nil, err
@@ -3202,7 +3222,7 @@ func (m *ModelProviderService) GetEmbeddingModel(tenantID, compositeModelName st
 }
 
 // GetChatModel  returns a ChatModel wrapper for the given tenant
-func (m *ModelProviderService) GetChatModel(tenantID, compositeModelName string) (*modelModule.ChatModel, error) {
+func (m *ModelProviderService) GetChatModel(ctx context.Context, tenantID, compositeModelName string) (*modelModule.ChatModel, error) {
 	driver, modelName, apiConfig, _, err := m.ResolveModelConfig(tenantID, entity.ModelTypeChat, compositeModelName)
 	if err != nil {
 		return nil, err

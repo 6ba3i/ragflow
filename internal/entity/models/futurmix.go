@@ -88,43 +88,6 @@ func newFuturMixJSONRequest(ctx context.Context, method, endpoint string, payloa
 	return req, nil
 }
 
-type futurmixAPIMessage struct {
-	Role    string      `json:"role"`
-	Content interface{} `json:"content"`
-}
-
-type futurmixChatRequest struct {
-	Model       string               `json:"model"`
-	Messages    []futurmixAPIMessage `json:"messages"`
-	Stream      bool                 `json:"stream"`
-	MaxTokens   *int                 `json:"max_tokens,omitempty"`
-	Temperature *float64             `json:"temperature,omitempty"`
-	TopP        *float64             `json:"top_p,omitempty"`
-	Stop        *[]string            `json:"stop,omitempty"`
-}
-
-func buildFuturMixChatRequest(modelName string, messages []Message, stream bool, chatModelConfig *ChatConfig) futurmixChatRequest {
-	apiMessages := make([]futurmixAPIMessage, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = futurmixAPIMessage{
-			Role:    msg.Role,
-			Content: msg.Content,
-		}
-	}
-	reqBody := futurmixChatRequest{
-		Model:    modelName,
-		Messages: apiMessages,
-		Stream:   stream,
-	}
-	if chatModelConfig != nil {
-		reqBody.MaxTokens = chatModelConfig.MaxTokens
-		reqBody.Temperature = chatModelConfig.Temperature
-		reqBody.TopP = chatModelConfig.TopP
-		reqBody.Stop = chatModelConfig.Stop
-	}
-	return reqBody
-}
-
 type futurmixChatChoice struct {
 	Message      futurmixChatMessage `json:"message"`
 	Delta        futurmixChatDelta   `json:"delta"`
@@ -150,28 +113,34 @@ func (f *FuturMixModel) ChatWithMessages(ctx context.Context, modelName string, 
 	if err := f.baseModel.APIConfigCheck(apiConfig); err != nil {
 		return nil, err
 	}
-	apiKey := *apiConfig.ApiKey
-	if strings.TrimSpace(modelName) == "" {
-		return nil, fmt.Errorf("model name is required")
-	}
+
 	if len(messages) == 0 {
 		return nil, fmt.Errorf("messages is empty")
 	}
 
-	endpoint, err := f.endpointURL(futurmixRegion(apiConfig), f.baseModel.URLSuffix.Chat)
+	resolvedBaseURL, err := f.baseModel.GetBaseURL(apiConfig)
 	if err != nil {
 		return nil, err
 	}
+	url := fmt.Sprintf("%s/%s", resolvedBaseURL, f.baseModel.URLSuffix.Chat)
 
-	reqBody := buildFuturMixChatRequest(modelName, messages, false, chatModelConfig)
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, false)
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, nonStreamCallTimeout)
 	defer cancel()
 
-	req, err := newFuturMixJSONRequest(ctx, "POST", endpoint, reqBody, apiKey)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
 
 	resp, err := f.baseModel.httpClient.Do(req)
 	if err != nil {
@@ -213,32 +182,33 @@ func (f *FuturMixModel) ChatStreamlyWithSender(ctx context.Context, modelName st
 		return err
 	}
 
-	if sender == nil {
-		return fmt.Errorf("sender is required")
-	}
-	if strings.TrimSpace(modelName) == "" {
-		return fmt.Errorf("model name is required")
-	}
 	if len(messages) == 0 {
 		return fmt.Errorf("messages is empty")
 	}
-	apiKey := *apiConfig.ApiKey
 
-	endpoint, err := f.endpointURL(futurmixRegion(apiConfig), f.baseModel.URLSuffix.Chat)
+	resolvedBaseURL, err := f.baseModel.GetBaseURL(apiConfig)
 	if err != nil {
 		return err
 	}
+	url := fmt.Sprintf("%s/%s", resolvedBaseURL, f.baseModel.URLSuffix.Chat)
 
-	if chatModelConfig != nil && chatModelConfig.Stream != nil && !*chatModelConfig.Stream {
-		return fmt.Errorf("stream must be true in ChatStreamlyWithSender")
-	}
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, false)
 
-	reqBody := buildFuturMixChatRequest(modelName, messages, true, chatModelConfig)
-
-	req, err := newFuturMixJSONRequest(ctx, "POST", endpoint, reqBody, apiKey)
+	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to marshal request: %w", err)
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, nonStreamCallTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
 
 	resp, err := f.baseModel.httpClient.Do(req)
 	if err != nil {
@@ -251,35 +221,45 @@ func (f *FuturMixModel) ChatStreamlyWithSender(ctx context.Context, modelName st
 		return fmt.Errorf("futurmix chat stream API error: %s, body: %s", resp.Status, string(body))
 	}
 
-	sawTerminal := false
-	done, err := ParseSSEStream[futurmixChatResponse](resp.Body, func(event futurmixChatResponse) error {
-		if len(event.Choices) == 0 {
+	accumulatedToolCalls := make(map[int]map[string]any)
+	if _, err = ParseSSEStream[map[string]interface{}](resp.Body, func(event map[string]interface{}) error {
+		choices, ok := event["choices"].([]interface{})
+		if !ok || len(choices) == 0 {
 			return nil
 		}
-		choice := event.Choices[0]
-		if choice.Delta.ReasoningContent != "" {
-			r := choice.Delta.ReasoningContent
-			if err := sender(nil, &r); err != nil {
+
+		firstChoice, ok := choices[0].(map[string]interface{})
+		if !ok {
+			return nil
+		}
+
+		delta, ok := firstChoice["delta"].(map[string]interface{})
+		if !ok {
+			return nil
+		}
+
+		accumulateToolCallDeltas(delta, accumulatedToolCalls)
+
+		reasoningContent, ok := delta["reasoning_content"].(string)
+		if ok && reasoningContent != "" {
+			if err = sender(nil, &reasoningContent); err != nil {
 				return err
 			}
 		}
-		if choice.Delta.Content != "" {
-			c := choice.Delta.Content
-			if err := sender(&c, nil); err != nil {
+
+		content, ok := delta["content"].(string)
+		if ok && content != "" {
+			if err = sender(&content, nil); err != nil {
 				return err
 			}
 		}
-		if choice.FinishReason != "" {
-			sawTerminal = true
-		}
+
 		return nil
-	})
-	if err != nil {
+	}); err != nil {
 		return fmt.Errorf("failed to scan response body: %w", err)
 	}
-	if !done && !sawTerminal {
-		return fmt.Errorf("futurmix: stream ended before [DONE] or finish_reason")
-	}
+
+	setSortedToolCallsResult(chatModelConfig, accumulatedToolCalls)
 
 	endOfStream := "[DONE]"
 	return sender(&endOfStream, nil)

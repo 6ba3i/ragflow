@@ -67,34 +67,9 @@ func (u *UpstageModel) ChatWithMessages(ctx context.Context, modelName string, m
 	}
 	baseURL = strings.TrimSuffix(baseURL, "/")
 	url := fmt.Sprintf("%s/%s", baseURL, u.baseModel.URLSuffix.Chat)
-
-	apiMessages := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
-	reqBody := map[string]interface{}{
-		"model":    modelName,
-		"messages": apiMessages,
-		"stream":   false,
-	}
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, false)
 
 	if chatModelConfig != nil {
-		if chatModelConfig.MaxTokens != nil {
-			reqBody["max_tokens"] = *chatModelConfig.MaxTokens
-		}
-		if chatModelConfig.Temperature != nil {
-			reqBody["temperature"] = *chatModelConfig.Temperature
-		}
-		if chatModelConfig.TopP != nil {
-			reqBody["top_p"] = *chatModelConfig.TopP
-		}
-		if chatModelConfig.Stop != nil {
-			reqBody["stop"] = *chatModelConfig.Stop
-		}
 		if chatModelConfig.Effort != nil && *chatModelConfig.Effort != "" {
 			reqBody["reasoning_effort"] = *chatModelConfig.Effort
 		}
@@ -152,7 +127,8 @@ func (u *UpstageModel) ChatWithMessages(ctx context.Context, modelName string, m
 	}
 
 	content, ok := messageMap["content"].(string)
-	if !ok {
+	toolCalls := extractToolCalls(messageMap)
+	if !ok && len(toolCalls) == 0 {
 		return nil, fmt.Errorf("invalid content format")
 	}
 
@@ -164,6 +140,7 @@ func (u *UpstageModel) ChatWithMessages(ctx context.Context, modelName string, m
 	return &ChatResponse{
 		Answer:        &content,
 		ReasonContent: &reasonContent,
+		ToolCalls:     toolCalls,
 	}, nil
 }
 
@@ -187,38 +164,13 @@ func (u *UpstageModel) ChatStreamlyWithSender(ctx context.Context, modelName str
 	}
 	baseURL = strings.TrimSuffix(baseURL, "/")
 	url := fmt.Sprintf("%s/%s", baseURL, u.baseModel.URLSuffix.Chat)
-
-	apiMessages := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
-	reqBody := map[string]interface{}{
-		"model":    modelName,
-		"messages": apiMessages,
-		"stream":   true,
-	}
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, true)
 
 	if chatModelConfig != nil {
 		if chatModelConfig.Stream != nil && !*chatModelConfig.Stream {
 			return fmt.Errorf("stream must be true in ChatStreamlyWithSender")
 		}
 
-		if chatModelConfig.MaxTokens != nil {
-			reqBody["max_tokens"] = *chatModelConfig.MaxTokens
-		}
-		if chatModelConfig.Temperature != nil {
-			reqBody["temperature"] = *chatModelConfig.Temperature
-		}
-		if chatModelConfig.TopP != nil {
-			reqBody["top_p"] = *chatModelConfig.TopP
-		}
-		if chatModelConfig.Stop != nil {
-			reqBody["stop"] = *chatModelConfig.Stop
-		}
 		// reasoning_effort: same as the non-streaming path above.
 		if chatModelConfig.Effort != nil && *chatModelConfig.Effort != "" {
 			reqBody["reasoning_effort"] = *chatModelConfig.Effort
@@ -249,6 +201,7 @@ func (u *UpstageModel) ChatStreamlyWithSender(ctx context.Context, modelName str
 		return fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 	sawTerminal := false
+	accumulatedToolCalls := make(map[int]map[string]any)
 	done, err := ParseSSEStream[map[string]interface{}](resp.Body, func(event map[string]interface{}) error {
 		choices, ok := event["choices"].([]interface{})
 		if !ok || len(choices) == 0 {
@@ -264,6 +217,8 @@ func (u *UpstageModel) ChatStreamlyWithSender(ctx context.Context, modelName str
 		if !ok {
 			return nil
 		}
+
+		accumulateToolCallDeltas(delta, accumulatedToolCalls)
 
 		if r, ok := delta["reasoning"].(string); ok && r != "" {
 			if err := sender(nil, &r); err != nil {
@@ -290,6 +245,8 @@ func (u *UpstageModel) ChatStreamlyWithSender(ctx context.Context, modelName str
 	if !done && !sawTerminal {
 		return fmt.Errorf("upstage: stream ended before [DONE] or finish_reason")
 	}
+
+	setSortedToolCallsResult(chatModelConfig, accumulatedToolCalls)
 
 	endOfStream := "[DONE]"
 	if err := sender(&endOfStream, nil); err != nil {

@@ -74,44 +74,10 @@ func (l *LmStudioModel) ChatWithMessages(ctx context.Context, modelName string, 
 		url = fmt.Sprintf("%s/%s", resolvedBaseURL, l.baseModel.URLSuffix.AsyncChat)
 	}
 
-	// Convert messages to API format
-	apiMessages := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
 	// Build request body
-	reqBody := map[string]interface{}{
-		"model":       modelName,
-		"messages":    apiMessages,
-		"stream":      false,
-		"temperature": 1,
-	}
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, false)
 
 	if chatModelConfig != nil {
-		if chatModelConfig.Stream != nil {
-			reqBody["stream"] = *chatModelConfig.Stream
-		}
-
-		if chatModelConfig.MaxTokens != nil {
-			reqBody["max_tokens"] = *chatModelConfig.MaxTokens
-		}
-
-		if chatModelConfig.Temperature != nil {
-			reqBody["temperature"] = *chatModelConfig.Temperature
-		}
-
-		if chatModelConfig.TopP != nil {
-			reqBody["top_p"] = *chatModelConfig.TopP
-		}
-
-		if chatModelConfig.Stop != nil {
-			reqBody["stop"] = *chatModelConfig.Stop
-		}
-
 		if chatModelConfig.Thinking != nil {
 			if *chatModelConfig.Thinking {
 				reqBody["thinking"] = map[string]interface{}{
@@ -180,7 +146,8 @@ func (l *LmStudioModel) ChatWithMessages(ctx context.Context, modelName string, 
 	}
 
 	content, ok := messageMap["content"].(string)
-	if !ok {
+	toolCalls := extractToolCalls(messageMap)
+	if !ok && len(toolCalls) == 0 {
 		return nil, fmt.Errorf("invalid content format")
 	}
 
@@ -198,6 +165,7 @@ func (l *LmStudioModel) ChatWithMessages(ctx context.Context, modelName string, 
 	chatResponse := &ChatResponse{
 		Answer:        &content,
 		ReasonContent: &reasonContent,
+		ToolCalls:     toolCalls,
 	}
 
 	return chatResponse, nil
@@ -223,47 +191,9 @@ func (l *LmStudioModel) ChatStreamlyWithSender(ctx context.Context, modelName st
 		url = fmt.Sprintf("%s/%s", resolvedBaseURL, l.baseModel.URLSuffix.AsyncChat)
 	}
 
-	// Convert messages to API format (supporting multimodal content)
-	apiMessages := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
 	// Build request body with streaming enabled
-	reqBody := map[string]interface{}{
-		"model":    modelName,
-		"messages": apiMessages,
-		"stream":   true,
-	}
-
-	if modelConfig.Stream != nil {
-		reqBody["stream"] = *modelConfig.Stream
-	}
-
-	if modelConfig.MaxTokens != nil {
-		reqBody["max_tokens"] = *modelConfig.MaxTokens
-	}
-
-	if modelConfig.Temperature != nil {
-		reqBody["temperature"] = *modelConfig.Temperature
-	}
-
-	if modelConfig.DoSample != nil {
-		reqBody["do_sample"] = *modelConfig.DoSample
-	}
-
-	if modelConfig.TopP != nil {
-		reqBody["top_p"] = *modelConfig.TopP
-	}
-
-	if modelConfig.Stop != nil {
-		reqBody["stop"] = *modelConfig.Stop
-	}
-
-	if modelConfig.Thinking != nil {
+	reqBody := buildRequestBody(modelConfig, modelName, messages, true)
+	if modelConfig != nil && modelConfig.Thinking != nil {
 		if *modelConfig.Thinking {
 			reqBody["thinking"] = map[string]interface{}{
 				"type": "enabled",
@@ -305,6 +235,7 @@ func (l *LmStudioModel) ChatStreamlyWithSender(ctx context.Context, modelName st
 	}
 
 	// SSE parsing: read line by line
+	accumulatedToolCalls := make(map[int]map[string]any)
 	if _, err := ParseSSEStream[map[string]interface{}](resp.Body, func(event map[string]interface{}) error {
 		common.Info(fmt.Sprintf("%v", event))
 
@@ -322,6 +253,8 @@ func (l *LmStudioModel) ChatStreamlyWithSender(ctx context.Context, modelName st
 		if !ok {
 			return nil
 		}
+
+		accumulateToolCallDeltas(delta, accumulatedToolCalls)
 
 		reasoningContent, ok := delta["reasoning_content"].(string)
 		if ok && reasoningContent != "" {
@@ -341,6 +274,7 @@ func (l *LmStudioModel) ChatStreamlyWithSender(ctx context.Context, modelName st
 	}); err != nil {
 		return fmt.Errorf("failed to scan response body: %w", err)
 	}
+	setSortedToolCallsResult(modelConfig, accumulatedToolCalls)
 
 	// Send [DONE] marker for OpenAI compatibility
 	endOfStream := "[DONE]"

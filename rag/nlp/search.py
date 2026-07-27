@@ -260,7 +260,7 @@ class Dealer:
 
             fusionExpr = None
             if matchText is not None and matchDense is not None:
-                fusion_weights = "0.05,0.95" if retrieval_lane is None and "vector_similarity_weight" not in req else f"{1.0 - vector_similarity_weight},{vector_similarity_weight}"
+                fusion_weights = "0.001,1" if retrieval_lane is None and "vector_similarity_weight" not in req else f"{1.0 - vector_similarity_weight},{vector_similarity_weight}"
                 fusionExpr = FusionExpr(
                     "weighted_sum",
                     topk,

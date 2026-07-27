@@ -68,35 +68,7 @@ func (s *StepFunModel) ChatWithMessages(ctx context.Context, modelName string, m
 	}
 	baseURL = strings.TrimSuffix(baseURL, "/")
 	url := fmt.Sprintf("%s/%s", baseURL, s.baseModel.URLSuffix.Chat)
-
-	apiMessages := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
-	reqBody := map[string]interface{}{
-		"model":    modelName,
-		"messages": apiMessages,
-		"stream":   false,
-	}
-
-	if chatModelConfig != nil {
-		if chatModelConfig.MaxTokens != nil {
-			reqBody["max_tokens"] = *chatModelConfig.MaxTokens
-		}
-		if chatModelConfig.Temperature != nil {
-			reqBody["temperature"] = *chatModelConfig.Temperature
-		}
-		if chatModelConfig.TopP != nil {
-			reqBody["top_p"] = *chatModelConfig.TopP
-		}
-		if chatModelConfig.Stop != nil {
-			reqBody["stop"] = *chatModelConfig.Stop
-		}
-	}
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, false)
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
@@ -150,7 +122,8 @@ func (s *StepFunModel) ChatWithMessages(ctx context.Context, modelName string, m
 	}
 
 	content, ok := messageMap["content"].(string)
-	if !ok {
+	toolCalls := extractToolCalls(messageMap)
+	if !ok && len(toolCalls) == 0 {
 		return nil, fmt.Errorf("invalid content format")
 	}
 
@@ -181,39 +154,7 @@ func (s *StepFunModel) ChatStreamlyWithSender(ctx context.Context, modelName str
 	}
 	baseURL = strings.TrimSuffix(baseURL, "/")
 	url := fmt.Sprintf("%s/%s", baseURL, s.baseModel.URLSuffix.Chat)
-
-	apiMessages := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
-	reqBody := map[string]interface{}{
-		"model":    modelName,
-		"messages": apiMessages,
-		"stream":   true,
-	}
-
-	if chatModelConfig != nil {
-		if chatModelConfig.Stream != nil && !*chatModelConfig.Stream {
-			return fmt.Errorf("stream must be true in ChatStreamlyWithSender")
-		}
-
-		if chatModelConfig.MaxTokens != nil {
-			reqBody["max_tokens"] = *chatModelConfig.MaxTokens
-		}
-		if chatModelConfig.Temperature != nil {
-			reqBody["temperature"] = *chatModelConfig.Temperature
-		}
-		if chatModelConfig.TopP != nil {
-			reqBody["top_p"] = *chatModelConfig.TopP
-		}
-		if chatModelConfig.Stop != nil {
-			reqBody["stop"] = *chatModelConfig.Stop
-		}
-	}
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, true)
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
@@ -240,6 +181,7 @@ func (s *StepFunModel) ChatStreamlyWithSender(ctx context.Context, modelName str
 	}
 
 	sawTerminal := false
+	accumulatedToolCalls := make(map[int]map[string]any)
 	done, err := ParseSSEStream[map[string]interface{}](resp.Body, func(event map[string]interface{}) error {
 		choices, ok := event["choices"].([]interface{})
 		if !ok || len(choices) == 0 {
@@ -255,6 +197,8 @@ func (s *StepFunModel) ChatStreamlyWithSender(ctx context.Context, modelName str
 		if !ok {
 			return nil
 		}
+
+		accumulateToolCallDeltas(delta, accumulatedToolCalls)
 
 		content, ok := delta["content"].(string)
 		if ok && content != "" {
@@ -272,6 +216,7 @@ func (s *StepFunModel) ChatStreamlyWithSender(ctx context.Context, modelName str
 	if err != nil {
 		return fmt.Errorf("failed to scan response body: %w", err)
 	}
+	setSortedToolCallsResult(chatModelConfig, accumulatedToolCalls)
 	if !done && !sawTerminal {
 		return fmt.Errorf("stepfun: stream ended before [DONE] or finish_reason")
 	}

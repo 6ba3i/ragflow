@@ -68,31 +68,8 @@ func (l *LongCatModel) ChatWithMessages(ctx context.Context, modelName string, m
 	baseURL = strings.TrimSuffix(baseURL, "/")
 	url := fmt.Sprintf("%s/%s", baseURL, l.baseModel.URLSuffix.Chat)
 
-	apiMessages := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
-	reqBody := map[string]interface{}{
-		"model":    modelName,
-		"messages": apiMessages,
-		"stream":   false,
-	}
-
-	if chatModelConfig != nil {
-		if chatModelConfig.MaxTokens != nil {
-			reqBody["max_tokens"] = *chatModelConfig.MaxTokens
-		}
-		if chatModelConfig.Temperature != nil {
-			reqBody["temperature"] = *chatModelConfig.Temperature
-		}
-		if chatModelConfig.TopP != nil {
-			reqBody["top_p"] = *chatModelConfig.TopP
-		}
-	}
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, false)
+	delete(reqBody, "stop")
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
@@ -146,7 +123,8 @@ func (l *LongCatModel) ChatWithMessages(ctx context.Context, modelName string, m
 	}
 
 	content, ok := messageMap["content"].(string)
-	if !ok {
+	toolCalls := extractToolCalls(messageMap)
+	if !ok && len(toolCalls) == 0 {
 		return nil, fmt.Errorf("invalid content format")
 	}
 
@@ -163,6 +141,7 @@ func (l *LongCatModel) ChatWithMessages(ctx context.Context, modelName string, m
 	return &ChatResponse{
 		Answer:        &content,
 		ReasonContent: &reasonContent,
+		ToolCalls:     toolCalls,
 	}, nil
 }
 
@@ -186,20 +165,8 @@ func (l *LongCatModel) ChatStreamlyWithSender(ctx context.Context, modelName str
 	}
 	baseURL = strings.TrimSuffix(baseURL, "/")
 	url := fmt.Sprintf("%s/%s", baseURL, l.baseModel.URLSuffix.Chat)
-
-	apiMessages := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
-	reqBody := map[string]interface{}{
-		"model":    modelName,
-		"messages": apiMessages,
-		"stream":   true,
-	}
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, true)
+	delete(reqBody, "stop")
 
 	if chatModelConfig != nil {
 		if chatModelConfig.Stream != nil && !*chatModelConfig.Stream {
@@ -207,15 +174,6 @@ func (l *LongCatModel) ChatStreamlyWithSender(ctx context.Context, modelName str
 		}
 
 		// Only documented fields are forwarded; see ChatWithMessages.
-		if chatModelConfig.MaxTokens != nil {
-			reqBody["max_tokens"] = *chatModelConfig.MaxTokens
-		}
-		if chatModelConfig.Temperature != nil {
-			reqBody["temperature"] = *chatModelConfig.Temperature
-		}
-		if chatModelConfig.TopP != nil {
-			reqBody["top_p"] = *chatModelConfig.TopP
-		}
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -244,6 +202,7 @@ func (l *LongCatModel) ChatStreamlyWithSender(ctx context.Context, modelName str
 	}
 
 	sawTerminal := false
+	accumulatedToolCalls := make(map[int]map[string]any)
 	done, err := ParseSSEStream[map[string]interface{}](resp.Body, func(event map[string]interface{}) error {
 		if apiErr, ok := event["error"]; ok {
 			return fmt.Errorf("longcat: upstream stream error: %v", apiErr)
@@ -263,6 +222,8 @@ func (l *LongCatModel) ChatStreamlyWithSender(ctx context.Context, modelName str
 		if !ok {
 			return nil
 		}
+
+		accumulateToolCallDeltas(delta, accumulatedToolCalls)
 
 		if r, ok := delta["reasoning_content"].(string); ok && r != "" {
 			if err := sender(nil, &r); err != nil {
@@ -286,6 +247,7 @@ func (l *LongCatModel) ChatStreamlyWithSender(ctx context.Context, modelName str
 	if err != nil {
 		return fmt.Errorf("failed to scan response body: %w", err)
 	}
+	setSortedToolCallsResult(chatModelConfig, accumulatedToolCalls)
 	if !done && !sawTerminal {
 		return fmt.Errorf("longcat: stream ended before [DONE] or finish_reason")
 	}

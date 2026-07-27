@@ -348,7 +348,7 @@ func (s *ChatPipelineService) AsyncChat(
 		// === Phase 6: SQL Retrieval ===
 		// Retrieve field_map for SQL retrieval (preferred over vector search)
 		promptConfig := chat.PromptConfig
-		fieldMap, fmErr := s.kbDAO.GetFieldMap(kbIDStrings(kbs))
+		fieldMap, fmErr := s.kbDAO.GetFieldMap(ctx, dao.DB, kbIDStrings(kbs))
 		if fmErr != nil {
 			common.Warn("get_field_map failed; proceeding without field_map", zap.Error(fmErr))
 			fieldMap = nil
@@ -552,7 +552,7 @@ func (s *ChatPipelineService) AsyncChat(
 				var flattedMeta common.MetaData
 				var mErr error
 				if s.MetadataSvc != nil {
-					flattedMeta, mErr = s.MetadataSvc.GetFlattedMetaByKBs(kbIDs)
+					flattedMeta, mErr = s.MetadataSvc.GetFlattedMetaByKBs(ctx, kbIDs)
 				}
 				if mErr == nil {
 					if filtered, ok := ApplyMetaDataFilter(
@@ -689,7 +689,7 @@ func (s *ChatPipelineService) AsyncChat(
 				searchQuestion := strings.Join(questions, " ")
 				if embModel != nil {
 					// Retrieval
-					rankFeature := s.MetadataSvc.LabelQuestion(searchQuestion, kbs)
+					rankFeature := s.MetadataSvc.LabelQuestion(ctx, searchQuestion, kbs)
 					{
 						tenantIDs := make([]string, 0)
 						kbIDs := make([]string, 0)
@@ -846,6 +846,12 @@ func (s *ChatPipelineService) AsyncChat(
 		// If empty_response is not configured, fall through to the LLM call
 		// with an empty knowledge context.
 		//
+		// EXCEPTION: when the user attached files to their message, the
+		// attachment text provides context that should be sent to the LLM
+		// even if KB retrieval returned nothing. In that case we skip the
+		// early return and fall through to the normal LLM call where
+		// attachments are appended to the system prompt.
+		//
 		// Two results are yielded (mirroring Python dialog_service.py):
 		//   1. Final=false — carries the answer text so streaming consumers
 		//      actually display the fallback message.
@@ -854,7 +860,7 @@ func (s *ChatPipelineService) AsyncChat(
 		//      final event (dialog_service.py:807); consumers that only look at
 		//      the final event (e.g. the OpenAI-compatible endpoint) would
 		//      otherwise see an empty reply.
-		if len(knowledges) == 0 {
+		if len(knowledges) == 0 && attachments == "" {
 			if emptyResp, ok := promptConfig["empty_response"].(string); ok && emptyResp != "" {
 				out <- AsyncChatResult{
 					Answer:    emptyResp,
@@ -1956,7 +1962,7 @@ func (s *ChatPipelineService) getModels(ctx context.Context, chat *entity.Chat) 
 	var kbs []*entity.Knowledgebase
 	if len(kbIDs) > 0 {
 		var err error
-		kbs, err = kbDAO.GetByIDs(kbIDs)
+		kbs, err = kbDAO.GetByIDs(ctx, dao.DB, kbIDs)
 		if err != nil {
 			common.Warn("Failed to get KBs by IDs; retrieval may be incomplete",
 				zap.Strings("kbIDs", kbIDs), zap.Error(err))

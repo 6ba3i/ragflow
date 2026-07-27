@@ -94,44 +94,6 @@ func (c *CometAPIModel) balanceURL(apiKey string) string {
 	return parsed.String()
 }
 
-type cometapiChatRequest struct {
-	Model       string               `json:"model"`
-	Messages    []cometapiAPIMessage `json:"messages"`
-	Stream      bool                 `json:"stream"`
-	MaxTokens   *int                 `json:"max_tokens,omitempty"`
-	Temperature *float64             `json:"temperature,omitempty"`
-	TopP        *float64             `json:"top_p,omitempty"`
-	Stop        *[]string            `json:"stop,omitempty"`
-}
-
-type cometapiAPIMessage struct {
-	Role    string      `json:"role"`
-	Content interface{} `json:"content"`
-}
-
-func buildCometAPIChatRequest(modelName string, messages []Message, stream bool, chatModelConfig *ChatConfig) cometapiChatRequest {
-	apiMessages := make([]cometapiAPIMessage, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = cometapiAPIMessage{
-			Role:    msg.Role,
-			Content: msg.Content,
-		}
-	}
-
-	reqBody := cometapiChatRequest{
-		Model:    modelName,
-		Messages: apiMessages,
-		Stream:   stream,
-	}
-	if chatModelConfig != nil {
-		reqBody.MaxTokens = chatModelConfig.MaxTokens
-		reqBody.Temperature = chatModelConfig.Temperature
-		reqBody.TopP = chatModelConfig.TopP
-		reqBody.Stop = chatModelConfig.Stop
-	}
-	return reqBody
-}
-
 func newCometAPIJSONRequest(ctx context.Context, method string, endpoint string, payload interface{}, apiKey string) (*http.Request, error) {
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
@@ -253,7 +215,7 @@ func (c *CometAPIModel) ChatWithMessages(ctx context.Context, modelName string, 
 		return nil, err
 	}
 
-	reqBody := buildCometAPIChatRequest(modelName, messages, false, chatModelConfig)
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, false)
 
 	ctx, cancel := context.WithTimeout(ctx, nonStreamCallTimeout)
 	defer cancel()
@@ -307,7 +269,7 @@ func (c *CometAPIModel) ChatStreamlyWithSender(ctx context.Context, modelName st
 			return fmt.Errorf("stream must be true in ChatStreamlyWithSender")
 		}
 	}
-	reqBody := buildCometAPIChatRequest(modelName, messages, true, chatModelConfig)
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, true)
 
 	req, err := newCometAPIJSONRequest(ctx, "POST", url, reqBody, apiKey)
 	if err != nil {
@@ -325,29 +287,43 @@ func (c *CometAPIModel) ChatStreamlyWithSender(ctx context.Context, modelName st
 	}
 
 	sawTerminal := false
-	done, err := ParseSSEStream[cometapiChatResponsePayload](resp.Body, func(event cometapiChatResponsePayload) error {
-		if len(event.Choices) == 0 {
+	accumulatedToolCalls := make(map[int]map[string]any)
+	done, err := ParseSSEStream[map[string]interface{}](resp.Body, func(event map[string]interface{}) error {
+		choices, ok := event["choices"].([]interface{})
+		if !ok || len(choices) == 0 {
 			return nil
 		}
-		choice := event.Choices[0]
-		reasoningContent := choice.Delta.ReasoningContent
-		content := choice.Delta.Content
 
-		if reasoningContent != "" {
-			if err := sender(nil, &reasoningContent); err != nil {
+		firstChoice, ok := choices[0].(map[string]interface{})
+		if !ok {
+			return nil
+		}
+
+		delta, ok := firstChoice["delta"].(map[string]interface{})
+		if !ok {
+			return nil
+		}
+
+		accumulateToolCallDeltas(delta, accumulatedToolCalls)
+
+		reasoningContent, ok := delta["reasoning_content"].(string)
+		if ok && reasoningContent != "" {
+			if err = sender(nil, &reasoningContent); err != nil {
 				return err
 			}
 		}
 
-		if content != "" {
-			if err := sender(&content, nil); err != nil {
+		content, ok := delta["content"].(string)
+		if ok && content != "" {
+			if err = sender(&content, nil); err != nil {
 				return err
 			}
 		}
 
-		if choice.FinishReason != "" {
+		if finishReason, ok := firstChoice["finish_reason"].(string); ok && finishReason != "" {
 			sawTerminal = true
 		}
+
 		return nil
 	})
 	if err != nil {
@@ -356,6 +332,8 @@ func (c *CometAPIModel) ChatStreamlyWithSender(ctx context.Context, modelName st
 	if !done && !sawTerminal {
 		return fmt.Errorf("cometapi: stream ended before [DONE] or finish_reason")
 	}
+
+	setSortedToolCallsResult(chatModelConfig, accumulatedToolCalls)
 
 	endOfStream := "[DONE]"
 	if err := sender(&endOfStream, nil); err != nil {

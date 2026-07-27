@@ -63,48 +63,16 @@ func (g *GroqModel) endpoint(apiConfig *APIConfig, suffix string) (string, error
 	return fmt.Sprintf("%s/%s", baseURL, strings.TrimPrefix(suffix, "/")), nil
 }
 
-func groqChatPayload(modelName string, messages []Message, stream bool, chatModelConfig *ChatConfig) map[string]interface{} {
-	apiMessages := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		apiMessages[i] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
-	reqBody := map[string]interface{}{
-		"model":    modelName,
-		"messages": apiMessages,
-		"stream":   stream,
-	}
-
+func applyGroqReasoningRequestParams(reqBody map[string]any, modelName string, chatModelConfig *ChatConfig) {
 	modelLower := strings.ToLower(modelName)
 	if strings.Contains(modelLower, "gpt-oss") {
 		reqBody["include_reasoning"] = true
-		if chatModelConfig.Effort != nil {
-			reqBody["reasoning_effort"] = chatModelConfig.Effort
+		if chatModelConfig != nil && chatModelConfig.Effort != nil {
+			reqBody["reasoning_effort"] = *chatModelConfig.Effort
 		}
 	} else if strings.Contains(modelLower, "qwen") || strings.Contains(modelLower, "deepseek") {
 		reqBody["reasoning_format"] = "parsed"
 	}
-
-	if chatModelConfig != nil {
-		if chatModelConfig.MaxTokens != nil {
-			reqBody["max_tokens"] = *chatModelConfig.MaxTokens
-		}
-		if chatModelConfig.Temperature != nil {
-			reqBody["temperature"] = *chatModelConfig.Temperature
-		}
-		if chatModelConfig.TopP != nil {
-			reqBody["top_p"] = *chatModelConfig.TopP
-		}
-		if chatModelConfig.Stop != nil {
-			reqBody["stop"] = *chatModelConfig.Stop
-		}
-
-	}
-
-	return reqBody
 }
 
 type groqChatMessage struct {
@@ -141,7 +109,9 @@ func (g *GroqModel) ChatWithMessages(ctx context.Context, modelName string, mess
 		return nil, err
 	}
 
-	jsonData, err := json.Marshal(groqChatPayload(modelName, messages, false, chatModelConfig))
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, false)
+	applyGroqReasoningRequestParams(reqBody, modelName, chatModelConfig)
+	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
@@ -216,7 +186,9 @@ func (g *GroqModel) ChatStreamlyWithSender(ctx context.Context, modelName string
 		return err
 	}
 
-	jsonData, err := json.Marshal(groqChatPayload(modelName, messages, true, chatModelConfig))
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, true)
+	applyGroqReasoningRequestParams(reqBody, modelName, chatModelConfig)
+	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
@@ -244,30 +216,51 @@ func (g *GroqModel) ChatStreamlyWithSender(ctx context.Context, modelName string
 	}
 
 	sawTerminal := false
-	done, err := ParseSSEStream[groqChatResponse](resp.Body, func(event groqChatResponse) error {
-		if event.Error != nil {
-			return fmt.Errorf("groq: upstream stream error: %v", event.Error)
+	accumulatedToolCalls := make(map[int]map[string]interface{})
+	done, err := ParseSSEStream[map[string]interface{}](resp.Body, func(event map[string]interface{}) error {
+		common.Info(fmt.Sprintf("%v", event))
+
+		tokenUsage, found, usageErr := decodeOpenAICompatibleStreamUsage(event)
+		if usageErr != nil {
+			return usageErr
 		}
-		if len(event.Choices) == 0 {
+		if found {
+			applyStreamUsage(chatModelConfig, modelUsage, tokenUsage)
+		}
+
+		choices, ok := event["choices"].([]interface{})
+		if !ok || len(choices) == 0 {
 			return nil
 		}
 
-		choice := event.Choices[0]
-		reasoning := choice.Delta.ReasoningContent
-		if reasoning == "" {
-			reasoning = choice.Delta.Reasoning
+		firstChoice, ok := choices[0].(map[string]interface{})
+		if !ok {
+			return nil
 		}
-		if reasoning != "" {
-			if err := sender(nil, &reasoning); err != nil {
+
+		delta, ok := firstChoice["delta"].(map[string]interface{})
+		if !ok {
+			return nil
+		}
+
+		accumulateToolCallDeltas(delta, accumulatedToolCalls)
+
+		content, ok := delta["content"].(string)
+		if ok && content != "" {
+			if err := sender(&content, nil); err != nil {
 				return err
 			}
 		}
-		if choice.Delta.Content != "" {
-			if err := sender(&choice.Delta.Content, nil); err != nil {
+
+		reasoningContent, ok := delta["reasoning_content"].(string)
+		if ok && reasoningContent != "" {
+			if err := sender(nil, &reasoningContent); err != nil {
 				return err
 			}
 		}
-		if choice.FinishReason != "" || event.FinishReason != "" {
+
+		finishReason, ok := firstChoice["finish_reason"].(string)
+		if ok && finishReason != "" {
 			sawTerminal = true
 		}
 		return nil
@@ -276,9 +269,10 @@ func (g *GroqModel) ChatStreamlyWithSender(ctx context.Context, modelName string
 		return fmt.Errorf("failed to scan response body: %w", err)
 	}
 	if !done && !sawTerminal {
-		return fmt.Errorf("groq: stream ended before [DONE] or finish_reason")
+		return fmt.Errorf("deepseek: stream ended before [DONE] or finish_reason")
 	}
 
+	setSortedToolCallsResult(chatModelConfig, accumulatedToolCalls)
 	endOfStream := "[DONE]"
 	return sender(&endOfStream, nil)
 }
