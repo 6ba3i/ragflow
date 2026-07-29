@@ -337,6 +337,77 @@ async def _navigate_compiled(
     return {"answer": answer, "chunks": chunks, "doc_aggs": _doc_aggs(chunks)}
 
 
+async def navigate_compiled_sources(
+    tools,
+    topic: str,
+    *,
+    keywords: str = "",
+    doc_scope: list[str] | None = None,
+    kinds: set[str],
+    label: str = "Compiled navigation",
+    noun: str = "compiled structure",
+    source_budget: int = _MAX_EVIDENCE_CHUNKS,
+) -> dict:
+    """Resolve a compiled structure to source chunks without ordinary fallback.
+
+    The production RAG Agent uses this primitive after securing its baseline.
+    Keeping fallback outside the reader makes route outcomes auditable.
+    """
+    from rag.advanced_rag.harness.tools.search import _narrow_by_keywords
+
+    if not doc_scope:
+        return {"chunks": [], "selected_node_ids": [], "source_ids_requested": [], "missing_source_ids": [], "outcome": "unavailable"}
+
+    entities: list[dict] = []
+    relations: list[dict] = []
+    per_doc: list[tuple[str, list[dict]]] = []
+    for doc_id in doc_scope:
+        structure = await _load_compiled_structure(tools, doc_id, kinds)
+        if structure["entities"] or structure["relations"]:
+            per_doc.append((doc_id, structure["entities"]))
+            entities.extend(structure["entities"])
+            relations.extend(structure["relations"])
+    if not entities and not relations:
+        return {"chunks": [], "selected_node_ids": [], "source_ids_requested": [], "missing_source_ids": [], "outcome": "empty"}
+
+    _answer, relevant = await _ask_structure(tools, topic, entities, relations, noun, label)
+    selected_names = {str(name).strip().lower() for name in relevant if str(name).strip()}
+    path_or_hops = [
+        {"from": relation.get("from"), "to": relation.get("to"), "type": relation.get("type")}
+        for relation in relations
+        if str(relation.get("from") or "").strip().lower() in selected_names or str(relation.get("to") or "").strip().lower() in selected_names
+    ]
+    requested: list[str] = []
+    chunks: list[dict] = []
+    for doc_id, doc_entities in per_doc:
+        ids = _entity_chunk_ids(doc_entities, relevant)
+        remaining = max(0, source_budget - len(requested))
+        budgeted_ids = ids[:remaining]
+        requested.extend(budgeted_ids)
+        if budgeted_ids:
+            chunks.extend(await _load_chunks_by_ids(tools, doc_id, budgeted_ids))
+    loaded = {str(chunk.get("chunk_id") or chunk.get("id") or "") for chunk in chunks}
+    missing = [chunk_id for chunk_id in requested if chunk_id not in loaded]
+    narrowed = _narrow_by_keywords(chunks, keywords)
+    if narrowed:
+        chunks = narrowed
+    if not chunks:
+        outcome = "partial_lineage" if requested else "empty"
+    elif missing:
+        outcome = "partial_lineage"
+    else:
+        outcome = "success"
+    return {
+        "chunks": chunks,
+        "selected_node_ids": [str(name) for name in relevant],
+        "path_or_hops": path_or_hops,
+        "source_ids_requested": requested,
+        "source_ids_loaded": [chunk_id for chunk_id in requested if chunk_id in loaded],
+        "missing_source_ids": missing,
+        "outcome": outcome,
+    }
+
+
 async def catalog_navigate(tools, topic: str, keywords: str = "", doc_scope: list[str] | None = None) -> dict:
     """Answer from the documents' compiled catalog (tree / TOC, page index, RAPTOR).
 
@@ -450,6 +521,49 @@ async def dataset_navigate(tools, topic: str, keywords: str = "", doc_scope: lis
     return result
 
 
+async def route_dataset_documents(tools, query: str, *, top_k: int = _NAV_MAX_DOCS, kb_ids: set[str] | None = None) -> dict:
+    """Return an auditable dataset-nav document scope without retrieving chunks."""
+    from rag.advanced_rag.knowlege_compile.dataset_nav import search_dataset_nav
+
+    candidates: list[tuple[float, str]] = []
+    selected_nodes: list[str] = []
+    seen_docs: set[str] = set()
+    seen_nodes: set[str] = set()
+    errors: list[str] = []
+    for kb in getattr(tools, "kbs", []) or []:
+        if kb_ids and kb.id not in kb_ids:
+            continue
+        try:
+            hits = await search_dataset_nav(
+                kb.tenant_id,
+                kb.id,
+                query,
+                embd_mdl=getattr(tools, "embed_mdl", None),
+                top_k=_NAV_MAX_HITS_PER_KB,
+            )
+        except Exception as exc:
+            _LOG.exception("[Dataset navigation] nav-tree search failed for kb=%s", kb.id)
+            errors.append(type(exc).__name__)
+            continue
+        for hit in hits:
+            node_name = str(hit.get("name") or "")
+            if node_name and node_name not in seen_nodes:
+                seen_nodes.add(node_name)
+                selected_nodes.append(node_name)
+            score = float(hit.get("score") or 0.0)
+            for doc_id in hit.get("doc_ids") or []:
+                if doc_id and doc_id not in seen_docs:
+                    seen_docs.add(doc_id)
+                    candidates.append((score, doc_id))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return {
+        "doc_ids": [doc_id for _, doc_id in candidates[: max(0, top_k)]],
+        "selected_node_ids": selected_nodes,
+        "score_family": "dataset_nav_local",
+        "errors": errors,
+    }
+
+
 # ── Knowledge-graph exploration ─────────────────────────────────────────────
 #
 # Unlike catalog/mindmap (which read the merged "graph" JSON of one doc), the KG
@@ -481,7 +595,17 @@ async def _kg_scopes(tools, doc_scope: list[str] | None):
     return [(kb.id, kb.tenant_id, None) for kb in getattr(tools, "kbs", []) or []]
 
 
-async def _kg_search(tools, kb_id: str, tenant_id: str, doc_ids, kind: str, text: str = "", top_n: int = 8, extra: dict | None = None) -> list[dict]:
+async def _kg_search(
+    tools,
+    kb_id: str,
+    tenant_id: str,
+    doc_ids,
+    kind: str,
+    text: str = "",
+    top_n: int = 8,
+    extra: dict | None = None,
+    representation_kinds: set[str] | None = None,
+) -> list[dict]:
     """Search the compiled KG rows of one KB and return the raw field maps."""
     from common import settings
     from common.doc_store.doc_store_base import MatchTextExpr, OrderByExpr
@@ -489,6 +613,8 @@ async def _kg_search(tools, kb_id: str, tenant_id: str, doc_ids, kind: str, text
     from rag.nlp import search
 
     condition: dict = {"knowledge_graph_kwd": [kind]}
+    if representation_kinds:
+        condition["compilation_template_kind_kwd"] = sorted(representation_kinds)
     if doc_ids:
         condition["doc_id"] = list(doc_ids)
     if extra:
@@ -681,3 +807,133 @@ async def graph_explore(tools, query: str, keywords: str = "", doc_scope: list[s
     _LOG.info("[Graph exploration] Pulled %d source passage(s) behind those nodes, kept %d after keyword filtering.", before, len(chunks))
 
     return {"answer": answer, "chunks": chunks, "doc_aggs": _doc_aggs(chunks)}
+
+
+async def navigate_graph_sources(
+    tools,
+    query: str,
+    *,
+    keywords: str = "",
+    doc_scope: list[str] | None = None,
+    kb_ids: set[str] | None = None,
+    source_budget: int = _MAX_EVIDENCE_CHUNKS,
+) -> dict:
+    """Traverse the compiled knowledge graph and return only source evidence."""
+    from rag.advanced_rag.harness.tools.search import _narrow_by_keywords
+
+    scopes = await _kg_scopes(tools, doc_scope)
+    if kb_ids:
+        scopes = [scope for scope in scopes if scope[0] in kb_ids]
+    if not scopes:
+        return {"chunks": [], "selected_node_ids": [], "path_or_hops": [], "source_ids_requested": [], "missing_source_ids": [], "outcome": "unavailable"}
+
+    text = f"{query} {keywords}".strip()
+    entities: list[dict] = []
+    relations: list[dict] = []
+    ent_names: set[str] = set()
+    hop_paths: list[dict] = []
+
+    def add_entities(new: list[dict], scope_key: str = "") -> list[str]:
+        added: list[str] = []
+        for entity in new:
+            key = f"{scope_key}:{entity['name'].lower()}"
+            if key in ent_names:
+                continue
+            ent_names.add(key)
+            entities.append(entity)
+            added.append(entity["name"])
+        return added
+
+    for kb_id, tenant_id, doc_ids in scopes:
+        seed_rows = await _kg_search(
+            tools,
+            kb_id,
+            tenant_id,
+            doc_ids,
+            "entity",
+            text=text,
+            top_n=_KG_SEEDS,
+            representation_kinds={"knowledge_graph"},
+        )
+        seeds = [entity for entity in (_kg_parse_entity(row) for row in seed_rows.values()) if entity]
+        frontier = add_entities(seeds, kb_id)
+        for hop in range(_KG_HOPS):
+            if not frontier:
+                break
+            relation_rows: dict = {}
+            relation_rows.update(
+                await _kg_search(
+                    tools,
+                    kb_id,
+                    tenant_id,
+                    doc_ids,
+                    "relation",
+                    top_n=_KG_REL_LIMIT,
+                    extra={"from_entity_kwd": frontier},
+                    representation_kinds={"knowledge_graph"},
+                )
+            )
+            relation_rows.update(
+                await _kg_search(
+                    tools,
+                    kb_id,
+                    tenant_id,
+                    doc_ids,
+                    "relation",
+                    top_n=_KG_REL_LIMIT,
+                    extra={"to_entity_kwd": frontier},
+                    representation_kinds={"knowledge_graph"},
+                )
+            )
+            hop_relations = [relation for relation in (_kg_parse_relation(row) for row in relation_rows.values()) if relation]
+            relations.extend(hop_relations)
+            hop_paths.extend({"hop": hop + 1, "from": relation["from"], "to": relation["to"]} for relation in hop_relations)
+            neighbour_names = {name for relation in hop_relations for name in (relation["from"], relation["to"]) if name.lower() not in ent_names}
+            if not neighbour_names:
+                break
+            neighbour_rows = await _kg_search(
+                tools,
+                kb_id,
+                tenant_id,
+                doc_ids,
+                "entity",
+                text=" ".join(neighbour_names),
+                top_n=_KG_NEIGHBORS,
+                representation_kinds={"knowledge_graph"},
+            )
+            wanted = {name.lower() for name in neighbour_names}
+            neighbours = [entity for entity in (_kg_parse_entity(row) for row in neighbour_rows.values()) if entity and entity["name"].lower() in wanted]
+            frontier = add_entities(neighbours, kb_id)
+    if not entities and not relations:
+        return {"chunks": [], "selected_node_ids": [], "path_or_hops": [], "source_ids_requested": [], "missing_source_ids": [], "outcome": "empty"}
+
+    _answer, relevant = await _ask_structure(tools, query, entities, relations, "knowledge graph", "Graph exploration")
+    evidence = _collect_evidence_ids(entities, relations, relevant)
+    requested: list[str] = []
+    chunks: list[dict] = []
+    for doc_id, chunk_ids in evidence.items():
+        remaining = max(0, source_budget - len(requested))
+        budgeted_ids = chunk_ids[:remaining]
+        requested.extend(budgeted_ids)
+        if doc_id and budgeted_ids:
+            chunks.extend(await _load_chunks_by_ids(tools, doc_id, budgeted_ids))
+    loaded = {str(chunk.get("chunk_id") or chunk.get("id") or "") for chunk in chunks}
+    missing = [chunk_id for chunk_id in requested if chunk_id not in loaded]
+    narrowed = _narrow_by_keywords(chunks, keywords)
+    if narrowed:
+        chunks = narrowed
+    if not chunks:
+        outcome = "partial_lineage" if requested else "empty"
+    elif missing:
+        outcome = "partial_lineage"
+    else:
+        outcome = "success"
+    return {
+        "chunks": chunks,
+        "selected_node_ids": [str(name) for name in relevant],
+        "path_or_hops": hop_paths,
+        "source_ids_requested": requested,
+        "source_ids_loaded": [chunk_id for chunk_id in requested if chunk_id in loaded],
+        "missing_source_ids": missing,
+        "outcome": outcome,
+    }

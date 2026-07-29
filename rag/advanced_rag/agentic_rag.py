@@ -41,6 +41,18 @@ from rag.advanced_rag.agentic_retrieval import (
     should_plan,
     validate_plan,
 )
+from rag.advanced_rag.compilation_capabilities import (
+    AdditiveEvidenceAccumulator,
+    CapabilityAttempt,
+    CapabilityConfig,
+    CapabilityExecutionResult,
+    CapabilityManifest,
+    merge_capability_routes,
+    merge_ordinary_evidence,
+    select_capability_actions,
+    source_identity,
+)
+from rag.advanced_rag.compilation_capability_runtime import discover_capabilities, execute_capability_action
 from rag.advanced_rag.structured_output import StructuredOutputFailureReason
 from api.db.services.doc_metadata_service import DocMetadataService
 from api.db.services.document_service import DocumentService
@@ -220,6 +232,7 @@ class RAGTools:
         context_builder_config: EvidenceBundleConfig | None = None,
         agentic_retrieval_config: AgenticRetrievalConfig | None = None,
         agentic_refinement_config: AgenticRefinementConfig | None = None,
+        compilation_capability_config: CapabilityConfig | None = None,
     ):
         self.tenant_ids = tenant_ids
         self.chat_mdl = deepcopy(chat_mdl)
@@ -251,6 +264,10 @@ class RAGTools:
         self.context_builder_config = context_builder_config or EvidenceBundleConfig.from_env()
         self.agentic_retrieval_config = agentic_retrieval_config or AgenticRetrievalConfig.from_env()
         self.agentic_refinement_config = agentic_refinement_config or AgenticRefinementConfig.from_env()
+        self.compilation_capability_config = compilation_capability_config or CapabilityConfig.from_env()
+        self._capability_manifest_cache: CapabilityManifest | None = None
+        self._capability_attempt_keys: set[tuple[str, str, tuple[str, ...]]] = set()
+        self._capability_supplemental_used = 0
         # Accumulator for chunks/doc_aggs across tool calls within a turn —
         # populated by ``search_knowledge_bases`` and ``search_structured_data``
         # so the final answer can cite everything retrieved so far.
@@ -303,13 +320,242 @@ class RAGTools:
         )
         if self.trace:
             if result.bundle:
-                self.trace.add_context_builder_summary(result.bundle.summary(), stage=stage)
+                summary = result.bundle.summary()
+                self.trace.add_context_builder_summary(summary, stage=stage)
+                compilation_survival = summary.get("compilation_context_survival") or []
+                if compilation_survival:
+                    self.trace.add_capability_event("context_survival", {"stage": stage, "evidence": compilation_survival})
+                    self.trace.add_capability_event(
+                        "citation_mapping",
+                        {
+                            "stage": stage,
+                            "sources": [
+                                {
+                                    "chunk_id": item.get("chunk_id"),
+                                    "doc_id": item.get("doc_id"),
+                                    "route_occurrences": item.get("route_occurrences") or [],
+                                }
+                                for item in compilation_survival
+                                if item.get("selected_for_context")
+                            ],
+                        },
+                    )
             else:
                 self.trace.add_context_builder_summary(
                     {"enabled": False, "candidate_evidence_count": len(self.kbinfos.get("chunks", []))},
                     stage=stage,
                 )
         return result.kbinfos
+
+    async def _compilation_manifest(self) -> CapabilityManifest:
+        if self.compilation_capability_config.mode == "off":
+            return CapabilityManifest.build([])
+        if self._capability_manifest_cache is None:
+            self._capability_manifest_cache = await discover_capabilities(self.kbs)
+            if self.trace:
+                self.trace.add_capability_event("capability_manifest", self._capability_manifest_cache.to_dict())
+        return self._capability_manifest_cache
+
+    async def _run_compilation_capabilities(
+        self,
+        *,
+        question: str,
+        keywords: str,
+        kbinfos: dict[str, Any],
+        docid_scope: list[str] | None,
+        top_n: int,
+        similarity_threshold: float,
+        capability_plan: Any | None = None,
+    ) -> dict[str, Any]:
+        config = self.compilation_capability_config
+        if config.mode == "off":
+            return kbinfos
+        manifest = await self._compilation_manifest()
+        derived_scope = list(docid_scope or [])
+        if not derived_scope:
+            seen_docs: set[str] = set()
+            for chunk in kbinfos.get("chunks") or []:
+                doc_id = str(chunk.get("doc_id") or "") if isinstance(chunk, dict) else ""
+                if doc_id and doc_id not in seen_docs:
+                    seen_docs.add(doc_id)
+                    derived_scope.append(doc_id)
+                if len(derived_scope) >= 4:
+                    break
+        action_requests = [("primary", question)]
+        if capability_plan is not None:
+            action_requests = [
+                (str(subquery.facet_id or "primary"), str(subquery.query or question))
+                for subquery in getattr(capability_plan, "subqueries", ())
+                if str(getattr(subquery, "query", "") or "").strip()
+            ] or action_requests
+        actions = []
+        skipped: list[dict[str, Any]] = []
+        for facet_id, action_query in action_requests:
+            remaining_actions = config.max_actions_per_turn - len(actions)
+            if remaining_actions <= 0:
+                skipped.append({"facet_id": facet_id, "query": action_query, "reason": "action_budget"})
+                continue
+            selected, request_skipped = select_capability_actions(
+                manifest,
+                action_query,
+                config=replace(config, max_actions_per_turn=remaining_actions),
+                facet_id=facet_id,
+                doc_scope=derived_scope,
+                explicit_document_scope=bool(docid_scope),
+            )
+            actions.extend(selected)
+            skipped.extend({**item, "facet_id": facet_id, "query": action_query} for item in request_skipped)
+        fresh_actions = []
+        for action in actions:
+            if action.dedupe_key() in self._capability_attempt_keys:
+                skipped.append({"capability_id": action.capability_id, "action_id": action.action_id, "reason": "duplicate_turn_attempt"})
+                continue
+            self._capability_attempt_keys.add(action.dedupe_key())
+            fresh_actions.append(action)
+        remaining_source_budget = max(0, config.supplemental_evidence_units - self._capability_supplemental_used)
+        budgeted_actions = []
+        for index, action in enumerate(fresh_actions):
+            actions_left = len(fresh_actions) - index
+            source_budget = (remaining_source_budget + actions_left - 1) // actions_left if actions_left else 0
+            if source_budget <= 0:
+                skipped.append({"capability_id": action.capability_id, "action_id": action.action_id, "reason": "global_source_budget"})
+                continue
+            budgeted_actions.append(replace(action, source_budget=source_budget))
+            remaining_source_budget -= source_budget
+        fresh_actions = budgeted_actions
+        if self.trace:
+            self.trace.add_capability_event(
+                "capability_selection",
+                {
+                    "availability_fingerprint": manifest.availability_fingerprint,
+                    "selected": [action.to_dict() for action in fresh_actions],
+                    "skipped": skipped,
+                    "global_source_budget_remaining": max(0, config.supplemental_evidence_units - self._capability_supplemental_used),
+                },
+            )
+        if config.mode == "diagnostic" or not fresh_actions:
+            return kbinfos
+
+        entries = {entry.capability_id: entry for entry in manifest.entries}
+
+        async def ordinary_retrieve(query: str, scope: list[str], source_budget: int) -> dict[str, Any]:
+            result = await settings.retriever.retrieval(
+                RetrievalQueryBundle.build(query),
+                self.embed_mdl,
+                self.tenant_ids,
+                self.kb_ids,
+                1,
+                max(1, min(source_budget, top_n)),
+                similarity_threshold,
+                vector_similarity_weight=0.7 if self.embed_mdl else 0.0,
+                aggs=True,
+                doc_ids=scope,
+                rank_feature=label_question(question, self.kbs),
+            )
+            result["chunks"] = settings.retriever.retrieval_by_children(result.get("chunks") or [], self.tenant_ids)
+            return result
+
+        semaphore = asyncio.Semaphore(config.max_concurrent_actions)
+
+        async def run_one(action):
+            entry = entries[action.capability_id]
+            async with semaphore:
+                try:
+                    return await asyncio.wait_for(
+                        execute_capability_action(self, entry, action, ordinary_retrieve=ordinary_retrieve),
+                        timeout=action.latency_budget_ms / 1000.0,
+                    )
+                except TimeoutError:
+                    return CapabilityExecutionResult(
+                        attempt=CapabilityAttempt(
+                            attempt_id=f"cap-attempt-{uuid.uuid4().hex[:12]}",
+                            action_id=action.action_id,
+                            capability_id=action.capability_id,
+                            query=action.query,
+                            outcome="cancelled",
+                            fallback="ordinary_baseline",
+                            latency_ms=float(action.latency_budget_ms),
+                            error_code="deadline_exceeded",
+                        )
+                    )
+
+        results = await asyncio.gather(*(run_one(action) for action in fresh_actions))
+        remaining = max(0, config.supplemental_evidence_units - self._capability_supplemental_used)
+        accumulator = AdditiveEvidenceAccumulator(
+            baseline_chunks=[chunk for chunk in kbinfos.get("chunks") or [] if isinstance(chunk, dict)],
+            supplemental_limit=remaining,
+            baseline_floor=config.protected_baseline_floor,
+        )
+        for result in results:
+            attempt = result.attempt
+            if self.trace:
+                self.trace.add_capability_event("capability_attempt", attempt.to_dict())
+                self.trace.add_capability_event(
+                    "capability_navigation",
+                    {
+                        "attempt_id": attempt.attempt_id,
+                        "capability_id": attempt.capability_id,
+                        "selected_node_ids": list(attempt.selected_node_ids),
+                        "selected_doc_ids": list(attempt.selected_doc_ids),
+                        "structural_path_or_hops": list(attempt.structural_path_or_hops),
+                        "score_family": attempt.structural_score_family,
+                    },
+                )
+                self.trace.add_capability_event(
+                    "capability_backprojection",
+                    {
+                        "attempt_id": attempt.attempt_id,
+                        "source_ids_requested": list(attempt.source_ids_requested),
+                        "source_ids_loaded": list(attempt.source_ids_loaded),
+                        "missing_source_ids": sorted(set(attempt.source_ids_requested).difference(attempt.source_ids_loaded)),
+                        "source_lineage_complete": attempt.source_lineage_complete,
+                    },
+                )
+            if config.mode == "active":
+                for evidence in result.evidence:
+                    accumulator.add(evidence)
+        if config.mode != "active":
+            return kbinfos
+        admitted_any = any(decision.get("admitted") is True for decision in accumulator.decisions)
+        if not admitted_any:
+            if self.trace:
+                self.trace.add_capability_event(
+                    "evidence_merge",
+                    {
+                        "baseline_count": len(kbinfos.get("chunks") or []),
+                        "merged_count": len(kbinfos.get("chunks") or []),
+                        "supplemental_admitted": 0,
+                        "global_supplemental_used": self._capability_supplemental_used,
+                        "decisions": accumulator.decisions,
+                        "reason": "no_source_evidence_admitted",
+                    },
+                )
+            return kbinfos
+        self._capability_supplemental_used += accumulator.supplemental_admitted
+        merged = dict(kbinfos)
+        merged["chunks"] = accumulator.chunks
+        merged["total"] = len(accumulator.chunks)
+        doc_aggs = list(kbinfos.get("doc_aggs") or [])
+        aggregated_doc_ids = {str(item.get("doc_id") or "") for item in doc_aggs if isinstance(item, dict)}
+        for chunk in accumulator.chunks:
+            doc_id = str(chunk.get("doc_id") or "")
+            if not doc_id or doc_id in aggregated_doc_ids:
+                continue
+            aggregated_doc_ids.add(doc_id)
+            doc_aggs.append({"doc_id": doc_id, "doc_name": chunk.get("docnm_kwd") or chunk.get("document_name") or ""})
+        merged["doc_aggs"] = doc_aggs
+        if self.trace:
+            self.trace.add_capability_event(
+                "evidence_merge",
+                {
+                    "baseline_count": len(kbinfos.get("chunks") or []),
+                    "merged_count": len(accumulator.chunks),
+                    "supplemental_admitted": accumulator.supplemental_admitted,
+                    "global_supplemental_used": self._capability_supplemental_used,
+                    "decisions": accumulator.decisions,
+                },
+            )
+        return merged
 
     def _prompt_start_idx(self, start_idx: int) -> int:
         return 0 if self.context_builder_config.enabled else start_idx
@@ -1461,6 +1707,7 @@ class RAGTools:
         docid_scope: list[str] | None,
         top_n: int,
         tool_deadline: float,
+        capability_manifest: CapabilityManifest | None = None,
     ) -> Any | None:
         cfg = self.agentic_retrieval_config
         if not cfg.enabled or cfg.mode == "off" or not self.embed_mdl or not self.kb_ids:
@@ -1492,6 +1739,8 @@ class RAGTools:
                 self.trace.add_agentic_retrieval_event("diagnostic_trigger_only", trigger_payload)
             return None
 
+        if capability_manifest is None and self.compilation_capability_config.mode != "off":
+            capability_manifest = await self._compilation_manifest()
         planner_input = build_planner_input(
             question,
             history=[],
@@ -1501,6 +1750,7 @@ class RAGTools:
             trigger=trigger,
             tenant_ids=self.tenant_ids,
             metadata_filters=self.meta_data_filter,
+            capability_manifest=capability_manifest.to_dict() if capability_manifest is not None else None,
         )
         return await self._coordinated_plan(planner_input, tool_deadline=tool_deadline)
 
@@ -1820,6 +2070,7 @@ class RAGTools:
                     logging.warning("search_knowledge_bases: every supplied doc ID was unknown; falling back to unfiltered retrieval")
                     docid_scope = None
 
+            capability_manifest = await self._compilation_manifest() if self.compilation_capability_config.mode != "off" else None
             fingerprint_scope = type("RAGAgentPlannerScope", (), {"kb_ids": self.kb_ids})()
             fingerprint_trigger = should_plan(
                 question,
@@ -1839,6 +2090,7 @@ class RAGTools:
                 trigger=fingerprint_trigger,
                 tenant_ids=self.tenant_ids,
                 metadata_filters=self.meta_data_filter,
+                capability_manifest=capability_manifest.to_dict() if capability_manifest is not None else None,
             )
             search_fingerprint = self._search_fingerprint(
                 planner_input=fingerprint_input,
@@ -1855,6 +2107,7 @@ class RAGTools:
                     docid_scope=docid_scope,
                     top_n=top_n,
                     tool_deadline=tool_deadline,
+                    capability_manifest=capability_manifest,
                 )
             await self._agentic_search_lock.acquire()
             lock_acquired = True
@@ -1942,34 +2195,46 @@ class RAGTools:
             vector_weight = variant_knobs["vector_similarity_weight"]
             start_idx = len(self.kbinfos.get("chunks", []))
             retrieval_call_id = None
-            embd_mdl = None
+            embd_mdl = self.embed_mdl if (variant_knobs["using_embedding"] or fusion_config.enabled) else None
+            supplemental_ordinary = None
             if use_refinement_result:
-                kbinfos = deepcopy(refinement_result.kbinfos)
+                supplemental_ordinary = deepcopy(refinement_result.kbinfos)
                 allowed_refinement_keys = {_refinement_storage_identity(chunk) for chunk in agentic_result.kbinfos.get("chunks", []) if isinstance(chunk, dict)}
                 allowed_refinement_keys.update(_refinement_storage_identity(chunk) for chunk in refinement_result.accepted_chunks if isinstance(chunk, dict))
-                kbinfos["chunks"] = [chunk for chunk in kbinfos.get("chunks", []) if isinstance(chunk, dict) and _refinement_storage_identity(chunk) in allowed_refinement_keys]
-                selected_doc_ids = {chunk.get("doc_id") for chunk in kbinfos["chunks"] if chunk.get("doc_id")}
+                supplemental_ordinary["chunks"] = [
+                    chunk for chunk in supplemental_ordinary.get("chunks", []) if isinstance(chunk, dict) and _refinement_storage_identity(chunk) in allowed_refinement_keys
+                ]
+                selected_doc_ids = {chunk.get("doc_id") for chunk in supplemental_ordinary["chunks"] if chunk.get("doc_id")}
                 selected_doc_names = {
                     chunk.get("docnm_kwd") or chunk.get("document_name") or chunk.get("title")
-                    for chunk in kbinfos["chunks"]
+                    for chunk in supplemental_ordinary["chunks"]
                     if chunk.get("docnm_kwd") or chunk.get("document_name") or chunk.get("title")
                 }
-                if isinstance(kbinfos.get("doc_aggs"), list):
-                    kbinfos["doc_aggs"] = [
+                if isinstance(supplemental_ordinary.get("doc_aggs"), list):
+                    supplemental_ordinary["doc_aggs"] = [
                         doc_agg
-                        for doc_agg in kbinfos["doc_aggs"]
+                        for doc_agg in supplemental_ordinary["doc_aggs"]
                         if isinstance(doc_agg, dict)
                         and (doc_agg.get("doc_id") in selected_doc_ids or (doc_agg.get("doc_name") or doc_agg.get("docnm_kwd") or doc_agg.get("document_name")) in selected_doc_names)
                     ]
-                kbinfos["total"] = len(kbinfos["chunks"])
+                supplemental_ordinary["total"] = len(supplemental_ordinary["chunks"])
             elif use_agentic_result:
                 assert agentic_result is not None
-                kbinfos = agentic_result.kbinfos
+                supplemental_ordinary = agentic_result.kbinfos
+
+            # Capability mode introduces an additive evidence contract.  Keep
+            # the existing no-capability path byte-for-byte equivalent so an
+            # off manifest cannot change normal Agentic Search behavior.
+            additive_capabilities_enabled = self.compilation_capability_config.mode != "off"
+            if not additive_capabilities_enabled and supplemental_ordinary is not None:
+                kbinfos = supplemental_ordinary
             else:
+                # Ordinary retrieval is the invariant baseline whenever the
+                # capability system is enabled. Phase 5/6 ordinary lanes are
+                # accumulated after it and can never replace it.
                 raise_if_local_work_deadline_exhausted()
-                embd_mdl = self.embed_mdl if (variant_knobs["using_embedding"] or fusion_config.enabled) else None
                 retrieval_started_ms = _now_ms()
-                kbinfos = await settings.retriever.retrieval(
+                baseline_kbinfos = await settings.retriever.retrieval(
                     query_bundle,
                     embd_mdl,
                     self.tenant_ids,
@@ -1983,7 +2248,8 @@ class RAGTools:
                     rank_feature=label_question(question, self.kbs),
                 )
                 raise_if_local_work_deadline_exhausted()
-                kbinfos["chunks"] = settings.retriever.retrieval_by_children(kbinfos["chunks"], self.tenant_ids)
+                baseline_kbinfos["chunks"] = settings.retriever.retrieval_by_children(baseline_kbinfos.get("chunks") or [], self.tenant_ids)
+                kbinfos = merge_ordinary_evidence(baseline_kbinfos, supplemental_ordinary)
                 if self.trace:
                     retrieval_call_id = self.trace.add_retrieval_call(
                         mode=mode,
@@ -1991,8 +2257,8 @@ class RAGTools:
                         keywords=keywords,
                         docid_scope=docid_scope,
                         metadata_filters=self.meta_data_filter,
-                        chunks=kbinfos.get("chunks", []),
-                        doc_aggs=kbinfos.get("doc_aggs", []),
+                        chunks=baseline_kbinfos.get("chunks", []),
+                        doc_aggs=baseline_kbinfos.get("doc_aggs", []),
                         tool_call_id=tool_call_id,
                         used_embedding=bool(embd_mdl),
                         used_web=False,
@@ -2009,19 +2275,38 @@ class RAGTools:
                             keywords,
                             docid_scope,
                             using_embedding,
-                            kbinfos.get("chunks", []),
-                            kbinfos,
+                            baseline_kbinfos.get("chunks", []),
+                            baseline_kbinfos,
                             fusion_config,
                             bool(embd_mdl),
                         ),
                     )
                     self.trace.add_evidence_from_chunks(
-                        kbinfos.get("chunks", []),
+                        baseline_kbinfos.get("chunks", []),
                         source_type="kb",
                         retrieval_call_id=retrieval_call_id,
                         tool_call_id=tool_call_id,
                         start_citation_index=start_idx,
                     )
+                    self.trace.add_capability_event(
+                        "evidence_merge",
+                        {
+                            "lane": "ordinary_phase5",
+                            "baseline_count": len(baseline_kbinfos.get("chunks") or []),
+                            "ordinary_supplemental_count": len((supplemental_ordinary or {}).get("chunks") or []),
+                            "merged_count": len(kbinfos.get("chunks") or []),
+                        },
+                    )
+
+                kbinfos = await self._run_compilation_capabilities(
+                    question=question,
+                    keywords=keywords,
+                    kbinfos=kbinfos,
+                    docid_scope=docid_scope,
+                    top_n=top_n,
+                    similarity_threshold=similarity_threshold,
+                    capability_plan=agentic_result.plan if agentic_result is not None else None,
+                )
 
             appended_refinement_evidence_count = 0
             raise_if_local_work_deadline_exhausted()
@@ -2029,6 +2314,30 @@ class RAGTools:
                 if self.context_builder_config.enabled:
                     mark_chunks_source_type(kbinfos.get("chunks", []), "kb")
                 chunks_to_append = list(kbinfos.get("chunks", []))
+                accumulated_by_identity = {
+                    source_identity(chunk): chunk for chunk in self.kbinfos.get("chunks", []) if isinstance(chunk, dict)
+                }
+                provenance_deduped_chunks = []
+                for chunk in chunks_to_append:
+                    if not isinstance(chunk, dict):
+                        provenance_deduped_chunks.append(chunk)
+                        continue
+                    existing = accumulated_by_identity.get(source_identity(chunk))
+                    if existing is not None and merge_capability_routes(existing, chunk):
+                        if self.trace:
+                            self.trace.add_capability_event(
+                                "evidence_merge",
+                                {
+                                    "identity": list(source_identity(chunk)),
+                                    "admitted": True,
+                                    "reason": "duplicate_accumulated_route_union",
+                                    "existing_accumulated_source": True,
+                                },
+                            )
+                        continue
+                    provenance_deduped_chunks.append(chunk)
+                    accumulated_by_identity[source_identity(chunk)] = chunk
+                chunks_to_append = provenance_deduped_chunks
                 if use_refinement_result:
                     existing_keys = {_refinement_storage_identity(chunk) for chunk in self.kbinfos.get("chunks", []) if isinstance(chunk, dict)}
                     deduped_chunks = []

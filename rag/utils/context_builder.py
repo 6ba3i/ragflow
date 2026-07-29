@@ -161,6 +161,7 @@ class EvidenceBundle:
         ]
         estimated_tokens = sum(_estimate_tokens(r.content) for r in self.selected)
         agentic_lineage = _agentic_lineage_summary(self.records, self.selected, self.rejected)
+        compilation_survival = _compilation_survival_summary(self.records, self.selected)
         provenance_counts = _score_provenance_counts(self.records)
         candidate_observations = _candidate_trace_observations(self.records, self.selected, self.rejected)
         candidate_observation_overflow_count = max(0, len(self.records) - len(candidate_observations))
@@ -236,6 +237,8 @@ class EvidenceBundle:
         }
         if agentic_lineage:
             summary["agentic_lineage"] = agentic_lineage
+        if compilation_survival:
+            summary["compilation_context_survival"] = compilation_survival
         return summary
 
 
@@ -399,6 +402,9 @@ def evidence_records_from_kbinfos(
         agentic_metadata = chunk.get("_ragflow_agentic_retrieval")
         if isinstance(agentic_metadata, dict):
             metadata["agentic_retrieval"] = dict(agentic_metadata)
+        compilation_metadata = chunk.get("_ragflow_compilation")
+        if isinstance(compilation_metadata, dict):
+            metadata["compilation"] = dict(compilation_metadata)
         for lineage_key in (
             "plan_id",
             "facet_id",
@@ -508,6 +514,7 @@ def build_context_bundle(
     for record in ordered:
         dup_key = _dedupe_key(record)
         source_key = _source_group_key(record)
+        protected_baseline = _has_protected_retrieval_lineage(record)
         if dup_key in seen:
             _reject(record, "duplicate", rejected)
             continue
@@ -520,13 +527,13 @@ def build_context_bundle(
             source_limit,
             query_features,
         )
-        if record_source_limit is not None and record.source_type == "kb" and per_source[source_key] >= record_source_limit:
+        if not protected_baseline and record_source_limit is not None and record.source_type == "kb" and per_source[source_key] >= record_source_limit:
             _reject(record, "max_chunks_per_source", rejected)
             continue
         if config.max_chunks is not None and len(selected) >= config.max_chunks:
             _reject(record, "max_chunks", rejected)
             continue
-        if record.source_type == "kb" and config.max_chunks_per_doc and record.doc_id:
+        if not protected_baseline and record.source_type == "kb" and config.max_chunks_per_doc and record.doc_id:
             doc_limit = _doc_limit_for_record(record, config, primary_doc_ids)
             if per_doc[record.doc_id] >= doc_limit:
                 _reject(record, "max_chunks_per_doc", rejected)
@@ -752,6 +759,9 @@ def _low_relevance_bypass_reasons(record: EvidenceRecord, rank: int, config: Evi
 
 def _has_protected_retrieval_lineage(record: EvidenceRecord) -> bool:
     chunk = record.chunk if isinstance(record.chunk, dict) else {}
+    compilation = record.metadata.get("compilation")
+    if isinstance(compilation, dict) and compilation.get("baseline_protected") is True:
+        return True
     fusion = chunk.get("_ragflow_fusion")
     if isinstance(fusion, dict):
         lane_ranks = fusion.get("lane_ranks")
@@ -1253,6 +1263,28 @@ def _agentic_lineage_summary(records: list[EvidenceRecord], selected: list[Evide
                 item[key] = lineage_value(record, key)
         lineage.append(item)
     return lineage
+
+
+def _compilation_survival_summary(records: list[EvidenceRecord], selected: list[EvidenceRecord]) -> list[dict[str, Any]]:
+    selected_ids = {id(record) for record in selected}
+    items: list[dict[str, Any]] = []
+    for record in records:
+        compilation = record.metadata.get("compilation")
+        if not isinstance(compilation, dict):
+            continue
+        items.append(
+            {
+                "chunk_id": record.chunk_id,
+                "doc_id": record.doc_id,
+                "selected_for_context": id(record) in selected_ids,
+                "rejection_reason": None if id(record) in selected_ids else record.rejection_reason,
+                "baseline_protected": bool(compilation.get("baseline_protected") or record.protection_reason),
+                "route_occurrences": compilation.get("route_occurrences") or [],
+            }
+        )
+        if len(items) >= _MAX_TRACE_IDS:
+            break
+    return items
 
 
 def _record_sort_key(record: EvidenceRecord, _config: EvidenceBundleConfig) -> tuple[Any, ...]:

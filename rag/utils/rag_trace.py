@@ -224,6 +224,7 @@ class RagTraceCollector:
             "agentic_retrieval": [],
             "agentic_planning": [],
             "agentic_refinement": [],
+            "capability_events": [],
             "llm": {},
             "latency_ms": {},
             "token_usage": {},
@@ -425,6 +426,9 @@ class RagTraceCollector:
                 "rejection_reason": chunk.get("rejection_reason") or agentic.get("rejection_reason"),
                 "support_status": chunk.get("support_status") or agentic.get("support_status", support_status),
             }
+            compilation = chunk.get("_ragflow_compilation")
+            if isinstance(compilation, dict):
+                entry["compilation"] = compilation
             followup_id = chunk.get("followup_id") or agentic.get("followup_id")
             if followup_id is not None:
                 entry["followup_id"] = followup_id
@@ -436,6 +440,7 @@ class RagTraceCollector:
                         "evidence_id": evidence_id,
                         "chunk_id": entry["chunk_id"],
                         "doc_id": entry["doc_id"],
+                        "route_occurrences": (compilation or {}).get("route_occurrences", []) if isinstance(compilation, dict) else [],
                         "final_reference_position": None,
                     }
                 )
@@ -455,6 +460,13 @@ class RagTraceCollector:
         record = dict(payload or {})
         record["stage"] = stage
         self.data["agentic_retrieval"].append(sanitize_for_trace(record))
+
+    def add_capability_event(self, event: str, payload: dict[str, Any] | None = None) -> None:
+        if not self.enabled:
+            return
+        record = dict(payload or {})
+        record["event"] = event
+        self.data["capability_events"].append(sanitize_for_trace(record))
 
     def add_agentic_planner_event(self, **fields: Any) -> None:
         if not self.enabled:

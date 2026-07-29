@@ -465,13 +465,14 @@ def build_planner_input(
     trigger: PlanningTrigger | None = None,
     tenant_ids: list[str] | None = None,
     metadata_filters: Any = None,
+    capability_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     cfg = cfg or AgenticRetrievalConfig()
     doc_ids = list(attachments or [])
     kb_ids = list(getattr(dialog, "kb_ids", []) or [])
     history_summary = _summarize_history(history or [])
     plan_id = f"plan-{uuid.uuid4().hex[:12]}"
-    return {
+    result = {
         "plan_id": plan_id,
         "original_question": question,
         "question": question,
@@ -502,6 +503,9 @@ def build_planner_input(
         "clauses": _split_clauses(question),
         "features": _question_features(question),
     }
+    if capability_manifest is not None:
+        result["capability_manifest"] = capability_manifest
+    return result
 
 
 def build_deterministic_plan(
@@ -646,6 +650,10 @@ def build_llm_planner_prompt(
         },
         "output_schema": canonical_json_schema(PlannerContentV2),
     }
+    if "capability_manifest" in planner_input:
+        # Availability is advisory. Capability actions use a separate fixed
+        # application schema and never replace ordinary subqueries.
+        prompt_input["capability_manifest"] = planner_input["capability_manifest"]
     system_prompt = (
         "You are a retrieval planning helper for RAGFlow.\n"
         "You do not answer the user.\n"
@@ -1532,6 +1540,7 @@ def build_sufficiency_judge_prompt(
             "document": str(chunk.get("docnm_kwd") or chunk.get("document_name") or chunk.get("title") or "")[:200],
             "text": re.sub(r"\s+", " ", str(chunk.get("content_with_weight") or chunk.get("content") or "")).strip()[:800],
             "facet_ids": _chunk_facet_ids(chunk),
+            "capability": {key: value for key, value in (chunk.get("_ragflow_compilation") or {}).items() if key in {"source_grounded", "citation_mode", "route_occurrences"}},
         }
         for chunk in ((kbinfos or {}).get("chunks") or [])[:20]
         if isinstance(chunk, dict)

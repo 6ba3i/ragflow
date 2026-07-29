@@ -164,7 +164,14 @@ async def _store_search(
         [kb_id],
     )
     rows = settings.docStoreConn.get_fields(res, fields) if res else {}
-    return list(rows.values())
+    normalized: list[dict] = []
+    for row_id, row in rows.items():
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        item.setdefault("id", str(row_id))
+        normalized.append(item)
+    return normalized
 
 
 async def _store_knn(
@@ -618,6 +625,9 @@ async def upsert_dataset_nav_doc(
         if existing_doc:
             old_payload = json.loads(existing_doc.get("content_with_weight") or "{}")
             if old_payload.get("description") == summary:
+                if vec_dim and _vector_len(existing_doc.get(_vec_field(vec_dim))) != vec_dim:
+                    existing_doc[_vec_field(vec_dim)] = doc_embedding
+                    await _store_upsert(tenant_id, kb_id, existing_doc)
                 return
             await _remove_dataset_nav_doc_locked(tenant_id, kb_id, doc_id)
 
@@ -1053,6 +1063,10 @@ async def search_dataset_nav(
                 logging.exception("search_dataset_nav: knn failed for kb=%s", kb_id)
                 rows_with_scores = []
 
+    # Some stores can return rows for a KNN query even when those rows have no
+    # vector.  Zero-score pseudo-hits are not a usable route and must not hide
+    # the lexical fallback.
+    rows_with_scores = [(row, score) for row, score in rows_with_scores if score > 0]
     if not rows_with_scores:
         fields = ["content_with_weight", "name", "doc_id", "type_kwd", "doc_ids_kwd", "doc_count_int"]
         try:
@@ -1093,6 +1107,61 @@ async def search_dataset_nav(
             }
         )
     return out
+
+
+async def repair_dataset_nav_vectors(
+    tenant_id: str,
+    kb_id: str,
+    embd_mdl,
+    *,
+    limit: int = 10000,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """Explicitly backfill missing vectors on existing dataset-nav rows.
+
+    This administrative repair is intentionally separate from query-time
+    navigation.  It does not rebuild the hierarchy or change summaries.
+    """
+    if embd_mdl is None:
+        raise ValueError("embd_mdl is required")
+    fields = ["id", "content_with_weight", "name", "doc_id", "type_kwd", "doc_ids_kwd", "doc_count_int", "parent_kwd", "depth_int", "available_int", "kb_id", "compile_kwd"]
+    rows = await _store_search(tenant_id, kb_id, {"compile_kwd": [_COMPILE_KWD]}, fields, limit=max(1, limit))
+    stats = {"scanned": len(rows), "missing": 0, "repaired": 0, "failed": 0}
+    for row in rows:
+        try:
+            payload = json.loads(row.get("content_with_weight") or "{}")
+        except Exception:
+            payload = {}
+        description = str(payload.get("description") or "").strip()
+        if not description:
+            continue
+        try:
+            vector = await _embed(embd_mdl, description)
+        except Exception:
+            logging.exception("repair_dataset_nav_vectors: embedding failed for row=%s", row.get("id"))
+            stats["failed"] += 1
+            continue
+        dimension = _vector_len(vector)
+        if not dimension:
+            stats["failed"] += 1
+            continue
+        vector_field = _vec_field(dimension)
+        stored = await _store_get(tenant_id, kb_id, str(row.get("id") or "")) if row.get("id") else row
+        if stored and _vector_len(stored.get(vector_field)) == dimension:
+            continue
+        stats["missing"] += 1
+        if dry_run:
+            continue
+        target = dict(stored or row)
+        target[vector_field] = vector
+        try:
+            await _store_upsert(tenant_id, kb_id, target)
+        except Exception:
+            logging.exception("repair_dataset_nav_vectors: update failed for row=%s", row.get("id"))
+            stats["failed"] += 1
+            continue
+        stats["repaired"] += 1
+    return stats
 
 
 def _as_str_list(value) -> list[str]:
