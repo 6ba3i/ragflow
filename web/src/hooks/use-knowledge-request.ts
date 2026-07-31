@@ -1,9 +1,7 @@
 import { useHandleFilterSubmit } from '@/components/list-filter-bar/use-handle-filter-submit';
 import message from '@/components/ui/message';
-import { ParseType } from '@/constants/knowledge';
+import { GenerateType, ParseType } from '@/constants/knowledge';
 import { ResponsePostType, ResponseType } from '@/interfaces/database/base';
-import { GenerateType } from '@/pages/dataset/dataset/generate-button/constants';
-import { DatasetGenerateKeys } from '@/pages/dataset/dataset/generate-button/hook';
 import {
   IArtifact,
   IArtifactAlteration,
@@ -30,6 +28,7 @@ import {
 import i18n from '@/locales/config';
 import kbService, {
   clearWiki,
+  deleteArtifactsStructure,
   deleteKnowledgeGraph,
   getArtifactsAlteration,
   getArtifactGraph,
@@ -72,6 +71,7 @@ import {
   isPipelineParserConfig,
 } from './parser-config-utils';
 import { useSetPaginationParams } from './route-hook';
+import { DatasetGenerateKeys } from './use-dataset-generate';
 
 export const enum KnowledgeApiAction {
   FetchKnowledgeListByPage = 'fetchKnowledgeListByPage',
@@ -95,6 +95,7 @@ export const enum KnowledgeApiAction {
   RemoveKnowledgeGraph = 'removeKnowledgeGraph',
   ClearWiki = 'clearWiki',
   FetchDatasetStructure = 'fetchDatasetStructure',
+  DeleteDatasetStructure = 'deleteDatasetStructure',
   FetchArtifactAlteration = 'fetchArtifactAlteration',
   RunArtifactIndex = 'runArtifactIndex',
 }
@@ -448,20 +449,20 @@ export const ArtifactTopicKeys = {
 };
 
 export const ArtifactAlterationKeys = {
-  detail: (datasetId: string) =>
-    [KnowledgeApiAction.FetchArtifactAlteration, datasetId] as const,
+  detail: (datasetId: string, kind: string) =>
+    [KnowledgeApiAction.FetchArtifactAlteration, datasetId, kind] as const,
 };
 
-export function useFetchArtifactAlteration() {
+export function useFetchArtifactAlteration(kind: string) {
   const knowledgeBaseId = useKnowledgeBaseId();
 
   const { data, isFetching: loading } = useQuery<IArtifactAlteration | null>({
-    queryKey: ArtifactAlterationKeys.detail(knowledgeBaseId),
+    queryKey: ArtifactAlterationKeys.detail(knowledgeBaseId, kind),
     initialData: null,
-    enabled: !!knowledgeBaseId,
+    enabled: !!knowledgeBaseId && !!kind,
     gcTime: 0,
     queryFn: async () => {
-      const { data } = await getArtifactsAlteration(knowledgeBaseId);
+      const { data } = await getArtifactsAlteration(knowledgeBaseId, kind);
       return data?.data ?? null;
     },
   });
@@ -833,6 +834,31 @@ export function useFetchDatasetStructureGraph(kind: string, keywords?: string) {
   return { data, loading };
 }
 
+export const useDeleteDatasetStructure = () => {
+  const knowledgeBaseId = useKnowledgeBaseId();
+  const queryClient = useQueryClient();
+
+  const {
+    data,
+    isPending: loading,
+    mutateAsync,
+  } = useMutation({
+    mutationKey: [KnowledgeApiAction.DeleteDatasetStructure],
+    mutationFn: async (kind: string) => {
+      const { data } = await deleteArtifactsStructure(knowledgeBaseId, kind);
+      if (data?.code === 0) {
+        message.success(i18n.t('message.deleted'));
+        queryClient.invalidateQueries({
+          queryKey: DatasetStructureKeys.all(knowledgeBaseId),
+        });
+      }
+      return data?.code;
+    },
+  });
+
+  return { data, loading, deleteDatasetStructure: mutateAsync };
+};
+
 export function useFetchKnowledgeMetadata(kbIds: string[] = []) {
   const { data, isFetching: loading } = useQuery<
     Record<string, Record<string, string[]>>
@@ -926,7 +952,7 @@ export const useClearWiki = () => {
   return { data, loading, clearWiki: mutateAsync };
 };
 
-export const useRunArtifactIndex = () => {
+export const useRunArtifactIndex = (kind: string) => {
   const knowledgeBaseId = useKnowledgeBaseId();
   const queryClient = useQueryClient();
 
@@ -941,7 +967,7 @@ export const useRunArtifactIndex = () => {
       if (data?.code === 0) {
         message.success(i18n.t('message.operated'));
         queryClient.invalidateQueries({
-          queryKey: ArtifactAlterationKeys.detail(knowledgeBaseId),
+          queryKey: ArtifactAlterationKeys.detail(knowledgeBaseId, kind),
         });
         queryClient.invalidateQueries({
           queryKey: ArtifactKeys.listByDataset(knowledgeBaseId),
@@ -992,7 +1018,7 @@ export const useFetchKnowledgeList = (
   handleScroll: (e: React.UIEvent<HTMLDivElement>) => void;
 } => {
   const { data, fetchNextPage, hasNextPage, isFetching, isFetchingNextPage } =
-    useInfiniteQuery<{ items: IDataset[] }>({
+    useInfiniteQuery<{ items: IDataset[]; total: number }>({
       queryKey: KnowledgeListKeys.list(
         shouldFilterListWithoutDocument,
         keywords,
@@ -1007,10 +1033,18 @@ export const useFetchKnowledgeList = (
           page_size: pageSize,
           ...(keywords ? { ext: { keywords } } : {}),
         });
-        return { items: (data?.data ?? []) as IDataset[] };
+        return {
+          items: (data?.data ?? []) as IDataset[],
+          total: data?.total_datasets ?? 0,
+        };
       },
-      getNextPageParam: (lastPage, allPages) =>
-        lastPage.items.length >= pageSize ? allPages.length + 1 : undefined,
+      getNextPageParam: (lastPage, allPages) => {
+        const loaded = allPages.reduce(
+          (total, page) => total + page.items.length,
+          0,
+        );
+        return loaded < lastPage.total ? allPages.length + 1 : undefined;
+      },
     });
 
   const list = useMemo(() => {

@@ -1,4 +1,4 @@
-import { GenerateType } from '@/pages/dataset/dataset/generate-button/constants';
+import { GenerateType } from '@/constants/knowledge';
 
 export enum ViewMode {
   LlmWiki = 'llm-wiki',
@@ -25,6 +25,17 @@ export const StructureKinds = [
 ] as const;
 
 export type StructureKind = (typeof StructureKinds)[number];
+
+export const ViewModeLabelKeyMap: Record<ViewMode, string> = {
+  [ViewMode.LlmWiki]: 'knowledgeDetails.llmWiki',
+  [ViewMode.Skills]: 'knowledgeDetails.skills',
+  [ViewMode.Tree]: 'knowledgeDetails.navTree',
+  [ViewMode.Graph]: 'knowledgeDetails.structureGraph',
+  [ViewMode.MindMap]: 'knowledgeDetails.structureMindmap',
+  [ViewMode.Timeline]: 'knowledgeDetails.structureTimeline',
+  // [ViewMode.SessionEssence]: 'knowledgeDetails.structureSessionEssence',
+  // [ViewMode.SessionGraph]: 'knowledgeDetails.structureSessionGraph',
+};
 
 export type GenerableViewMode = Exclude<ViewMode, ViewMode.Tree>;
 

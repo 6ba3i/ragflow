@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"ragflow/internal/common"
 	"ragflow/internal/dao"
 	"ragflow/internal/entity"
+	"ragflow/internal/ingestion/knowledge_compile"
 	"ragflow/internal/storage"
 
 	"gorm.io/gorm"
@@ -192,7 +194,7 @@ func (s *DocumentService) DeleteDocument(ctx context.Context, id string) error {
 func (s *DocumentService) DeleteDocuments(ctx context.Context, ids []string, deleteAll bool, datasetID, userID string) (int, error) {
 	// 1. Check dataset is accessible by the user
 	if !s.kbDAO.Accessible(ctx, dao.DB, datasetID, userID) {
-		return 0, fmt.Errorf("you don't own the dataset %s", datasetID)
+		return 0, fmt.Errorf("You don't own the dataset %s.", datasetID)
 	}
 
 	// 2. Resolve document IDs
@@ -356,6 +358,18 @@ func (s *DocumentService) deleteDocEngineData(docID, tenantID, kbID string) {
 	indexName := fmt.Sprintf("ragflow_%s", tenantID)
 	if _, delErr := s.docEngine.DeleteChunks(ctx, map[string]interface{}{"doc_id": docID}, indexName, kbID); delErr != nil {
 		common.Logger.Warn(fmt.Sprintf("deleteDocEngineData: failed to delete chunks for %s: %v", docID, delErr))
+	}
+	// Notify the dataset-level post-processing consumer (§11) that this document's
+	// source + per-doc compiled chunks are gone. The consumer removes the
+	// dataset-scoped merged products and triggers incremental re-dedup. Best-
+	// effort, non-fatal: the synchronous deletion above already removed the
+	// source/per-doc chunks, so the consumer only owns merged-product cleanup.
+	// Bound the publish with a timeout so a stalled scheduler (MySQL/NATS) can
+	// never block the document delete, which already succeeded above.
+	pubCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := knowledge_compile.PublishDeleted(pubCtx, tenantID, kbID, docID, 0); err != nil {
+		common.Logger.Warn(fmt.Sprintf("deleteDocEngineData: publish doc_deleted for %s failed: %v", docID, err))
 	}
 	if s.metadataSvc != nil {
 		_ = s.DeleteDocumentAllMetadata(ctx, docID) // logs internally

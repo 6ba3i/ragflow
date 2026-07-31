@@ -17,6 +17,22 @@
 import asyncio
 import hashlib
 import json
+"""Agentic-RAG capability layer.
+
+``RAGTools`` bundles every retrieval primitive the agentic-search graph
+(:mod:`rag.advanced_rag.agentic_rag_graph`) needs — question formalisation,
+document scoping, keyword analysis, KB / web / structured retrieval, a
+sufficiency judge and follow-up-question generation — plus the two things
+the *outer* LLM is ever allowed to call as tools: ``rag`` (run the whole
+agentic-search graph) and ``summarize_document`` (dump one document for an
+explicit summary request).
+
+The individual search steps are deliberately NOT ``@tool``-decorated: the
+graph orchestrates them itself, so ``chat_mdl`` stays a plain reasoning
+model (no tool schema is bound onto it) and its ``async_chat*`` calls take
+the fast non-tool-calling path.
+"""
+
 import logging
 import os
 import re
@@ -235,7 +251,7 @@ class RAGTools:
         compilation_capability_config: CapabilityConfig | None = None,
     ):
         self.tenant_ids = tenant_ids
-        self.chat_mdl = deepcopy(chat_mdl)
+        self.chat_mdl = chat_mdl.clone()
         self.embed_mdl = embed_mdl
         self.field_map = {}
         self.sql_kbs = []

@@ -309,7 +309,10 @@ func TestDatasetServiceUpdateDatasetRejectsMissingDataset(t *testing.T) {
 	if code != common.CodeDataError {
 		t.Fatalf("expected data error code, got %d", code)
 	}
-	if err.Error() != "dataset not found" {
+	// Nonexistent and not-owned datasets share the "lacks permission"
+	// error so existence is not revealed (IDOR), matching Python.
+	expected := "user 'tenant-1' lacks permission for dataset 'missing-kb'"
+	if err.Error() != expected {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -382,7 +385,7 @@ func TestDatasetServiceUpdateDatasetValidatesName(t *testing.T) {
 	if code != common.CodeDataError {
 		t.Fatalf("expected data error code, got %d", code)
 	}
-	if err.Error() != "`name` is required" {
+	if err.Error() != "String should have at least 1 character" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -592,11 +595,11 @@ func TestDatasetServiceUpdateDatasetRejectsInvalidEmbeddingModelFormat(t *testin
 		embeddingModel  string
 		expectedMessage string
 	}{
-		{"empty", "", "Embedding model identifier must follow <model_name>@<provider> format"},
-		{"whitespace", " ", "Embedding model identifier must follow <model_name>@<provider> format"},
-		{"missing_at", "BAAI/bge-small-en-v1.5Builtin", "Embedding model identifier must follow <model_name>@<provider> format"},
-		{"empty_model_name", "@Builtin", "Both model_name and provider must be non-empty strings"},
-		{"empty_provider", "BAAI/bge-small-en-v1.5@", "Both model_name and provider must be non-empty strings"},
+		{"empty", "", "embedding model identifier must follow <model_name>@<provider> format"},
+		{"whitespace", " ", "embedding model identifier must follow <model_name>@<provider> format"},
+		{"missing_at", "BAAI/bge-small-en-v1.5Builtin", "embedding model identifier must follow <model_name>@<provider> format"},
+		{"empty_model_name", "@Builtin", "both model_name and provider must be non-empty strings"},
+		{"empty_provider", "BAAI/bge-small-en-v1.5@", "both model_name and provider must be non-empty strings"},
 	}
 
 	ctx := t.Context()

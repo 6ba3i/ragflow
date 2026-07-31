@@ -157,12 +157,12 @@ func TestCreateDataset_ValidatesName(t *testing.T) {
 	if code != common.CodeDataError {
 		t.Fatalf("expected data error code, got %d", code)
 	}
-	if err.Error() != "Dataset name can't be empty." {
+	if err.Error() != "dataset name can't be empty" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
-func TestCreateDataset_RejectsDuplicateName(t *testing.T) {
+func TestCreateDataset_DedupesDuplicateName(t *testing.T) {
 	db := setupServiceTestDB(t)
 	pushServiceDB(t, db)
 	insertCreateDatasetTenant(t, "tenant-1")
@@ -179,15 +179,16 @@ func TestCreateDataset_RejectsDuplicateName(t *testing.T) {
 	}
 
 	ctx := t.Context()
-	_, code, err := testDatasetCreateService(t).CreateDataset(ctx, &service.CreateDatasetRequest{Name: "Existing"}, "tenant-1")
-	if err == nil {
-		t.Fatal("expected duplicate name error")
+	// Mirror Python's duplicate_name: the create appends (1) instead of failing.
+	result, code, err := testDatasetCreateService(t).CreateDataset(ctx, &service.CreateDatasetRequest{Name: "Existing"}, "tenant-1")
+	if err != nil {
+		t.Fatalf("expected success, got %v", err)
 	}
-	if code != common.CodeDataError {
-		t.Fatalf("expected data error code, got %d", code)
+	if code != common.CodeSuccess {
+		t.Fatalf("expected success code, got %d", code)
 	}
-	if !strings.Contains(err.Error(), "already exists") {
-		t.Fatalf("unexpected error: %v", err)
+	if result["name"] != "Existing(1)" {
+		t.Fatalf("unexpected name: %v", result["name"])
 	}
 }
 
@@ -197,13 +198,13 @@ func TestCreateDataset_RejectsInvalidEmbeddingModel(t *testing.T) {
 		embeddingModel  string
 		expectedMessage string
 	}{
-		{"empty", "", "Embedding model identifier must follow <model_name>@<provider> format"},
-		{"whitespace", " ", "Embedding model identifier must follow <model_name>@<provider> format"},
-		{"missing_at", "BAAI/bge-small-en-v1.5Builtin", "Embedding model identifier must follow <model_name>@<provider> format"},
-		{"empty_model_name", "@Builtin", "Both model_name and provider must be non-empty strings"},
-		{"empty_provider", "BAAI/bge-small-en-v1.5@", "Both model_name and provider must be non-empty strings"},
-		{"whitespace_model_name", " @Builtin", "Both model_name and provider must be non-empty strings"},
-		{"whitespace_provider", "BAAI/bge-small-en-v1.5@ ", "Both model_name and provider must be non-empty strings"},
+		{"empty", "", "embedding model identifier must follow <model_name>@<provider> format"},
+		{"whitespace", " ", "embedding model identifier must follow <model_name>@<provider> format"},
+		{"missing_at", "BAAI/bge-small-en-v1.5Builtin", "embedding model identifier must follow <model_name>@<provider> format"},
+		{"empty_model_name", "@Builtin", "both model_name and provider must be non-empty strings"},
+		{"empty_provider", "BAAI/bge-small-en-v1.5@", "both model_name and provider must be non-empty strings"},
+		{"whitespace_model_name", " @Builtin", "both model_name and provider must be non-empty strings"},
+		{"whitespace_provider", "BAAI/bge-small-en-v1.5@ ", "both model_name and provider must be non-empty strings"},
 	}
 
 	ctx := t.Context()
